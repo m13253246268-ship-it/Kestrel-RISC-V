@@ -1,3 +1,5 @@
+[English](README.en.md) | **简体中文**
+
 # vLLM-Kestrel — 边云协同 · 精确注意力 LLM 推理引擎
 
 > Axiom-Guided Exact-Attention edge LLM runtime
