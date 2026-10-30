@@ -1,0 +1,738 @@
+/**
+ * vllm_safetensors.h - Safetensors format parser for model weight loading
+ *
+ * Supports loading HuggingFace safetensors files with bfloat16/float16/float32
+ * weight conversion to float32 for the Qwen3-VL-8B-Instruct model.
+ *
+ * Safetensors format:
+ *   [0..7]   Header size (uint64 LE)
+ *   [8..N-1] JSON header string
+ *   [N..]    Tensor data (aligned)
+ */
+
+#ifndef VLLM_SAFETENSORS_H
+#define VLLM_SAFETENSORS_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "vllm_l3.h"   /* STL3State: Phase-2 L3 disk eviction state */
+#include "vllm_platform.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Vision weight buffers 的具名类型（定义见 vllm_vision.h）；供 STModelWeights
+ * 前向引用 VQF mmap 挂载的 vision 张量（STModelWeights.vision）。 */
+struct STVisionWeights;
+
+/* Debug: front/back guard bytes around each KV block and trailing guard on
+ * per-state scratch buffers. Data pointers are offset +KV_GUARD into the raw
+ * allocation; every free must use (uint8_t*)ptr - KV_GUARD. Set to 0 to
+ * disable (plain allocations, data pointer == raw pointer). */
+#define KV_GUARD 4096
+
+/* Safetensors dtype codes */
+#define ST_DTYPE_F32  0
+#define ST_DTYPE_F16  1
+#define ST_DTYPE_BF16 2
+
+/**
+ * Single tensor entry from the safetensors JSON header.
+ */
+typedef struct {
+    char    *name;         /* tensor name, e.g. "model.language_model.layers.0.self_attn.q_proj.weight" */
+    int      dtype;        /* ST_DTYPE_F32 / F16 / BF16 */
+    int64_t  n_dims;       /* number of dimensions (up to 8 for Conv3d weights) */
+    int64_t  ne[8];        /* dimensions: ne[0]=fastest, ne[7]=slowest */
+    int64_t  n_elems;      /* total number of elements (ne[0] * ne[1] * ...) */
+    int64_t  file_offsets[2]; /* start and end offset in data section */
+    int64_t  n_bytes;       /* raw bytes in file */
+} STTensorInfo;
+
+/**
+ * Parsed safetensors file header.
+ */
+typedef struct {
+    int         n_files;        /* number of shard files */
+    char      **file_paths;     /* [n_files] file paths */
+    int         n_tensors;      /* total tensor count across all shards */
+    STTensorInfo *tensors;      /* [n_tensors] tensor info */
+    /* Model config extracted from config.json */
+    int         dim;            /* hidden_size = 4096 */
+    int         n_layers;       /* num_hidden_layers = 36 */
+    int         n_heads;        /* num_attention_heads = 32 */
+    int         n_kv_heads;     /* num_key_value_heads = 8 */
+    int         head_dim;       /* head_dim = 128 */
+    int         ffn_dim;        /* intermediate_size = 12288 */
+    int         vocab_size;     /* 151936 */
+    int         max_seq_len;    /* max_position_embeddings = 262144 */
+    float       rope_theta;     /* 5000000.0 */
+    float       norm_eps;       /* 1e-6 */
+    int         bos_id;         /* 151643 */
+    int         eos_id;         /* 151645 */
+    bool        has_q_norm;     /* Qwen3-VL has per-layer q_norm/k_norm */
+    bool        has_mrope;      /* Qwen3-VL uses MRoPE (3D RoPE) */
+    int         head_dim_full;  /* 128 for Qwen3-VL */
+    int         kv_lora_rank;   /* 0 means no KV lora */
+
+    /* ---- MoE (qwen3_moe) ---- */
+    int         is_moe;         /* 1 = qwen3_moe：每层 router + n_experts 专家 */
+    int         n_experts;      /* num_experts (30B-A3B: 128) */
+    int         moe_ffn;        /* moe_intermediate_size (30B-A3B: 768) 单专家中间宽 */
+    int         top_k;          /* num_experts_per_tok (30B-A3B: 8) */
+    int         shared_experts; /* num_shared_experts（Qwen3 MoE 无 → 0） */
+    /* is_moe=1 时 ffn_dim 被覆写为 n_experts*moe_ffn（每层专家堆叠行数/列数），
+     * 使 gate/up/down 的"整层堆叠→量化→repack"与稠密逐字节同构。 */
+
+    /* ---- Vision config (Qwen3-VL) ---- */
+    int         has_vision;     /* 1 = vision encoder present */
+    int         vis_depth;      /* ViT depth (27) */
+    int         vis_hidden;     /* ViT hidden_size (1152) */
+    int         vis_heads;      /* ViT num_heads (16) */
+    int         vis_ffn;        /* ViT intermediate_size (4304) */
+    int         vis_patch;      /* patch_size (16) */
+    int         vis_temporal;   /* temporal_patch_size (2) */
+    int         vis_merge;      /* spatial_merge_size (2) */
+    int         vis_out_dim;    /* out_hidden_size = 4096 */
+    int         vis_in_chan;    /* in_channels (3) */
+    int         vis_max_pos;    /* num_position_embeddings (2304) */
+    int         vis_ds_idx[4];  /* deepstack_visual_indexes [8,16,24] */
+    int         vis_ds_count;   /* number of deepstack layers (3) */
+    int         mrope_sections[4]; /* MRoPE sections [24,20,20] */
+    int         mrope_n_sec;    /* number of MRoPE sections (3) */
+
+    /* Vision special token IDs */
+    int         vision_start_id;   /* 151652 */
+    int         vision_end_id;     /* 151653 */
+    int         image_token_id;    /* 151655 */
+    int         video_token_id;    /* 151656 */
+} STModelConfig;
+
+/**
+ * Dynamically allocated weight buffers for Qwen3-VL model.
+ * All weights are stored in float32 after conversion from safetensors.
+ *
+ * Memory estimate (f32): ~32 GB total. This is impractical for most systems.
+ * The engine therefore loads only the pre-quantized self-developed VQF format
+ * (Q8/Q4 mmap); raw safetensors reading is confined to the vqf_convert tool.
+ */
+typedef struct {
+    STModelConfig cfg;
+
+    /* --- Permanent tensors (always loaded) --- */
+    float *token_embed;       /* [vocab_size, dim]  embedded_tokens.weight */
+    float *lm_head;           /* [vocab_size, dim]  lm_head.weight (untied!) */
+    float *final_norm;        /* [dim]              model.language_model.norm.weight */
+    float *moe_router;        /* [n_layers*n_experts, dim] f32 常驻（qwen3_moe
+                               * router.weight；top-k 边界敏感 → 不量化） */
+
+    /* --- Per-layer weights (can be loaded/freed dynamically) --- */
+    /* All arrays are indexed by layer: weights[layer * dim_size] */
+    float *attn_norm;       /* [n_layers, dim]    input_layernorm.weight */
+    float *ffn_norm;        /* [n_layers, dim]    post_attention_layernorm.weight */
+    float *q_weight;        /* [n_layers, dim * q_out]  q_proj.weight → [dim, n_heads*head_dim] */
+    float *k_weight;        /* [n_layers, dim * k_out]  k_proj.weight → [dim, n_kv_heads*head_dim] */
+    float *v_weight;        /* [n_layers, dim * k_out]  v_proj.weight */
+    float *o_weight;        /* [n_layers, q_out * dim]  o_proj.weight → [n_heads*head_dim, dim] */
+    float *q_norm;          /* [n_layers, q_out]        q_norm.weight */
+    float *k_norm;          /* [n_layers, k_out]        k_norm.weight */
+    /* Qwen2 系注意力投影 bias（VQF 张量 q_bias/k_bias/v_bias，Qwen3 无 → NULL）。
+     * 只在 VQF 加载路径赋值（直挂 mmap 区）；投影后在调用点逐行加。 */
+    float *q_bias;          /* [n_layers, q_out]        q_proj.bias */
+    float *k_bias;          /* [n_layers, k_out]        k_proj.bias */
+    float *v_bias;          /* [n_layers, k_out]        v_proj.bias */
+    float *gate_weight;     /* [n_layers, ffn_dim * dim] gate_proj.weight */
+    float *up_weight;       /* [n_layers, ffn_dim * dim] up_proj.weight */
+    float *down_weight;     /* [n_layers, dim * ffn_dim] down_proj.weight */
+
+    /* --- Q8_0 compact storage for FFN + LM Head (fixedpoint_quantize) ---
+     * Layout: 34 bytes per 32 elements = { f16 scale d; int8 qs[32]; }
+     * When has_q8=1, FFN uses AVX2 dequantizing matvec (3-4x mem BW reduction) */
+    uint8_t *q8_gate_weight;  /* [n_layers * (ffn_dim * dim + 31)/32 * 34] */
+    uint8_t *q8_up_weight;
+    uint8_t *q8_down_weight;
+    uint8_t *q8_lm_weight;    /* [(vocab * dim + 31)/32 * 34] — LM head Q8_0 */
+    uint8_t *q8_q_weight;     /* [n_layers * (q_out * dim + 31)/32 * 34] */
+    uint8_t *q8_k_weight;     /* [n_layers * (k_out * dim + 31)/32 * 34] */
+    uint8_t *q8_v_weight;
+    uint8_t *q8_o_weight;     /* [n_layers * (dim * q_out + 31)/32 * 34] */
+    int      has_q8;          /* 1 = Q8_0 compact weights available */
+
+    /* --- Q4_0 compact storage for decode (fixedpoint_quantize_saturate B=4) ---
+     * Layout: 18 bytes per 32 elements = { f16 scale d; uint8 nibbles qs[16]; }
+     * Decode uses Q4_0 weights × Q8_0 activations (integer-domain dot) to halve
+     * weight DRAM bandwidth vs Q8_0 (18B vs 34B per 32-element block). */
+    uint8_t *q4_gate_weight;  /* [n_layers * (ffn_dim * dim + 31)/32 * 18] */
+    uint8_t *q4_up_weight;
+    uint8_t *q4_down_weight;
+    uint8_t *q4_lm_weight;    /* [(vocab * dim + 31)/32 * 18] — LM head Q4_0 */
+    uint8_t *q4_q_weight;     /* [n_layers * (q_out * dim + 31)/32 * 18] */
+    uint8_t *q4_k_weight;     /* [n_layers * (k_out * dim + 31)/32 * 18] */
+    uint8_t *q4_v_weight;
+    uint8_t *q4_o_weight;     /* [n_layers * (dim * q_out + 31)/32 * 18] */
+    int      has_q4;          /* 1 = Q4_0 compact weights available */
+    /* 逐张量 q4 布局（VQF v5 起）：0=legacy(18B/块) 1=4x4(72B/块) 2=lane-major(32行tile)。
+     * 旧文件（v2/v3/v4）加载后统一置 1（4x4），与 g_st_q4_repack=1 行为一致。 */
+    int      q4_q_layout, q4_k_layout, q4_v_layout, q4_o_layout;
+    int      q4_gate_layout, q4_up_layout, q4_down_layout, q4_lm_layout;
+
+    /* --- Q4_0 8x8 GEMM 预打包副本（prefill 专用, 仅 wmode=q4 分配）---
+     * 每个矩阵与 legacy 同大小（144B/block = 8 行 legacy 18B/block），布局为
+     * llama.cpp block_q4_0x8：{ f16 d[8]; uint8 qs[128] }，qs 按 4B 组 8 行交织、
+     * 每字节 ^0x88（nibble v 存为 v^0x88, 即 [-8,+7] 有符号）。点积无需 bias
+     * 校正（与 llama 8x8 LUT 内核同约定）。decode/GEMV 仍用 legacy 副本。 */
+    uint8_t *x8_gate_weight;
+    uint8_t *x8_up_weight;
+    uint8_t *x8_down_weight;
+    uint8_t *x8_q_weight;
+    uint8_t *x8_k_weight;
+    uint8_t *x8_v_weight;
+    uint8_t *x8_o_weight;
+    int      has_x8;          /* 1 = 8x8 预打包副本就绪 */
+
+    /* --- Q2_1 compact storage for mixed-precision decode (wmode=q2mix) ---
+     * Layout: 16 bytes per 32 elements =
+     *   { f16 d0; f16 m0; f16 d1; f16 m1; uint8 qs[8]; }
+     * two 16-elem sub-blocks with own (scale d, min m); 2-bit codes q∈[0,3].
+     * dequant w_i = m_h + d_h * q_i → 0.5 B/element (÷2.1 vs Q4_0).
+     * Allocated for the FFN projections (gate/up/down) only; attention stays
+     * Q4_0 (mixed precision: sensitive projections at 4-bit, FFN at 2-bit,
+     * axiom blas_precision_efficiency_tradeoff). */
+    uint8_t *q2_gate_weight;  /* [n_layers * (ffn_dim * dim + 31)/32 * 16] */
+    uint8_t *q2_up_weight;
+    uint8_t *q2_down_weight;  /* [n_layers * (dim * ffn_dim + 31)/32 * 16] */
+    int      has_q2;          /* 1 = Q2_1 FFN weights available */
+
+    /* Pre-unpacked Q4_0 → int8 (wmode=q4): the q8_* buffers above hold
+     * Q4_0 values expanded to 34 B/block { f16 scale d; int8 qs[32]; } —
+     * byte-layout identical to Q8_0, so the tuned Q8 kernels consume them
+     * directly (no nibble unpack at runtime). qs[i] = (nibble-8) ∈ [-8,+7]
+     * with the same scale bits as the nibble format, so results are bit-identical
+     * to the nibble Q4_0 path. q4_* buffers are NOT allocated in this mode. */
+    int      q8_buf_q4;        /* 1 = q8_* buffers store pre-unpacked Q4 int8 */
+
+    int      emb_f16;          /* VQF: 1 = token_embed 存 F16，读取时转 F32 */
+
+    int   weights_loaded;   /* bitmask: which weight groups are loaded */
+    int   n_layers_allocated; /* actual number of layers with allocated buffers */
+    int   is_allocated;
+
+    /* VQF (vLLM Quantized Format) mmap ownership: when non-NULL all weight
+     * pointers above alias the mmap'd VQF file (read-only, zero-copy).
+     * st_weights_free() munmap()s it instead of free()ing each pointer. */
+    void  *vqf_map;
+    size_t vqf_map_len;
+
+    /* VQF: 多模态 vision 权重（mmap 直挂，alias vqf_map，见 vllm_vision.h）。
+     * vqf_load 在文件含 vision 张量（VQF_FLAG_VISION）时 calloc 填充，
+     * st_weights_free() 的 vqf_map 分支一并释放该结构体。 */
+    struct STVisionWeights *vision;
+} STModelWeights;
+
+/**
+ * Inference state for Qwen3-VL model.
+ */
+typedef struct {
+    STModelWeights    weights;
+    STModelConfig     cfg;
+    float  *hidden;         /* [dim] current hidden state */
+    float ***k_cache;        /* [n_layers][n_blocks] per-block KV cache */
+    float ***v_cache;
+    int    *cache_len;
+    int     kv_bs;           /* KV block size in positions (= g_sparse_block) */
+    int     kv_n_blocks;     /* allocated blocks per layer */
+    int8_t ***k_cache_q8;    /* [n_layers][n_blocks] per-block INT8 K cache */
+    float  *logits;         /* [vocab_size] */
+    /* Temp buffers (maximum size across uses) */
+    float  *q_buf;          /* max(n_heads * head_dim, ffn_dim) = 12288 */
+    float  *k_buf;          /* max(n_kv_heads * head_dim, ffn_dim) = 12288 */
+    float  *v_buf;          /* n_kv_heads * head_dim = 1024 */
+    float  *attn_buf;       /* [n_heads * head_dim] = 4096 */
+    float  *ffn_buf;        /* [ffn_dim] = 12288 */
+    float  *ffn_out_buf;    /* [dim] = 4096 */
+    int     seq_len;
+    int     mrope_pos;      /* MRoPE text-position cursor. For multimodal
+                             * prompts the text MRoPE position advances by
+                             * max(grid_h,grid_w) per visual region, NOT by the
+                             * visual-token count, so it diverges from seq_len.
+                             * prefill_ex stores the final text_pos here and
+                             * decode continues from it (0 = text-only: fall
+                             * back to seq_len). */
+    int     is_allocated;
+
+    float  *scores_buf;        /* [max_kv_slots * nh] per-head rows for parallel attention */
+    int     max_kv_slots;      /* KV cache slot count per layer (= max_seq) */
+
+    /* Phase 1.5: prefill-accumulated attention importance (message-passing
+     * potential, blas_sparse_message_passing_schedule). prefill_importance[s]
+     * = total attention mass position s received during the exact prefill
+     * pass (aggregated across heads and query tokens). The sparse decode
+     * selection ranks blocks by this importance + a fresh probe, so blocks
+     * actually attended during prefill (e.g. a needle fact) are retained even
+     * at aggressive k. imp_head is the per-head accumulation scratch. */
+    float  *prefill_importance;  /* [max_kv_slots] per-token attention mass */
+    float  *imp_head;            /* [nh * max_kv_slots] per-head scratch */
+    STL3State l3;                /* Phase-2 L3 disk eviction state (fp NULL = off) */
+
+    /* KV cache INT8 quantization (~4x memory bandwidth reduction).
+     * Uses fixed scale 1/127: K-norm already ensures K ≈ [-1, 1],
+     * so round(K_f32 * 127) → INT8 is near-lossless. Same factor for V. */
+    int      use_kv_q8;        /* 1 = use INT8 KV cache instead of F32 */
+    int8_t ***v_cache_q8;      /* [n_layers][n_blocks] per-block INT8 V cache */
+    float  **k_scale;          /* [n_layers][max_seq * nkv] per-token per-head K max-abs scale */
+    float  **v_scale;          /* [n_layers][max_seq * nkv] per-token per-head V max-abs scale */
+
+    /* KV cache Q4 compression (--kv-q4): 40-byte Q4_0 payload per 64 floats
+     * (l3_q4_pack64/dot64/vacc64), ~1.65x denser than the INT8 form. Decode
+     * attention scores/accumulates straight from the payloads (no dequant).
+     * f32 cache is retained (exact prefill attention, L3 eviction, ppl-f32
+     * A/B reference). Mutually exclusive with use_kv_q8. */
+    int      use_kv_q4;        /* 1 = use Q4 KV payload cache */
+    uint8_t ***k_cache_q4;     /* [n_layers][n_blocks] Q4 K payload blocks */
+    uint8_t ***v_cache_q4;     /* [n_layers][n_blocks] Q4 V payload blocks */
+
+    int     profile_decode;
+    double  dec_t_qkv;
+    double  dec_t_attn;
+    double  dec_t_o;
+    double  dec_t_gu;
+    double  dec_t_down;
+    double  dec_t_lm;
+    double  dec_t_other;
+} STQwenInferenceState;
+
+/**
+ * Free all weight buffers.
+ */
+void st_weights_free(STModelWeights *w);
+
+/* Batched Q8_0 matvec with row-tiled shared-input fusion (axiom:
+ * block_matrix_assoc_natural + partition_alignment):
+ *   out[p*out_stride + r] = dot(q8_w[r], x[p]) + bias[r]
+ * x is PATCH-MAJOR [batch][cols]; patch-parallel with 4 rows accumulated per
+ * pass (independent FMA chains sharing one x vector). cols MUST be a multiple
+ * of 32; out_stride lets the caller pad rows. */
+void st_q8_matvec_batched(float *__restrict out, const uint8_t *__restrict q8_w,
+                          const float *__restrict x, const float *__restrict bias,
+                          int batch, int rows, int cols, int out_stride);
+
+/* Single-vector Q8_0 matvec: out[r] = dot(q8_w[r], x) + bias[r].
+ * NO internal OMP (caller owns the parallelism — used inside fused ViT
+ * layers where each thread processes one patch serially). Rows are unrolled
+ * 4-way sharing one x vector (independent FMA chains). cols multiple of 32. */
+void st_q8_matvec_single(float *__restrict out, const uint8_t *__restrict q8_w,
+                         const float *__restrict x, const float *__restrict bias,
+                         int rows, int cols);
+
+/* Batch Q8_0 matvec: out[B][rows] = W[rows][cols] · x[B][cols] (+bias).
+ * The weight matrix is streamed ONCE per row (row-parallel inside); each
+ * patch accumulates in the same block order as st_q8_matvec_single, so the
+ * numerics are bit-identical to calling it per patch — only the weight
+ * re-read traffic is eliminated (visual ViT encode hot path). */
+void st_q8_matvec_batch(float *__restrict out, const uint8_t *__restrict q8_w,
+                        const float *__restrict bias,
+                        const float *__restrict x,
+                        int B, int rows, int cols);
+
+/* ViT QKV projection with head-contiguous output: out[3][nh][B][hd] instead
+ * of [B][3*vh], so the block attention streams each head's K/V sequentially.
+ * rows = 3*vh; vh = vis_hidden, nh = vis_heads, hd = vh/nh. */
+void st_q8_matvec_batch_qkv(float *__restrict out, const uint8_t *__restrict q8_w,
+                            const float *__restrict bias,
+                            const float *__restrict x,
+                            int B, int rows, int vh, int nh, int hd);
+
+/* ---- RISC-V：视觉塔 Q8 权重的 8x8 布局转换（mode-0 34B/块 → mode-2 272B/组）----
+ * 动机：视觉权重在 VQF 里是 mode-0（每 32 列 = 2B f16 + 32B int8，行步长
+ * (cols/32)*34），RISC-V 上只能走通用标量 worker；转成 8x8 后可以直接复用
+ * LLM prefill 的 RVV 批量内核（一次取数喂 4 个 patch）。
+ * 纯字节置换，值不变，每行累加序（块 → k → i）也不变 ⇒ 与旧的 mode-0 标量
+ * 路径逐位一致。返回 malloc 的新缓冲区（字节数与 src 相同：272 = 8×34）；
+ * rows%8 或 cols%32 非 0 时返回 NULL（调用方保持原路径）。 */
+uint8_t *st_q8_repack_0to2(const uint8_t *src, int rows, int cols);
+
+/* 告知 st_q8_matvec_batch / _qkv：传进来的权重已是 8x8 布局，按 mode-2 走。
+ * 由视觉塔加载后设置一次；未设置时保持原来的 mode-0 行为。 */
+void st_q8_vis_set_mode2(int on);
+
+/* ---- Qwen3-VL Inference API ---- */
+
+/* Runtime switch to disable Q4_0 weights (default 0 = Q4_0 ON when available).
+ * Set to 1 via CLI --no-q4 to force the Q8_0 path. */
+extern int g_st_no_q4;
+
+/* Weight mode: 0 = dual Q8_0+Q4_0 (default), 1 = Q4_0 nibble-only,
+ * 2 = Q8_0-only, 3 = Q4_0 pre-unpacked int8 (q4i, ~9.8 GB, decode ~3x slower
+ * — offline prefill workloads only). Set via CLI --wmode q4|q4i|q8|dual or
+ * env VLLM_WMODE. Q4_0 nibble-only halves resident weight memory (~13.8 GB ->
+ * ~6.3 GB) to remove swap pressure while keeping the fastest decode path. */
+extern int g_st_wmode;
+/* Resolve the effective weight mode (env VLLM_WMODE > --no-q4 > CLI --wmode);
+ * returns 0 dual, 1 q4, 2 q8, 3 q4i, 4 g256. */
+int st_wmode_effective(void);
+
+/* M4e: Q8_0 4x4 repack master switch (default ON on NEON-dotprod builds).
+ * Cleared by the geometric gate in st_weights_alloc_layers (rows%4 / cols%32
+ * mismatch, wmode=g256/q4i). main.c reads it to keep the lm_head repack
+ * consistent with the layer matrices. */
+extern int g_st_q8_repack;
+
+/* Runtime switch for mixed precision: force prefill GEMM (QKV/O/FFN) onto the
+ * Q8_0 path while keeping Q4_0 for decode. Default 1 (P1, 2026-08-29 A/B on
+ * Qwen3-VL-2B: TPOT 102.5 -> 76.2ms, -25.6%); set to 0 for Q4_0-everywhere.
+ * prefill is unpack-bound (Q8_0 wins) while decode is weight-DRAM-bound
+ * (Q4_0 wins), so this takes the best of both. */
+extern int g_st_prefill_q8;
+
+/* q2mix layered precision (--q2mix-tail N, default 0): in wmode=q2mix the LAST
+ * N transformer layers keep Q4_0 FFN weights while the earlier layers use Q2_1.
+ * 2-bit error hurts most in the final layers (ds4/DwarfStar observation).
+ * Measured on Qwen3-VL-2B the tail does NOT recover 2-bit quality on dense
+ * models (the FFN is the main residual path); mechanism verified via N=all. */
+extern int g_q2mix_tail;
+
+/* Isolated "OTHER"-bucket probe (MRoPE + KV-store + INT8 quantize) at
+ * S=1024/2048/4096, no model load. Triggered by --probe-other. */
+void st_probe_other(void);
+
+/* Sparse attention Phase-1 self-test (synthetic KV, no model load).
+ * Triggered by --test-sparse. */
+void st_test_sparse_attn(void);
+
+/* Prefill mini-batch size (default 32). Set via CLI --prefill-batch for A/B. */
+extern int g_st_prefill_batch;
+
+/* Phase 1: block-sparse decode attention (default OFF = exact).
+ * --sparse-attn enables; --sparse-k sets top blocks per head; --sparse-block
+ * sets positions per block; --sparse-probe sets probe samples per block.
+ * Axiom: probabilistic_selection_nc + sparse schedule. */
+extern int g_sparse_attn;
+extern int g_sparse_k;
+extern int g_sparse_block;
+extern int g_sparse_probe;
+/* --sparse-min-ctx N：稀疏 decode 的上下文长度下限（默认 1024）。
+ * ctx 低于此值时 decode 退回精确核（probe 开销 > 省下的注意力）。0 = 关闭本门。 */
+extern int g_sparse_min_ctx;
+extern int g_sparse_pf_group;
+extern int g_sparse_pf_k;
+/* --sparse-pf-min-ctx N：稀疏 prefill 的上下文长度下限（默认 3072）。
+ * 只在 VLLM_SPARSE_PREFILL=1 时参与判定；ctx 低于此值退回精确核（短上下文稀疏是净亏）。 */
+extern int g_sparse_pf_min_ctx;
+/* --sparse-ratio R：选块预算按块数比例化（0 = 关闭 → --sparse-k 仍是固定块数）。 */
+extern float g_sparse_ratio;
+/* 有效选块预算：R>0 时 clamp(ceil(R*n_blocks), g_sparse_k, n_blocks)，否则 g_sparse_k。 */
+int st_sparse_k_eff(int n_blocks);
+/* 稀疏 prefill 核的选块预算（--sparse-pf-k；0 = 沿用 --sparse-k）。 */
+int st_sparse_pf_k_eff(int n_blocks);
+/* --force-blk B[,B...]：诊断钩子，**只对 decode 选块**无条件保留这些块
+ * （g_force_blk_n == 0 时关闭）。用于分离「decode 选块失败」与
+ * 「prefill 近似注意力损害 hidden state」。 */
+#define ST_FORCE_BLK_MAX 8
+extern int g_force_blk[ST_FORCE_BLK_MAX];
+extern int g_force_blk_n;
+extern int g_l3_evict;
+extern float g_l3_ratio;
+extern int g_l3_min_seq;          /* --l3-min-seq: only evict when seq_len >= N */
+extern char *g_l3_path;           /* --l3-path: L3 cache file path (NULL = kv_l3.bin) */
+extern long long g_l3_max_size;   /* --l3-max-size: L3 file size cap in MB (0 = unlimited) */
+extern char *g_l3_cur_path;       /* serve: per-user L3 file for the current request
+                                   * (NULL = use g_l3_path, e.g. bench mode) */
+extern long g_l3_user_ttl;        /* --l3-user-ttl: minutes a per-user L3 file is kept
+                                   * after the user's last request (0 = never auto-clean) */
+extern int g_kv_q4;              /* --kv-q4: in-memory Q4 KV payload cache */
+extern long long g_l3_disk_hits;   /* decode tokens served from L3 disk (obsv.) */
+
+/* Speculative decode (--spec, n-gram draft + parallel prefill verification).
+ * When g_verify_logits is non-NULL, st_qwen_model_prefill_batch computes lm_head
+ * logits for EVERY position of the (single, K<=SPEC_DRAFT_MAX) draft
+ * mini-batch into g_verify_logits[pos*vocab] and records each position's
+ * top-1 token in g_verify_pred. Owned by the serve layer; must be cleared
+ * (NULL) after each verify so normal prefills keep the last-token-only
+ * contract. */
+#define SPEC_DRAFT_MAX 16
+extern float *g_verify_logits;
+extern int    g_verify_draft[SPEC_DRAFT_MAX];
+extern int    g_verify_pred[SPEC_DRAFT_MAX];
+extern float  g_verify_margin[SPEC_DRAFT_MAX];  /* top-1 - top-2 logit gap per position */
+extern int    g_verify_invalid;
+extern int    g_verify_pos;
+
+/* 神经草稿头（P2，2026-09-24）：1 层 Qwen3VLTextDecoderLayer + final norm，
+ * 冻结主模型文本塔训练（EAGLE 式特征级外推）。投影 q8_0 量化 + norm f32，
+ * 独立 KV cache。输入主模型最后一层 hidden（final_norm 前），自回归 K 步
+ * 输出 top-1 草稿。 */
+typedef struct {
+    uint8_t *q8_q_weight;   /* q8_0 [kv_dim_q, dim] */
+    uint8_t *q8_k_weight;   /* q8_0 [kv_dim,   dim] */
+    uint8_t *q8_v_weight;   /* q8_0 [kv_dim,   dim] */
+    uint8_t *q8_o_weight;   /* q8_0 [dim, kv_dim_q] */
+    uint8_t *q8_gate_weight;/* q8_0 [ffn_dim, dim] */
+    uint8_t *q8_up_weight;  /* q8_0 [ffn_dim, dim] */
+    uint8_t *q8_down_weight;/* q8_0 [dim, ffn_dim] */
+    float *q_norm;      /* [head_dim] */
+    float *k_norm;      /* [head_dim] */
+    float *attn_norm;   /* [dim] input_layernorm */
+    float *ffn_norm;    /* [dim] post_attention_layernorm */
+    float *final_norm;  /* [dim] */
+    float *k_draft;     /* [SPEC_DRAFT_MAX][kv_dim] 独立 K cache */
+    float *v_draft;     /* [SPEC_DRAFT_MAX][kv_dim] 独立 V cache */
+    void  *map;         /* mmap 句柄 */
+    size_t map_len;
+    int    loaded;
+} STDraftHead;
+
+/* 加载草稿头 f32 权重（mmap）；kv_dim = n_kv_heads*head_dim。返回 0 成功。 */
+int  st_draft_head_load(STDraftHead *dh, const char *path,
+                        int dim, int ffn_dim, int n_kv_heads, int head_dim);
+void st_draft_head_free(STDraftHead *dh);
+/* 草稿头前向：hidden 为主模型最后一层 hidden [dim]，自回归 K 步，每步 top-1
+ * token 写入 draft[0..K-1]。logits_buf 为调用方提供的 [vocab_size] 临时缓冲
+ * （不覆盖 st->logits）。返回草稿长度。 */
+int  st_draft_head_forward(STQwenInferenceState *st, STDraftHead *dh,
+                           const float *hidden, int K, int *draft,
+                           float *logits_buf);
+
+/* Model-load progress (updated by st_load_layer_weights so the web admin
+ * page can show a live "Loading layer X/Y" bar). 0/0 when idle. */
+extern int g_model_load_layer;
+extern int g_model_load_total;
+
+/**
+ * Initialize inference state from loaded weights.
+ * Allocates KV caches and temp buffers.
+ * Returns 0 on success, -1 on error.
+ */
+int st_qwen_inference_init(STQwenInferenceState *st, const STModelWeights *weights);
+
+/**
+ * Run one forward pass through Qwen3-VL language model.
+ * token_id: input token to process
+ * Logits stored in st->logits.
+ */
+void st_qwen_model_forward(STQwenInferenceState *st, int token_id);
+
+/**
+ * Mini-batch prefill (axiom: blas_qkv_fusion_categorical).
+ * Processes n_tokens prompt tokens in mini-batches of 8, sharing weight
+ * dequantization across tokens within each batch.
+ * Reduces memory bandwidth ~8x for weight reads during prefill.
+ * Returns 0 on success, -1 on error.
+ */
+int st_qwen_model_prefill_batch(STQwenInferenceState *st,
+                                const int *token_ids, int n_tokens);
+
+/* K-EMB-001：句子向量（embedding）取值钩子。调用方在 prefill 前登记 out/dim，
+ * prefill 收尾把**末位 token 的 final-norm 隐状态做 L2 归一化**后写入
+ * out[0..dim)（官方 Qwen3-Embedding 的 last-token pooling + Normalize），
+ * 然后自动清空（一次性）。未登记时对生成路径零行为改变。 */
+void st_embed_request(float *out, int dim);
+
+/* MoE 专家级驻留：真实 router 热度采集（EW 标定 H 用）。
+ * reset 清零并开启（FFN 内按层累计被选中专家）；save 落盘 "l:e:count"。 */
+void st_moe_heat_reset(const STModelWeights *w);
+void st_moe_heat_save(const char *path);
+
+/* MoE 专家并行（EP）· 阶段一自检（方案锚点：资料/分布式专家提取_实施方案.md）
+ *   M1 专家段一等化：由 VQF 目录几何导出 (层,专家) → gate/up 连续段 & down
+ *      列带描述符，并用文件元数据独立交叉校验（目录 offset ↔ 引擎直挂指针、
+ *      rows ↔ nl*ff、bytes ↔ nl*layerB、expB 整页对齐），非自证。
+ *   M2 虚拟 rank 位级一致：专家按 rank 均分，各 rank 只算自己拥有的被选专家、
+ *      产出完整 d 维贡献 C_j，协调者按 j 升序归约；结果须与单机
+ *      st_moe_ffn_sparse_q4 位级一致（A≡C）。
+ * 仅明文 MoE VQF；仅 f32 精确轨（VLLM_ACTQ/FUSE/DN_D2 须关）。返回 0 = 全 PASS。 */
+int st_moe_ep_selftest(STModelWeights *w, int nranks_max);
+
+/* MoE 专家并行（EP）· 阶段一多进程（M3）：同机多进程 → 阶段二跨机协同。
+ * transport 经 vllm_ep.h 抽象；阶段一 host=127.0.0.1，阶段二换板 IP 即跨机。
+ *   rank0 协调者：持有 router，广播 {x_ffn,sel,pr}，按 j 升序归约并位级对拍；
+ *   rank r>0 工作者：只算本 rank 拥有的被选专家，回传完整 d 维贡献 C_j。
+ * 返回 0 = 全 PASS。调用前须已 vqf_load（仅明文 q4_4x4 MoE）。 */
+int st_moe_ep_coord_run(STModelWeights *w, int nranks, int port);
+int st_moe_ep_worker_run(STModelWeights *w, int rank, const char *host,
+                         int port, int nranks);
+
+/* MoE EP 接入真实 forward（协调者侧，M3.5）：
+ *   st_moe_ep_root_begin() 在跑测试前建立 transport（不等模型）；此后 forward 内
+ *   的 FFN 段自动改走 EP（惰性绑定几何）；st_moe_ep_root_end() 发结束哨兵并关闭。
+ * 未调用 begin 时，forward 行为与改动前**完全一致**（零回归）。 */
+int  st_moe_ep_root_begin(int nranks, int port);
+void st_moe_ep_root_end(void);
+
+/* 非对称专家分片（M5 实证，N==2）：split>0 时 rank0 拥 [0,split)、rank1 拥
+ * [split,ne)；split<=0 回退均分。两侧进程（协调者 + 工作者）须设同一值。 */
+void st_moe_ep_set_split(int split);
+
+/* MoE EP · EPLB（专家并行负载均衡，§9.25）：把专家→rank 从「静态均分/手工切分」
+ * 升级为「按实测热度 + 各 rank 算力自动求任意置换」，使各 rank 完成时间趋同。
+ * 纪律：只改「谁算」不改「怎么算」——每个 C_j 仍由唯一 rank 用同一原始点积核产出、
+ * 协调者仍按 j 升序归约 → A≡C 位级一致保持。跨机由协调者在会话启动时经 transport
+ * 广播同一张表（两侧同表）。
+ *   st_moe_ep_eplb_config：配置（on=0 关闭；heat_path 为 l:e:count 热度文件；
+ *                          cap 为各 rank 算力权重，ncap 项，空/NULL 视为全 1）。
+ *   st_moe_ep_eplb_on    ：是否启用，供握手决定是否传表。
+ *   st_moe_ep_eplb_build ：按热度+算力贪心 LPT 建表（任意置换）；owner_out 需 ≥ne 项。
+ *   st_moe_ep_set_owner_tbl：安装/清除 owner 表（ne 项 uint8，值∈[0,nranks)）。 */
+void st_moe_ep_eplb_config(int on, const char *heat_path, const double *cap, int ncap);
+int  st_moe_ep_eplb_on(void);
+int  st_moe_ep_eplb_build(int ne, int nranks, uint8_t *owner_out);
+void st_moe_ep_set_owner_tbl(const uint8_t *tbl, int ne);
+
+/* 单板串行法（§9.26）：单 rank「独占」FFN 基准。
+ * 在一块板上串行测「某 rank 独占时」的每层 FFN 计算时延（跨机 EP 时每块板独占
+ * 自己的核 + 带宽，故该值 ≈ 跨机时该 rank 的时延；同机并发是错误代理，§9.11）。
+ * 只读本 rank 拥有的专家段 → 常驻集 ≈「加载该 rank 分片」的常驻集（内存等价，
+ * 磁盘/I/O 不等价）。nranks=1 → rank0 拥全部专家（单板全做，必然含 I/O）；
+ * nranks=2 → 双板各半。reps 为每层重复次数（取 min）。返回 0 = 成功。 */
+int st_moe_ep_rank_bench(STModelWeights *w, int nranks, int rank,
+                         int layers_max, int reps);
+
+/**
+ * Phase-2 L3 cold-block Q4 disk eviction (--l3-evict). Called after prefill by
+ * both the bench path and the HTTP serve path. Packs cold KV blocks into the
+ * L3 cache file (--l3-path, default kv_l3.bin) and frees them from RAM.
+ */
+void l3_evict_after_prefill(STQwenInferenceState *st, int keep_lcp, int incremental);
+
+/**
+ * P3: materialize the first `prefix_len` tokens' KV rows back into RAM from
+ * the L3 Q4 payload, for every block that eviction freed (blocks[l][b] NULL
+ * but metadata on_disk). This is a pure decompress-and-store pass: no GEMM, no
+ * attention, no re-computation.
+ *
+ * Why: with L3 on, the prefix-reuse gates in the serve layer are hard-disabled
+ * because prefill cannot read the NULLed blocks. Restoring the rows lets a
+ * follow-up request keep its shared prefix (ist_reset keeps cache_len) and
+ * prefill only the new suffix, instead of re-running a full prefill.
+ *
+ * Allocation follows st_qwen_kv_rebuild_freed's layout (KV_GUARD-padded blocks,
+ * f32 when that world exists, q8 when use_kv_q8).
+ *
+ * Returns >= 0 = number of blocks rebuilt; the [0, prefix_len) rows are then
+ * complete in RAM (0 = nothing was missing: no L3 state / no evicted block /
+ * everything already resident). Returns -1 = at least one block could not be
+ * rebuilt, so the prefix is INCOMPLETE and the caller must not reuse it.
+ */
+int l3_restore_prefix(STQwenInferenceState *st, int prefix_len);
+
+/**
+ * Copy the KV cache for the first `prefix_len` tokens
+ * from `src` into `dst` (exact copy, zero quality loss). Enables prefix reuse:
+ * a shared prompt prefix is prefilled once, then cheaply forked into multiple
+ * request states so only the unique suffix needs prefill. `dst` must already be
+ * initialized with the same model config and a max_seq >= src's max_seq.
+ */
+void st_qwen_copy_kv_prefix(STQwenInferenceState *dst,
+                            const STQwenInferenceState *src,
+                            int prefix_len);
+
+/**
+ * Continuous batching: decode ONE next token for `n_batch` independent
+ * requests in a single forward pass. Each layer's weight matrices are read
+ * once and reused across all requests (amortizing the decode memory-bound
+ * weight traffic, MA5-PAR independent-session composition). Each request
+ * attends only its own KV prefix (per-request cache_len), so results are
+ * bit-identical to decoding each request separately with st_qwen_model_forward.
+ * `sts[i]` must be distinct initialized states with the same model config;
+ * `tokens[i]` is the next token for request i.
+ */
+void st_qwen_model_forward_batch(STQwenInferenceState *const *sts,
+                                 int n_batch, const int *tokens);
+
+/**
+ * Multimodal prefill: image/video + text inference.
+ * Replaces <image_pad>/<video_pad> placeholder tokens with visual embeddings
+ * from the vision encoder and runs the full LLM forward pass.
+ *
+ * @param st             Initialized inference state
+ * @param token_ids      Tokenized prompt (with vision placeholder tokens)
+ * @param n_tokens       Total number of tokens in the prompt
+ * @param visual_tokens  Visual encoder output [n_vis_tokens, dim]
+ * @param n_vis_tokens   Number of visual tokens
+ * @param grid_thw       [grid_t, grid_h, grid_w] for visual region 3D positions
+ *                       Pass NULL for images (defaults to [1, gh, gw])
+ * @return 0 on success, -1 on error
+ */
+int st_qwen_model_multimodal_prefill(STQwenInferenceState *st,
+                                      const int *token_ids, int n_tokens,
+                                      const float *visual_tokens, int n_vis_tokens,
+                                      int grid_thw[3]);
+
+/**
+ * Multimodal prefill with multiple visual regions (multi-image / image+video).
+ * grids: [n_regions][3] = {grid_t, grid_h, grid_w} per region, in the same
+ * order the visual tokens were concatenated. Each region contributes
+ * grid_t*grid_h*grid_w visual tokens (main grid only).
+ * ds_features: optional DeepStack features [n_ds][n_vis_tokens, dim], injected
+ * into the LLM's first n_ds layers at the visual-token positions (official
+ * _deepstack_process). Pass NULL/0 to disable.
+ * @return 0 on success, -1 on error
+ */
+int st_qwen_model_multimodal_prefill_ex(STQwenInferenceState *st,
+                                         const int *token_ids, int n_tokens,
+                                         const float *visual_tokens, int n_vis_tokens,
+                                         const int *grids, int n_regions,
+                                         const float *const *ds_features, int n_ds,
+                                         int start);
+/* start: 跳过前 start 个 token 行的 KV 写入（前缀复用，P4）。调用前调用方
+ * 必须已把 st 的 cache_len[l]/seq_len 置为 start（ist_reset(keep)），本函数
+ * 只计算并写入 [start, n_tokens) 的行；MRoPE 位置按全序列绝对值计算，与前缀
+ * 一致。start=0 时行为与旧签名完全一致。调用方须保证 0 <= start < n_tokens。 */
+
+/**
+ * Free inference state.
+ */
+void st_qwen_inference_free(STQwenInferenceState *st);
+
+/* Free a KV cache block base (debug page-guarded allocations must be released
+ * with the matching path; see vllm_safetensors.c). */
+void st_qwen_kv_free_raw(void *raw);
+
+/* Free one KV block by payload pointer + payload byte count (v2 lazy-mmap
+ * blocks must be munmap'ed with their exact size; guards auto-reconciled). */
+void st_qwen_kv_free_block(void *payload, size_t payload_bytes);
+
+/* Re-allocate the fp32/INT8 KV blocks freed by Phase-2 L3 eviction (they were
+ * set NULL). Call before the next prefill so it can write the new request's
+ * KV. Returns bytes allocated (0 = none freed previously). */
+size_t st_qwen_kv_rebuild_freed(STQwenInferenceState *st);
+
+/* ---- Disk KV persistence (serve --disk-kv) ----
+ * Snapshot the first n_tokens rows of the F32 KV cache to `path` together
+ * with the model geometry, so a later process (after a restart) can restore
+ * the same prefix and only prefill the suffix. F32 keeps the restore bit-
+ * exact with a fresh prefill (same guarantee as the in-RAM prefix reuse;
+ * P4 实测 2026-09-07 见方案文档 §7.2：该"位级"保证仅限覆盖纯 prefill 行、
+ * 且与批量形状相关的场景，跨 decode 行的恢复在对抗性输入下贪心输出可分叉)。
+ * The checkpoint is invalid when the model geometry changes (checked on load).
+ * Saves st->cache_len[0] rows max; call with n_tokens <= cache_len[0].
+ * Returns 0 on success, nonzero on failure (corrupt/geometry mismatch...). */
+int st_kv_disk_save(STQwenInferenceState *st, const char *path,
+                    const int *tokens, int n_tokens);
+int st_kv_disk_load(STQwenInferenceState *st, const char *path, int n_tokens);
+
+/* ---- Utility: bfloat16 to float32 ---- */
+
+/** Convert a single bfloat16 value to float32. */
+static inline float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = (uint32_t)bf16 << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/** Convert float32 to bfloat16. */
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* VLLM_SAFETENSORS_H */

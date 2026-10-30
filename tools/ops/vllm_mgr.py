@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""vllm_mgr.py - supervisor for the vllm_kestrel engine (RK3588 board).
+
+A tiny zero-dependency (stdlib-only) process manager that:
+  * starts / stops / restarts the engine from the persisted config file
+    written by the engine's /admin/api/config/save endpoint
+  * serves a minimal HTTP status page (default port 8082) so the admin
+    page at :8080/admin/ can start the engine after a shutdown
+
+Usage:
+  python3 tools/ops/vllm_mgr.py status                 # show engine status
+  python3 tools/ops/vllm_mgr.py start                  # launch the engine (nohup)
+  python3 tools/ops/vllm_mgr.py stop                   # stop it (SIGTERM -> SIGKILL)
+  python3 tools/ops/vllm_mgr.py restart                # stop then start
+  python3 tools/ops/vllm_mgr.py serve [--serve 8082]   # HTTP supervisor (daemon loop)
+
+Config file schema (written by the admin page):
+  { "model_dir": "<path-to-model-dir>", "kv_q4": false,
+    "prefix_kv": true, "prefix_cache": false, "prefill_q8": false,
+    "sparse_attn": false,
+    "sparse_k": 32,
+    "sparse_prefill": false, "sparse_pf_k": 32, "sparse_pf_group": 4,
+    "port": 8080, "threads": 8, "max_queued": 16,
+    "batch_max": 8,
+    "min_free_mb": 2048, "env": {"OMP_NUM_THREADS": "4"} }
+
+工业边缘（预置命名上下文 / 会话 / 审计；审查台独立页 http://<host>:<port>/review）：
+  "rulebook_dir": ""      -> --rulebook-dir（留空 = 关闭预置上下文）
+  "session_dir": ""       -> --session-dir（留空 = 关闭服务端会话存储）
+  "session_limit": 0      -> --session-limit（>0 时注入；0 = 引擎默认 1024）
+  "audit_log": ""         -> --audit-log（留空 = 用 <session_dir>/admin_audit.jsonl）
+组件配置（K-ADMIN-001；由管理页 /admin/{kb,laya,yolo} 写入，各自独立成页）：
+  "embed_model": ""       -> --embed-model（向量模型目录；留空 = 复用主模型）
+  "kb_root": ""           -> --kb-root（知识库根目录，管理页浏览 .vkb）
+  "laya_pack": ""         -> --laya-pack（Laya 决策权重包目录）
+  "yolo_model": ""        -> --yolo-model（检测模型，VQF v4）
+  "yolo_conf": 0.0        -> --yolo-conf（>0 时注入）
+  "yolo_iou": 0.0         -> --yolo-iou（>0 时注入）
+视频源检测（K-E2E-005；YOLO 卡片下配置，留空/0 = 不注入）：
+  "yolo_video_src": ""    -> --yolo-video-src（默认视频源：file|dir|http://|rtsp://）
+  "yolo_video_frames": 0  -> --yolo-video-frames（/v1/detect_video 默认抽帧数）
+  "yolo_video_interval_ms": 0 -> --yolo-video-interval-ms（常驻拉流抽帧间隔）
+云边协同（云端上游回退；默认 never = 不注入，零回归）：
+  "cloud_endpoint": ""    -> --cloud-endpoint（http://host[:port]；仅明文 http）
+  "cloud_model": ""       -> --cloud-model（转发时覆盖的模型名）
+  "cloud_fallback": "never" -> --cloud-fallback（never | on-unready | always）
+  凭据不走本文件：请用 env VLLM_CLOUD_KEY（cfg["env"]）或手工 --cloud-key
+拒答与转人工（K-E2E-004；由管理页 /admin/kb 写入）：
+  "kb_abstain": 0        -> --kb-abstain（0 = 关；>0 时 /v1/rag 证据分低于此值即拒答）
+  "handoff_url": ""      -> --handoff-url（拒答/escalate 时 POST 通知外部工单系统；留空 = 不回调）
+规则包需离线预处理：vllm_kestrel --serve --auto-load --model <dir>
+  --rulebook-dir <dir> --rulebook-build <手册文件> --rulebook-id <id> ...
+
+Optional key, not written by the admin page but honoured when present in a
+hand-edited config: "wmode" — passed through to the engine's --wmode. 量化在
+转换期由 vqf_convert --wmode 固化进 VQF 文件，加载侧不选择；只有 g256 离线
+基准档需要加载侧同档位才能通过布局校验。
+"""
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root (two levels up from tools/ops/), overridable for board layouts that
+# do not match the repository layout (e.g. a dedicated deploy directory).
+REPO = os.environ.get("VLLM_MGR_REPO", os.path.dirname(os.path.dirname(HERE)))
+
+def env_path(name, dflt):
+    v = os.environ.get(name)
+    return v if v else dflt
+
+def config_path():
+    return env_path("VLLM_ADMIN_CONFIG", os.path.join(REPO, "webmgr", "config.json"))
+
+def log_path():
+    return env_path("VLLM_ADMIN_LOG", os.path.join(REPO, "logs", "engine.log"))
+
+def flag_path():
+    return env_path("VLLM_MGR_FLAG", os.path.join(REPO, "webmgr", "restart.flag"))
+
+def find_bin():
+    v = os.environ.get("VLLM_MGR_BIN")
+    if v and os.path.isfile(v):
+        return v
+    for c in (os.path.join(HERE, "..", "..", "build-rk3588", "vllm_kestrel"),
+              os.path.join(HERE, "..", "..", "build", "vllm_kestrel"),
+              os.path.join(REPO, "build-rk3588", "vllm_kestrel"),
+              "./build-rk3588/vllm_kestrel"):
+        if os.path.isfile(c):
+            return c
+    return os.path.join(REPO, "build-rk3588", "vllm_kestrel")
+
+
+def load_config():
+    p = config_path()
+    if not os.path.isfile(p):
+        return None, p
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f), p
+    except Exception:
+        return None, p
+
+
+def build_cmd(cfg, bin_):
+    cmd = [bin_, "--serve",
+           "--port", str(int(cfg.get("port", 8080))),
+           "--model", cfg.get("model_dir", os.path.join(REPO, "models", "qwen3-vl-2b")),
+           "--threads", str(int(cfg.get("threads", 8))),
+           "--max-queued", str(int(cfg.get("max_queued", 16))),
+           "--min-free-mb", str(int(cfg.get("min_free_mb", 2048)))]
+    # 对外模型标识（/v1/models、OpenAI 请求的 model 字段）。缺省时引擎回落到内置
+    # 默认名，会与实际模型不符 —— 因此管理页的「模型 ID」写入 config.json 后在此透传。
+    _mi = str(cfg.get("model_id") or "").strip()
+    if _mi:
+        cmd += ["--model-id", _mi]
+    # 连续批处理（--batch-max N，0/1 = 关，上限 32）：多用户并发档。
+    _bm = int(cfg.get("batch_max") or 0)
+    if _bm > 0:
+        cmd += ["--batch-max", str(_bm)]
+    # 量化模式已从管理页移除：量化在转换期由 vqf_convert --wmode 固化进 VQF 文件，
+    # 加载侧不再选择。仅当 config 显式携带 wmode 时透传（手工编辑 / 遗留配置的
+    # 逃生口——例如 g256 离线基准档需要加载侧 --wmode g256 通过布局校验）。
+    _wm = str(cfg.get("wmode") or "").strip()
+    if _wm:
+        cmd += ["--wmode", _wm]
+    if cfg.get("kv_q4"):
+        cmd.append("--kv-q4")
+    # KV 前缀复用默认开（引擎默认）；管理页取消勾选（prefix_kv=false）时才关闭
+    if cfg.get("prefix_kv", True) is False:
+        cmd.append("--no-prefix-kv")
+    if cfg.get("prefix_cache"):
+        cmd.append("--prefix-cache")
+    if cfg.get("prefill_q8"):
+        cmd.append("--prefill-q8")
+    if cfg.get("sparse_attn"):
+        cmd += ["--sparse-attn", "--sparse-k", str(int(cfg.get("sparse_k", 32)))]
+    # 稀疏 prefill：只有 env 门 VLLM_SPARSE_PREFILL（由 cfg["env"] 注入，见下方 env 组装），
+    # 两个旋钮走 CLI。默认关，所以默认 argv 与改动前逐字相同。
+    #   --sparse-pf-k     prefill 专用保留块数（0 = 沿用 --sparse-k）
+    #   --sparse-pf-group 选块粒度：每 G 个 token 共享一次选块（0 = 旧行为，会丢针；推荐 4~8）
+    if cfg.get("sparse_attn") and cfg.get("sparse_prefill"):
+        pfk = int(cfg.get("sparse_pf_k") or 0)
+        if pfk > 0:
+            cmd += ["--sparse-pf-k", str(pfk)]
+        pfg = cfg.get("sparse_pf_group")
+        pfg = 4 if pfg is None else int(pfg)
+        if pfg > 0:
+            cmd += ["--sparse-pf-group", str(pfg)]
+    if cfg.get("l3_evict"):
+        if not cfg.get("sparse_attn"):
+            # L3 cold-block eviction needs sparse decode attention
+            cmd += ["--sparse-attn"]
+        cmd += ["--l3-evict"]
+        cmd += ["--l3-ratio", str(float(cfg.get("l3_ratio", 0.75)))]
+        cmd += ["--l3-min-seq", str(int(cfg.get("l3_min_seq", 0)))]
+        p = str(cfg.get("l3_path") or "").strip()
+        if p:
+            cmd += ["--l3-path", p]   # L3 cache file path (e.g. eMMC mount)
+        ms = int(cfg.get("l3_max_size") or 0)
+        if ms > 0:
+            cmd += ["--l3-max-size", str(ms)]   # size cap in MB (0 = unlimited)
+        ttl = int(cfg.get("l3_user_ttl") or 30)
+        if ttl > 0:
+            cmd += ["--l3-user-ttl", str(ttl)]  # per-user file idle TTL in minutes
+    if cfg.get("device"):
+        cmd += ["--device", str(cfg["device"])]   # device profile override
+    if cfg.get("disk_kv"):
+        # Disk KV persistence: F32 conversation snapshots survive restarts.
+        d = str(cfg.get("disk_kv_dir") or "").strip()
+        cmd += ["--disk-kv", d or "kv_disk"]
+    # 工业边缘：预置命名上下文（规则包）/ 会话存储 / 管理面审计。
+    # 目录留空 = 关闭对应功能（引擎侧 --rulebook-dir / --session-dir 缺省即关）。
+    # 审计日志留空时引擎默认落到 <session_dir>/admin_audit.jsonl。
+    rb_dir = str(cfg.get("rulebook_dir") or "").strip()
+    if rb_dir:
+        cmd += ["--rulebook-dir", rb_dir]
+    se_dir = str(cfg.get("session_dir") or "").strip()
+    if se_dir:
+        cmd += ["--session-dir", se_dir]
+        try:
+            se_limit = int(cfg.get("session_limit") or 0)
+        except (TypeError, ValueError):
+            se_limit = 0
+        if se_limit > 0:
+            cmd += ["--session-limit", str(se_limit)]
+    au_log = str(cfg.get("audit_log") or "").strip()
+    if au_log:
+        cmd += ["--audit-log", au_log]
+    if cfg.get("spec"):
+        # n-gram speculative decode (greedy-only) with draft length --spec-k.
+        cmd += ["--spec", "--spec-k", str(int(cfg.get("spec_k", 4)))]
+    mp = cfg.get("min_p")
+    if mp:
+        cmd += ["--min-p", str(float(mp))]
+    # K-ADMIN-001：协作/感知组件配置（由管理页 /admin/{kb,laya,yolo} 写入 config.json，
+    # 保存后重启生效）。全部为可选项，留空即不注入对应 CLI 参数。
+    _em = str(cfg.get("embed_model") or "").strip()
+    if _em:
+        cmd += ["--embed-model", _em]
+    _kr = str(cfg.get("kb_root") or "").strip()
+    if _kr:
+        cmd += ["--kb-root", _kr]
+    _lp = str(cfg.get("laya_pack") or "").strip()
+    if _lp:
+        cmd += ["--laya-pack", _lp]
+    _ym = str(cfg.get("yolo_model") or "").strip()
+    if _ym:
+        cmd += ["--yolo-model", _ym]
+    try:
+        _ycf = float(cfg.get("yolo_conf") or 0)
+    except (TypeError, ValueError):
+        _ycf = 0.0
+    if _ycf > 0:
+        cmd += ["--yolo-conf", str(_ycf)]
+    try:
+        _yiou = float(cfg.get("yolo_iou") or 0)
+    except (TypeError, ValueError):
+        _yiou = 0.0
+    if _yiou > 0:
+        cmd += ["--yolo-iou", str(_yiou)]
+    # K-E2E-005 视频源检测：默认视频源 + 抽帧参数（留空/0 = 不注入，零回归）
+    _yvs = str(cfg.get("yolo_video_src") or "").strip()
+    if _yvs:
+        cmd += ["--yolo-video-src", _yvs]
+    try:
+        _yvf = int(cfg.get("yolo_video_frames") or 0)
+    except (TypeError, ValueError):
+        _yvf = 0
+    if _yvf > 0:
+        cmd += ["--yolo-video-frames", str(_yvf)]
+    try:
+        _yvi = int(cfg.get("yolo_video_interval_ms") or 0)
+    except (TypeError, ValueError):
+        _yvi = 0
+    if _yvi > 0:
+        cmd += ["--yolo-video-interval-ms", str(_yvi)]
+    # 云边协同：云端上游回退（默认不注入 = never，零回归）。
+    # 凭据（Bearer）不走 config.json：请用 env VLLM_CLOUD_KEY（见 cfg["env"] 透传）。
+    _ce = str(cfg.get("cloud_endpoint") or "").strip()
+    if _ce:
+        cmd += ["--cloud-endpoint", _ce]
+        _cm = str(cfg.get("cloud_model") or "").strip()
+        if _cm:
+            cmd += ["--cloud-model", _cm]
+        _cfb = str(cfg.get("cloud_fallback") or "never").strip()
+        if _cfb in ("on-unready", "always"):
+            cmd += ["--cloud-fallback", _cfb]
+    # 拒答与转人工（K-E2E-004）：kb_abstain>0 才注入（0 = 关闭，零回归）；
+    # handoff_url 留空 = 不回调外部系统。
+    try:
+        _kab = float(cfg.get("kb_abstain") or 0)
+    except (TypeError, ValueError):
+        _kab = 0.0
+    if _kab > 0:
+        cmd += ["--kb-abstain", str(_kab)]
+    _hu = str(cfg.get("handoff_url") or "").strip()
+    if _hu:
+        cmd += ["--handoff-url", _hu]
+    # Load-on-use / unload-when-idle (用时加载 / 不用时卸载): the model is
+    # loaded on the first request and auto-unloaded after idle seconds.
+    if cfg.get("auto_load"):
+        cmd.append("--load-on-use")
+    au = int(cfg.get("auto_unload_s") or 0)
+    if au > 0:
+        cmd += ["--auto-unload", str(au)]
+    # 加载格式（--load-format）：v1.0 引擎为纯 VQF 运行时，加载时自动定位模型
+    # 目录内的 model.vqf，auto 与 vqf 等价，故不再注入该参数。
+    if not cfg.get("auto_start"):
+        # Manual mode: the engine starts with the model NOT loaded; the
+        # admin page triggers the load (VQF 单文件，量化由文件固化).
+        cmd.append("--no-auto-load")
+    else:
+        # auto_start = 常驻：supervisor 拉起引擎并同步加载模型（引擎侧
+        # g_serve_auto_load 默认为 0，必须显式 --auto-load 才会在启动时加载）。
+        cmd.append("--auto-load")
+    return cmd
+
+
+def build_env(cfg):
+    env = dict(os.environ)
+    e = cfg.get("env") or {}
+    for k, v in e.items():
+        env[str(k)] = str(v)
+    env.setdefault("OMP_NUM_THREADS", "4")
+    return env
+
+
+def _pid_alive(pid):
+    """PID 存在且不是僵尸进程。"""
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            st = f.read().rsplit(")", 1)[1].split()[0]
+        return st != "Z"
+    except Exception:
+        return False
+
+
+def _is_engine_proc(pid):
+    """核对 /proc/<pid>/cmdline 是否确为引擎的 --serve 调用。
+
+    pgrep -f 是正则匹配整条命令行，可能命中恰好含该串的其它进程（shell、
+    编辑器、tail 日志等），从而在引擎并未运行时误报 "engine already running"。
+    cmdline 读不到（权限）时保守视为匹配。"""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\x00") if a]
+    except Exception:
+        return True
+    if not argv:
+        return False
+    return os.path.basename(argv[0]).startswith("vllm") and "--serve" in argv
+
+
+def engine_pids():
+    """PIDs of the running engine (pgrep on the --serve command line)."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "vllm_kestrel --serve"],
+            stderr=subprocess.DEVNULL, text=True)
+        pids = [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+    # 过滤僵尸与 pgrep 误匹配（陈旧记录是 "already running" 误报的来源）
+    return [p for p in pids if _pid_alive(p) and _is_engine_proc(p)]
+
+
+def start_engine():
+    cfg, path = load_config()
+    if cfg is None:
+        return {"ok": False,
+                "error": "no config at %s - save it from the admin page first" % path}
+    pids = engine_pids()
+    if pids:
+        return {"ok": False, "error": "engine already running", "pids": pids}
+    bin_ = find_bin()
+    if not os.path.isfile(bin_):
+        return {"ok": False, "error": "engine binary not found: %s" % bin_}
+    cmd = build_cmd(cfg, bin_)
+    env = build_env(cfg)
+    os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+    try:
+        with open(log_path(), "ab") as logf:
+            logf.write(b"\n===== engine start %s =====\n" %
+                       time.strftime("%F %T").encode())
+            logf.flush()
+            p = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                 env=env, start_new_session=True)
+    except Exception as e:
+        return {"ok": False, "error": "launch failed: %s" % e}
+    return {"ok": True, "pid": p.pid, "cmd": " ".join(cmd)}
+
+
+def stop_engine(timeout=12):
+    pids = engine_pids()
+    if not pids:
+        return {"ok": True, "note": "engine not running"}
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    for _ in range(timeout * 2):
+        if not engine_pids():
+            return {"ok": True, "stopped": pids}
+        time.sleep(0.5)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    return {"ok": True, "stopped": pids, "note": "SIGKILL after SIGTERM timeout"}
+
+
+def request_restart():
+    f = flag_path()
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    with open(f, "w") as fh:
+        fh.write(time.strftime("%F %T"))
+    return {"ok": True, "note": "restart armed: engine will relaunch after shutdown"}
+
+
+
+def status():
+    pids = engine_pids()
+    cfg, cpath = load_config()
+    return {
+        "engine_running": bool(pids),
+        "pids": pids,
+        "config": cpath,
+        "config_exists": cfg is not None,
+        "binary": find_bin(),
+        "restart_armed": os.path.isfile(flag_path()),
+        "time": time.strftime("%F %T"),
+    }
+
+
+# ---------------- HTTP supervisor ----------------
+
+def page_html():
+    st = status()
+    color = "#3ecf8e" if st["engine_running"] else "#ffb020"
+    state = "运行中" if st["engine_running"] else "已停止"
+    eng = ("<a href='http://%s:8080/admin/' target='_blank'>打开完整管理页 (:8080/admin/)</a>"
+           % (os.environ.get("HOSTNAME", "localhost")))
+    if not st["engine_running"] and not st["config_exists"]:
+        eng += "<p style='color:#888'>尚未保存配置 - 先在引擎运行期间打开管理页保存配置。</p>"
+    return """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>vLLM-Kestrel supervisor</title><style>
+body{background:#0f1419;color:#d7e0ea;font-family:Consolas,"Microsoft YaHei",monospace;padding:30px;max-width:640px;margin:0 auto}
+h1{font-size:18px}.st{font-size:16px;margin:14px 0}.dot{display:inline-block;width:10px;height:10px;border-radius:50%%;margin-right:8px;background:%s}
+button{background:#202a36;color:#d7e0ea;border:1px solid #2c3a4a;border-radius:6px;padding:8px 16px;margin:4px;font-size:14px;cursor:pointer}
+button:hover{border-color:#4da3ff}.k{color:#8ea0b4;font-size:12px}</style></head><body>
+<h1>vLLM-Kestrel supervisor</h1>
+<div class="st"><span class="dot"></span>引擎状态: <b>%s</b> <span id="pid">%s</span></div>
+<div class="k">%s</div>
+<div style="margin-top:16px">
+<button onclick="post('/api/start')">启动引擎</button>
+<button onclick="post('/api/stop')">停止引擎</button>
+<button onclick="post('/api/restart')">重启</button>
+</div>
+<div id="out" style="margin-top:12px;font-size:13px;white-space:pre-wrap"></div>
+<script>
+async function post(p){var o=document.getElementById('out');o.textContent='...';
+try{var r=await fetch(p,{method:'POST'});var j=await r.json();
+o.textContent=JSON.stringify(j,null,2);}catch(e){o.textContent='ERR '+e;}
+setTimeout(()=>location.reload(),1200);}
+</script></body></html>""" % (color, state, st["pids"], eng)
+
+
+class MgrHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[mgr] %s\n" % (fmt % args))
+
+    def _cors(self):
+        # allow the engine admin page (:8080) to call this supervisor (:8082)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, html):
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        if p.path == "/":
+            self._html(page_html())
+        elif p.path == "/api/status":
+            self._json(status())
+        else:
+            self._json({"ok": False, "error": "not found"}, 404)
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        if p.path == "/api/start":
+            res = start_engine()
+        elif p.path == "/api/stop":
+            res = stop_engine()
+        elif p.path == "/api/restart":
+            res = request_restart()
+        else:
+            res = {"ok": False, "error": "not found"}
+        self._json(res)
+
+
+def supervise_loop(stop_event):
+    """Supervision loop:
+      * auto_relaunch the engine when restart.flag is present and the engine
+        is down (the admin page arms it before shutting the engine down);
+      * if config.auto_start is enabled, automatically start the engine when
+        it is down (build_cmd then adds --auto-load so the model loads too)."""
+    while not stop_event.wait(2.0):
+        try:
+            if engine_pids():
+                continue
+            if os.path.isfile(flag_path()):
+                os.remove(flag_path())
+                res = start_engine()
+                print("[mgr] auto-restart: %s" % json.dumps(res, ensure_ascii=False),
+                      flush=True)
+                continue
+            cfg, _ = load_config()
+            if cfg and cfg.get("auto_start"):
+                res = start_engine()
+                print("[mgr] auto_start: %s" % json.dumps(res, ensure_ascii=False),
+                      flush=True)
+        except Exception as e:
+            print("[mgr] supervise loop error: %s" % e, flush=True)
+
+
+def serve_http(port):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), MgrHandler)
+    stop_event = threading.Event()
+    t = threading.Thread(target=supervise_loop, args=(stop_event,), daemon=True)
+    t.start()
+    print("[mgr] supervisor listening on :%d  (admin page: engine :8080/admin/)" % port,
+          flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="vllm_kestrel supervisor")
+    ap.add_argument("action", nargs="?", default="status",
+                    choices=["start", "stop", "restart", "status", "serve"])
+    ap.add_argument("--serve", nargs="?", const=8082, type=int, default=None,
+                    help="run the HTTP supervisor (default port 8082)")
+    args = ap.parse_args()
+
+    if args.serve is not None:
+        serve_http(args.serve)
+        return
+
+    if args.action == "status":
+        print(json.dumps(status(), ensure_ascii=False, indent=2))
+    elif args.action == "start":
+        print(json.dumps(start_engine(), ensure_ascii=False, indent=2))
+    elif args.action == "stop":
+        print(json.dumps(stop_engine(), ensure_ascii=False, indent=2))
+    elif args.action == "restart":
+        print(json.dumps(stop_engine(), ensure_ascii=False, indent=2))
+        print(json.dumps(start_engine(), ensure_ascii=False, indent=2))
+    elif args.action == "serve":
+        serve_http(8082)
+
+
+if __name__ == "__main__":
+    main()

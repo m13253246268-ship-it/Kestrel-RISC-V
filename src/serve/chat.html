@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-en="vLLM-Kestrel Inference Client">vLLM-Kestrel 推理客户端</title>
+<style>
+:root{
+  --bg:#0e131a; --panel:#161d27; --panel2:#1d2734; --bd:#2a3648;
+  --tx:#d7e0ea; --tx2:#8ea0b4; --acc:#4da3ff; --ok:#3ecf8e; --bad:#ff6b6b; --warn:#ffb020;
+  --user:#24466b; --ai:#1c2632;
+  --panel3:#243042; --bd-hi:#3a4a63; --tx3:#61748c; --acc-soft:rgba(77,163,255,.12);
+  --focus:rgba(77,163,255,.3); --tr:.18s;
+  /* ---- Lucide icons (inline data-URI, offline-safe) ---- */
+  --i-zap:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E");
+  --i-langs:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 8 6 6'/%3E%3Cpath d='m4 14 6-6 2-3'/%3E%3Cpath d='M2 5h12'/%3E%3Cpath d='M7 2h1'/%3E%3Cpath d='m22 22-5-10-5 10'/%3E%3Cpath d='M14 18h6'/%3E%3C/svg%3E");
+  --i-sliders:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='21' x2='14' y1='4' y2='4'/%3E%3Cline x1='10' x2='3' y1='4' y2='4'/%3E%3Cline x1='21' x2='12' y1='12' y2='12'/%3E%3Cline x1='8' x2='3' y1='12' y2='12'/%3E%3Cline x1='21' x2='16' y1='20' y2='20'/%3E%3Cline x1='12' x2='3' y1='20' y2='20'/%3E%3Cline x1='14' x2='14' y1='2' y2='6'/%3E%3Cline x1='8' x2='8' y1='10' y2='14'/%3E%3Cline x1='16' x2='16' y1='18' y2='22'/%3E%3C/svg%3E");
+  --i-activity:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2'/%3E%3C/svg%3E");
+  --i-trash:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/%3E%3Cpath d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/%3E%3C/svg%3E");
+  --i-image:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='18' height='18' x='3' y='3' rx='2' ry='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21'/%3E%3C/svg%3E");
+  --i-film:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='18' height='18' x='3' y='3' rx='2'/%3E%3Cpath d='M7 3v18'/%3E%3Cpath d='M3 7.5h4'/%3E%3Cpath d='M3 12h18'/%3E%3Cpath d='M3 16.5h4'/%3E%3Cpath d='M17 3v18'/%3E%3Cpath d='M17 7.5h4'/%3E%3Cpath d='M17 16.5h4'/%3E%3C/svg%3E");
+  --i-send:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m22 2-7 20-4-9-9-4Z'/%3E%3Cpath d='M22 2 11 13'/%3E%3C/svg%3E");
+  --i-x:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 6 6 18'/%3E%3Cpath d='m6 6 12 12'/%3E%3C/svg%3E");
+  --i-user:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2'/%3E%3Ccircle cx='12' cy='7' r='4'/%3E%3C/svg%3E");
+  --i-bot:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 8V4H8'/%3E%3Crect width='16' height='12' x='4' y='8' rx='2'/%3E%3Cpath d='M2 14h2'/%3E%3Cpath d='M20 14h2'/%3E%3Cpath d='M15 13v2'/%3E%3Cpath d='M9 13v2'/%3E%3C/svg%3E");
+}
+*{box-sizing:border-box}
+body{margin:0;background:
+  radial-gradient(900px 420px at 80% -12%,rgba(77,163,255,.07),transparent 60%),
+  var(--bg);
+  color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace;height:100vh;display:flex;flex-direction:column}
+
+/* ---- 图标：CSS mask 伪元素（免疫 textContent/innerHTML 重写） ---- */
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-langs{--icon:var(--i-langs)}
+.ic-sliders{--icon:var(--i-sliders)}
+.ic-activity{--icon:var(--i-activity)}
+.ic-trash{--icon:var(--i-trash)}
+.ic-image{--icon:var(--i-image)}
+.ic-film{--icon:var(--i-film)}
+.ic-send{--icon:var(--i-send)}
+.ic-x{--icon:var(--i-x)}
+
+header{display:flex;align-items:center;gap:11px;padding:10px 18px;background:linear-gradient(180deg,#1a2330,#161d27);border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.brand{width:32px;height:32px;border-radius:8px;flex:none;background:linear-gradient(135deg,#57a7ff,#2f6fe0);box-shadow:0 4px 14px rgba(77,163,255,.35);-webkit-mask:var(--i-zap) center/18px no-repeat;mask:var(--i-zap) center/18px no-repeat}
+.brandwrap{display:flex;flex-direction:column;gap:1px;min-width:0;margin-right:2px}
+header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px;line-height:1.25}
+.brandwrap .sub{font-size:9.5px;color:var(--tx3);letter-spacing:2px}
+.badge{display:inline-flex;align-items:center;gap:7px;padding:3px 11px;border-radius:10px;font-size:12px;border:1px solid var(--bd);background:var(--panel2);transition:color var(--tr),border-color var(--tr)}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;box-shadow:0 0 8px currentColor}
+.badge.ok{color:var(--ok);border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.08)}
+.badge.stop{color:#7a8ba0}
+.badge.warn{color:var(--warn);border-color:rgba(255,176,32,.55);background:rgba(255,176,32,.08)}
+/* ---------- 可验证推理（attest）凭证 UI ---------- */
+.attbar{margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px}
+.attbtn{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--ok);color:var(--ok);border-radius:8px;
+        padding:2px 9px;font:inherit;font-size:11px;cursor:pointer;transition:background var(--tr),border-color var(--tr)}
+.attbtn:hover{background:rgba(62,207,142,.14);border-color:var(--ok)}
+.attbtn.off{border-color:var(--tx2);color:var(--tx2)}
+.attbtn.off:hover{background:rgba(142,160,180,.1)}
+.attpanel{margin-top:8px;border:1px solid var(--bd-hi);border-radius:9px;padding:10px 12px;
+          background:rgba(0,0,0,.2);font-size:11px;line-height:1.65}
+.attpanel .row{margin:2px 0}
+.attpanel code{word-break:break-all;font-size:10.5px;color:var(--tx2);background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px}
+.attpanel .ok{color:var(--ok)}
+.attpanel .bad{color:var(--bad)}
+.attpanel .mut{color:var(--tx2)}
+.attpanel button{margin-top:6px;margin-right:6px}
+header select.ctxsel{background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:6px 8px;font:inherit;font-size:12px;cursor:pointer;transition:border-color var(--tr),box-shadow var(--tr)}
+header select.ctxsel:hover{border-color:var(--acc)}
+header select.ctxsel:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--focus)}
+a{color:var(--acc);text-decoration:none}
+.navlink{display:inline-flex;align-items:center;gap:7px;color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:7px;padding:5px 11px;background:var(--panel2);cursor:pointer;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+#warnbar{display:none;background:linear-gradient(90deg,rgba(255,176,32,.12),transparent 45%),#33240f;color:var(--warn);border-bottom:1px solid #5c471f;border-left:3px solid var(--warn);padding:7px 18px;font-size:12px;line-height:1.6}
+#warnbar.show{display:block}
+#main{flex:1;overflow-y:auto;padding:18px 18px;display:flex;flex-direction:column;gap:13px}
+.msg{max-width:78%;padding:11px 14px;border-radius:12px;white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.6}
+.msg.user{align-self:flex-end;background:linear-gradient(180deg,#2b5480,#234366);border:1px solid rgba(77,163,255,.4);border-bottom-right-radius:3px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.msg.ai{align-self:flex-start;background:linear-gradient(180deg,#212c3a,#1c2632);border:1px solid var(--bd);border-bottom-left-radius:3px;box-shadow:0 4px 14px rgba(0,0,0,.22)}
+.msg .meta{font-size:10px;color:var(--tx2);margin-bottom:5px;opacity:.9;display:flex;align-items:center;gap:5px;text-transform:uppercase;letter-spacing:.5px}
+.msg .meta::before{content:"";width:11px;height:11px;flex:none;background-color:currentColor;-webkit-mask:var(--i-bot) center/contain no-repeat;mask:var(--i-bot) center/contain no-repeat}
+.msg.user .meta{color:#9ec4f5}
+.msg.user .meta::before{-webkit-mask-image:var(--i-user);mask-image:var(--i-user)}
+.msg img, .msg video{max-width:240px;border-radius:8px;display:block;margin:4px 0;border:1px solid var(--bd)}
+.msg .frames{display:flex;flex-wrap:wrap;gap:4px}
+.msg .frames img{max-width:110px}
+#metrics{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 18px;background:linear-gradient(180deg,#1a2330,var(--panel));border-top:1px solid var(--bd);font-size:12px;color:var(--tx2);min-height:34px}
+#metrics .stat{display:inline-flex;align-items:baseline;gap:5px;background:var(--panel2);border:1px solid var(--bd);border-radius:7px;padding:3px 9px;white-space:nowrap;transition:border-color var(--tr)}
+#metrics .stat:hover{border-color:var(--bd-hi)}
+#metrics .stat .k{color:var(--tx2);font-size:11px}
+#metrics .stat b{color:var(--acc);font-weight:600;font-size:13px}
+#metrics .stat .u{color:var(--tx2);font-size:10px;opacity:.7}
+#metrics.hidden{display:none}
+#inputbar{display:flex;gap:10px;align-items:flex-end;padding:11px 18px 15px;background:linear-gradient(180deg,var(--panel),#141b25);border-top:1px solid var(--bd)}
+#attachments{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.att{position:relative;display:inline-flex}
+.att img,.att video{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--bd)}
+.att .x{position:absolute;top:-6px;right:-6px;background:var(--bad);color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:11px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+textarea{flex:1;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:140px;transition:border-color var(--tr),box-shadow var(--tr)}
+textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--focus)}
+textarea::placeholder{color:var(--tx3)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:color var(--tr),border-color var(--tr),background var(--tr),filter var(--tr)}
+button:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-soft)}
+button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.08);color:#07131f;background:linear-gradient(180deg,#57a7ff,#3d8bee)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.toolbtn{font-size:12px;padding:6px 11px}
+.hidden{display:none !important}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.overlay{position:fixed;inset:0;background:rgba(5,8,12,.62);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.modal{background:linear-gradient(180deg,#1a2330,#161d27);border:1px solid var(--bd-hi);border-radius:14px;padding:18px;width:100%;max-width:440px;max-height:86vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.55)}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px;font-size:14px;font-weight:600;border-bottom:1px solid var(--bd);padding-bottom:10px}
+.modal .fld{display:flex;flex-direction:column;gap:4px;margin:10px 0;font-size:12px;color:var(--tx2)}
+.modal .fld input[type=number],.modal .fld select,.modal input[type=text]{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:7px 9px;font-family:inherit;font-size:13px;transition:border-color var(--tr),box-shadow var(--tr)}
+.modal .fld input[type=number]:focus,.modal .fld select:focus,.modal input[type=text]:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--focus)}
+.modal input::placeholder{color:var(--tx3)}
+.modal .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+#perf_list{max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:6px}
+.pf{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:8px 11px;font-size:12px;transition:border-color var(--tr)}
+.pf:hover{border-color:var(--bd-hi)}
+.pf .t{color:var(--tx2);font-size:10px;margin-bottom:4px}
+.pf .g{display:flex;gap:12px;flex-wrap:wrap}
+.pf .g span{color:var(--tx2)}
+.pf b{color:var(--acc);font-weight:600}
+@media (max-width:720px){
+  header{flex-wrap:wrap;gap:8px;padding:8px 12px}
+  header h1{font-size:14px}
+  .brandwrap .sub{display:none}
+  #clock{display:none}
+  #main{padding:10px 10px 12px;gap:10px}
+  .msg{max-width:94%;font-size:15px;padding:9px 12px}
+  .msg img,.msg video{max-width:100%}
+  #inputbar{flex-direction:column;align-items:stretch;gap:8px;padding:8px 12px 12px}
+  textarea{flex:none;width:100%;min-height:52px}
+  #btn_send{width:100%;padding:12px}
+  #metrics{gap:4px;padding:6px 12px}
+  #metrics .stat{padding:2px 7px}
+}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--bd);border-radius:5px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--bd-hi)}
+::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand" aria-hidden="true"></span>
+  <div class="brandwrap">
+    <h1 data-en="vLLM-Kestrel Inference Client">vLLM-Kestrel 推理客户端</h1>
+    <div class="sub">vLLM-KESTREL · CHAT CONSOLE</div>
+  </div>
+  <span id="engBadge" class="badge">引擎: 未知</span>
+  <span id="attBadge" class="badge">🔏 可验证: 未知</span>
+  <span style="flex:1"></span>
+  <button id="btn_settings" class="toolbtn ic-sliders" title="推理参数设置" data-en-title="Inference settings" data-en="Settings">设置</button>
+  <button id="btn_perf" class="toolbtn ic-activity" title="性能指标历史" data-en-title="Performance history" data-en="Perf">性能</button>
+  <button id="btn_clear_hist" class="toolbtn ic-trash" title="清空当前会话的历史记录（对话与上下文）" data-en-title="Clear the current session history (messages and context)" data-en="Clear history">清理历史</button>
+  <select id="p_ctx" class="ctxsel" title="上下文关联模式：全关联=全部历史；关联前十条=最近10条消息；无关联=只看本轮（TTFT 最快）。控制每轮上下文计算量" data-en-title="Context mode: Full = all history; Last 10 = the 10 most recent messages; None = current turn only (fastest TTFT). Controls per-turn context computation.">
+    <option value="full" data-en="Full">全关联</option>
+    <option value="last10" data-en="Last 10">关联前十条</option>
+    <option value="none" data-en="None">无关联</option>
+  </select>
+  <a href="/admin/" target="_blank" class="navlink" data-en="Admin /admin/">管理页 /admin/</a>
+  <button id="langBtn" type="button" class="toolbtn ic-langs" title="切换为中文">EN</button>
+  <span id="clock" style="color:var(--tx2);font-size:12px"></span>
+</header>
+<div id="warnbar"><span data-en="Model not loaded — go to ">模型未加载 —— 请到 </span><a href="/admin/" target="_blank" style="text-decoration:underline"><span data-en="Admin">管理页</span></a><span data-en=" to select a quantization type and click &quot;Load Model&quot;; once loaded you can chat here."> 选择量化类型并点击「加载模型」，加载完成后即可在此对话。</span></div>
+<div id="main"></div>
+<div id="metrics" class="hidden"></div>
+<div id="settings" class="overlay hidden">
+  <div class="modal">
+    <div class="modal-head"><span data-en="Inference settings">推理设置</span><button id="btn_close_set" class="toolbtn ic-x" title="关闭" data-en-title="Close"></button></div>
+    <label class="fld"><span data-en="User ID (separate context; switching clears the current conversation)">用户 ID（绑定独立上下文；切换后自动清空当前对话）</span>
+      <input type="text" id="p_user" placeholder="留空 = 匿名（共享上下文）" data-en-ph="Empty = anonymous (shared context)"></label>
+    <label class="fld">max_tokens<input type="number" id="p_max" min="1" max="4096" value="256"></label>
+    <label class="fld">temperature<input type="number" id="p_temp" min="0" max="2" step="0.1" value="0.7"></label>
+    <label class="fld">top_p<input type="number" id="p_topp" min="0" max="1" step="0.05" value="0.9"></label>
+    <label class="fld"><span data-en="Output mode">输出模式</span>
+      <select id="p_stream"><option value="1" data-en="Streaming SSE">流式 SSE</option><option value="0" data-en="Single JSON">一次性 JSON</option></select>
+    </label>
+    <div class="row">
+      <button id="btn_clear" class="toolbtn" data-en="Clear conversation">清空对话</button>
+      <button id="btn_done_set" class="primary" data-en="Done">完成</button>
+    </div>
+  </div>
+</div>
+<div id="perf" class="overlay hidden">
+  <div class="modal">
+    <div class="modal-head"><span data-en="Performance history">性能指标历史</span><div style="display:flex;gap:6px"><button id="btn_clear_perf" class="toolbtn ic-trash" title="清空全部性能记录" data-en-title="Clear all performance records" data-en="Clear records">清空记录</button><button id="btn_close_perf" class="toolbtn ic-x" title="关闭" data-en-title="Close"></button></div></div>
+    <input type="text" id="perf_search" placeholder="搜索（时间 / token / 耗时 / 速度…）" data-en-ph="Search (time / token / latency / speed…)">
+    <div id="perf_meta" style="font-size:11px;color:var(--tx2);margin:6px 0"></div>
+    <div id="perf_list"></div>
+  </div>
+</div>
+<div id="inputbar">
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div id="attachments"></div>
+    <div style="display:flex;gap:8px">
+      <button id="btn_img" class="toolbtn ic-image" title="上传图片（可多张）" data-en-title="Upload images (multiple)" data-en="Image">图片</button>
+      <button id="btn_vid" class="toolbtn ic-film" title="上传视频（自动抽帧）" style="display:none" data-en-title="Upload video (frames auto-extracted)" data-en="Video">视频</button>
+    </div>
+    <input type="file" id="file_img" accept="image/*" multiple style="display:none">
+    <input type="file" id="file_vid" accept="video/*" style="display:none">
+  </div>
+  <textarea id="input" placeholder="输入消息…（支持文字 / 图片 / 视频，Enter 发送，Shift+Enter 换行）" data-en-ph="Type a message… (text / image / video supported; Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="btn_send" class="primary ic-send" data-en="Send">发送</button>
+</div>
+<script>
+"use strict";
+/* ============ 双语（中 / 英）================
+ * 与 admin.html 同一套机制与同一个 localStorage 键，两页语言保持一致。
+ *   - HTML 静态文案：元素加 data-en="English"；placeholder 加 data-en-ph；
+ *     title 加 data-en-title。含子元素的元素不要加 data-en，改为把中文文本段
+ *     各自包一层 <span data-en="...">…</span>。
+ *   - JS 动态文案：T("中文", "English")。
+ * 边界：引擎日志/后端原始串不在本机制内。 */
+var LANG_KEY = "vllm_lang";
+var LANG = (function(){ try { return localStorage.getItem(LANG_KEY) === "en" ? "en" : "zh"; } catch(e){ return "zh"; } })();
+function T(zh, en){ return LANG === "en" ? en : zh; }
+function applyLang(){
+  document.documentElement.lang = (LANG === "en") ? "en" : "zh-CN";
+  document.querySelectorAll("[data-en]").forEach(function(el){
+    if (el.__zh === undefined) el.__zh = el.textContent;
+    el.textContent = (LANG === "en") ? el.dataset.en : el.__zh;
+  });
+  document.querySelectorAll("[data-en-html]").forEach(function(el){
+    if (el.__zhHtml === undefined) el.__zhHtml = el.innerHTML;
+    el.innerHTML = (LANG === "en") ? el.dataset.enHtml : el.__zhHtml;
+  });
+  document.querySelectorAll("[data-en-ph]").forEach(function(el){
+    if (el.__zhPh === undefined) el.__zhPh = el.placeholder;
+    el.placeholder = (LANG === "en") ? el.dataset.enPh : el.__zhPh;
+  });
+  document.querySelectorAll("[data-en-title]").forEach(function(el){
+    if (el.__zhTi === undefined) el.__zhTi = el.title;
+    el.title = (LANG === "en") ? el.dataset.enTitle : el.__zhTi;
+  });
+  var lb = document.getElementById("langBtn");
+  if (lb){ lb.textContent = T("EN", "中文"); lb.title = T("Switch to English", "切换为中文"); }
+  try { localStorage.setItem(LANG_KEY, LANG); } catch(e){}
+}
+function setLang(l){ LANG = (l === "en") ? "en" : "zh"; applyLang(); }
+/* 语言切换后重跑本页的动态渲染（指标条 / 性能历史 / 附件缩略图 / 状态徽标）。 */
+function refreshAfterLang(){
+  if (lastMet) renderMetrics(lastMet);
+  renderPerfHistory();
+  renderAttachments();
+  refreshStatus();
+  renderAttBadge();
+  rerenderAttestAll();
+}
+const $ = id => document.getElementById(id);
+let history = [];        /* OpenAI-format messages (for multi-turn) */
+let historyTokens = null; /* 引擎回传的完整历史 token 序列（下轮 context_tokens 复用） */
+let curAtt = null;        /* 本轮 attest 采集：{body,out,proof}（请求/输出原文 + 凭证） */
+let lastAttInfo = null;   /* GET /v1/attest 最近一次结果（启用态 + 设备公钥） */
+let attPub = null;        /* 设备公钥 hex（浏览器内 SM2 验签用，公开信息） */
+let attachments = [];    /* {kind:'image', url} | {kind:'video', frames:[url...]} */
+let streaming = false;
+let genCount = 0;        /* tokens received in the current stream (progress) */
+let streamT0 = 0;        /* performance.now() at stream start */
+let progTimer = 0;       /* progress refresh interval id */
+const PERF_KEY = "vllm_perf_hist";
+let metricHistory = [];
+try { metricHistory = JSON.parse(localStorage.getItem(PERF_KEY) || "[]"); } catch (e) { metricHistory = []; }
+if (!Array.isArray(metricHistory)) metricHistory = [];
+let lastMet = null;      /* 最近一次指标，用于切换语言时重绘指标条 */
+
+function statusTxt(st){
+  return ({
+    "-1":T("未知","Unknown"), 0:T("未加载","Not loaded"), 1:T("加载中","Loading"), 2:T("就绪","Ready"), 3:T("加载失败","Load failed")
+  })[st];
+}
+
+async function refreshStatus(){
+  try {
+    const s = await fetch("/admin/api/status").then(r => r.json());
+    const st = s.load_state;
+    const badge = $("engBadge");
+    badge.textContent = T("模型: ","Model: ") + (statusTxt(st) || st) + (s.device_id ? " · " + s.device_id : "");
+    badge.className = "badge " + (st === 2 ? "ok" : st === 1 ? "warn" : "stop");
+    $("warnbar").classList.toggle("show", st !== 2);
+    /* 模型未加载(0)/加载失败(3)时仍允许发送：--load-on-use 会在请求到达时
+     * 自动重载模型（卸载→重载→上下文延续）；仅"加载中"或流式进行中禁用。 */
+    $("btn_send").disabled = streaming || (st === 1);
+  } catch (e) {
+    $("engBadge").textContent = T("引擎: 已停止","Engine: stopped");
+    $("engBadge").className = "badge stop";
+    $("warnbar").classList.add("show");
+    $("btn_send").disabled = true;
+  }
+}
+
+/* ---------- message rendering ---------- */
+function addMsg(role, parts){
+  const box = document.createElement("div");
+  box.className = "msg " + (role === "user" ? "user" : "ai");
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = role === "user" ? T("你","You") : "vllm-kestrel";
+  box.appendChild(meta);
+  const body = document.createElement("div");
+  body.className = "body";
+  box.appendChild(body);
+  for (const p of parts){
+    if (p.type === "text"){
+      const t = document.createElement("div");
+      t.textContent = p.text;
+      body.appendChild(t);
+    } else if (p.type === "image"){
+      const im = document.createElement("img");
+      im.src = p.url;
+      body.appendChild(im);
+    } else if (p.type === "video"){
+      const fr = document.createElement("div");
+      fr.className = "frames";
+      for (const u of p.frames){
+        const im = document.createElement("img");
+        im.src = u;
+        fr.appendChild(im);
+      }
+      body.appendChild(fr);
+    }
+  }
+  $("main").appendChild(box);
+  box.scrollIntoView({behavior:"smooth", block:"end"});
+  return body;
+}
+
+/* ---------- attachments (image / video) ---------- */
+function addAttachment(a){
+  attachments.push(a);
+  renderAttachments();
+}
+function renderAttachments(){
+  const box = $("attachments");
+  box.innerHTML = "";
+  attachments.forEach((a, i) => {
+    const w = document.createElement("span");
+    w.className = "att";
+    const el = document.createElement(a.kind === "image" ? "img" : "video");
+    if (a.kind === "image") el.src = a.url;
+    else { el.src = a.frames[0]; el.title = a.frames.length + T(" 帧"," frames"); }
+    const x = document.createElement("button");
+    x.className = "x";
+    x.textContent = "×";
+    x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
+    w.appendChild(el); w.appendChild(x);
+    box.appendChild(w);
+  });
+}
+$("btn_img").onclick = () => $("file_img").click();
+$("file_img").onchange = e => {
+  for (const f of e.target.files){
+    const r = new FileReader();
+    r.onload = () => addAttachment({kind:"image", url: r.result});
+    r.readAsDataURL(f);
+  }
+  e.target.value = "";
+};
+$("btn_vid").onclick = () => $("file_vid").click();
+$("file_vid").onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  msgStatus(T("视频抽帧中…","Extracting video frames…"));
+  try {
+    const frames = await extractFrames(f, 8);
+    addAttachment({kind:"video", frames});
+    msgStatus("");
+  } catch (err) {
+    msgStatus(T("视频处理失败: ","Video processing failed: ") + err, true);
+  }
+};
+async function extractFrames(file, n){
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.src = url; v.muted = true; v.preload = "auto";
+  await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej("decode"); });
+  await new Promise((res, rej) => { v.oncanplay = res; v.onerror = () => rej("decode"); });
+  const dur = v.duration || 0;
+  const frames = [];
+  for (let i = 0; i < n; i++){
+    v.currentTime = dur * (i + 0.5) / n;
+    await new Promise(res => { v.onseeked = res; });
+    const scale = Math.min(1, 448 / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(v.videoWidth * scale));
+    c.height = Math.max(1, Math.round(v.videoHeight * scale));
+    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+    frames.push(c.toDataURL("image/jpeg", 0.7));
+  }
+  URL.revokeObjectURL(url);
+  return frames;
+}
+
+/* ---------- status line (metrics) ---------- */
+function msgStatus(text, isErr){
+  const m = $("metrics");
+  if (!text){ m.classList.add("hidden"); return; }
+  m.classList.remove("hidden");
+  m.innerHTML = isErr
+    ? '<span style="color:var(--bad)">' + text + "</span>"
+    : '<span class="spinner"></span> ' + text;
+}
+function statChip(label, value, unit){
+  return '<span class="stat"><span class="k">' + label + '</span><b>' + value +
+         '</b>' + (unit ? '<span class="u">' + unit + '</span>' : "") + '</span>';
+}
+function showProgress(nTok, elapsedMs){
+  const m = $("metrics");
+  m.classList.remove("hidden");
+  m.innerHTML =
+    statChip(T("生成进度","Generated"), nTok, "tok") +
+    statChip(T("已耗时","Elapsed"), (elapsedMs / 1000).toFixed(1), "s") +
+    '<span class="spinner"></span>';
+}
+function stopProgress(){
+  if (progTimer){ clearInterval(progTimer); progTimer = 0; }
+}
+function saveMetric(met){
+  metricHistory.unshift({
+    t: new Date().toLocaleString(),
+    prompt_tokens: met.prompt_tokens, last_user_tokens: met.last_user_tokens,
+    n_tokens: met.n_tokens, ttft_ms: met.ttft_ms, tpot_ms: met.tpot_ms,
+    prefill_ms: met.prefill_ms, total_ms: met.total_ms, tok_s: met.tok_s
+  });
+  if (metricHistory.length > 200) metricHistory.length = 200;
+  try { localStorage.setItem(PERF_KEY, JSON.stringify(metricHistory)); } catch (e) {}
+}
+function perfText(e){
+  return [e.t, T("上下文","Context"), e.prompt_tokens, T("上一问","Last user"), e.last_user_tokens, T("生成","Generated"), e.n_tokens,
+    "ttft", e.ttft_ms, "tpot", e.tpot_ms, "prefill", e.prefill_ms,
+    T("总耗时","Total"), e.total_ms, T("速度","Speed"), e.tok_s].join(" ");
+}
+function renderPerfHistory(){
+  const q = ($("perf_search").value || "").trim().toLowerCase();
+  const list = $("perf_list");
+  const filtered = metricHistory.filter(e => !q || perfText(e).toLowerCase().indexOf(q) >= 0);
+  $("perf_meta").textContent = T("共 ","Total ") + metricHistory.length + T(" 条，匹配 "," records, matched ") + filtered.length + T(" 条"," records");
+  if (!filtered.length){
+    list.innerHTML = '<div style="color:var(--tx2);text-align:center;padding:12px">' +
+      (metricHistory.length ? T("无匹配","No match") : T("暂无记录","No records")) + '</div>';
+    return;
+  }
+  list.innerHTML = filtered.map(e =>
+    '<div class="pf"><div class="t">' + e.t + '</div><div class="g">' +
+      '<span>' + T("上下文","Context") + ' <b>' + ((e.prompt_tokens || 0) * 4 / 1024).toFixed(2) + ' KB</b></span>' +
+      '<span>' + T("生成","Generated") + ' <b>' + (e.n_tokens != null ? e.n_tokens : "—") + '</b> tok</span>' +
+      '<span>TTFT <b>' + (e.ttft_ms != null ? e.ttft_ms.toFixed(1) : "—") + '</b> ms</span>' +
+      '<span>TPOT <b>' + (e.tpot_ms != null ? e.tpot_ms.toFixed(1) : "—") + '</b> ms</span>' +
+      '<span>' + T("总耗时","Total") + ' <b>' + (e.total_ms != null ? e.total_ms.toFixed(1) : "—") + '</b> ms</span>' +
+      '<span>' + T("速度","Speed") + ' <b>' + (e.tok_s != null ? e.tok_s.toFixed(2) : "—") + '</b> tok/s</span>' +
+    '</div></div>'
+  ).join("");
+  applyLang();
+}
+function showMetrics(met){
+  if (met.n_tokens > 0 || met.prompt_tokens > 0) saveMetric(met);
+  lastMet = met;
+  renderMetrics(met);
+}
+function renderMetrics(met){
+  const m = $("metrics");
+  m.classList.remove("hidden");
+  const tok_s = (met.tok_s != null ? met.tok_s : (met.total_ms > 0 ? met.n_tokens * 1000 / met.total_ms : 0)).toFixed(2);
+  const lastU = (met.last_user_tokens != null) ? met.last_user_tokens : "—";
+  const ctxKB = ((met.prompt_tokens || 0) * 4 / 1024).toFixed(2);
+  m.innerHTML =
+    statChip(T("上下文总长","Context length"), ctxKB, "KB") +
+    statChip(T("上一问","Last user"), lastU, "tok") +
+    statChip(T("生成","Generated"), met.n_tokens, "tok") +
+    statChip("TTFT", met.ttft_ms.toFixed(1), "ms") +
+    statChip("TPOT", met.tpot_ms.toFixed(1), "ms") +
+    statChip("prefill", met.prefill_ms.toFixed(1), "ms") +
+    statChip(T("总耗时","Total"), met.total_ms.toFixed(1), "ms") +
+    statChip(T("速度","Speed"), tok_s, "tok/s");
+}
+
+/* ---------- send ---------- */
+async function send(){
+  if (streaming || $("btn_send").disabled) return;
+  const text = $("input").value.trim();
+  const atts = attachments.slice();
+  if (!text && atts.length === 0) return;
+  $("input").value = "";
+  /* 多模态轮次后引擎重置文本 KV 前缀，token 序列不可复用。 */
+  if (atts.length) historyTokens = null;
+  let rawContent = "";   /* 原始 delta 拼接（不含 cleanDelta），保存为历史 */
+
+  /* build user message parts */
+  const parts = [];
+  if (text) parts.push({type:"text", text});
+  for (const a of atts){
+    if (a.kind === "image") parts.push({type:"image", url: a.url});
+    else parts.push({type:"video", frames: a.frames});
+  }
+  attachments = [];
+  renderAttachments();
+  addMsg("user", parts);
+
+  /* OpenAI format */
+  const apiParts = [];
+  if (text) apiParts.push({type:"text", text});
+  for (const a of atts){
+    if (a.kind === "image") apiParts.push({type:"image_url", image_url:{url: a.url}});
+    else apiParts.push({type:"video_frames", video_frames: a.frames});
+  }
+  history.push({role:"user", content: apiParts});
+  const bodyObj = {
+    model: "qwen3-vl-8b",
+    messages: history,
+    context_mode: $("p_ctx").value,
+    max_tokens: parseInt($("p_max").value, 10) || 256,
+    temperature: parseFloat($("p_temp").value) || 0.7,
+    top_p: parseFloat($("p_topp").value) || 0.9,
+    stream: $("p_stream").value === "1"
+  };
+  /* token 级历史复用：完整上下文模式下回传引擎的 history_tokens，使历史 KV
+   * 精确保留、每轮只 prefill 新增内容（TTFT 不再随轮次累积增长）。 */
+  if (historyTokens && $("p_ctx").value === "full")
+    bodyObj.context_tokens = historyTokens;
+  /* 用户 ID：绑定独立上下文（L3 缓存文件 / disk_kv 恢复隔离）。 */
+  const uid = $("p_user").value.trim();
+  if (uid) bodyObj.user = uid;
+
+  const aiBody = addMsg("assistant", [{type:"text", text:""}]);
+  const aiText = aiBody.querySelector("div");
+  /* 可验证推理（attest）：保存本轮「请求原文」与「输出原文」，两者是复算
+   * body_sha / digest 的必要输入（必须与引擎实际收到/产出的字节一致）。 */
+  const rawBody = JSON.stringify(bodyObj);
+  curAtt = { body: rawBody, out: "", proof: null };
+  streaming = true;
+  refreshStatus();
+  const t0 = performance.now();
+  try {
+    if (bodyObj.stream){
+      await streamRequest(bodyObj, aiText, t0, (s)=>{ rawContent += s; curAtt.out += s; }, rawBody);
+    } else {
+      const r = await fetch("/v1/chat/completions", {
+        method:"POST", headers:{"Content-Type":"application/json","X-Kestrel-Meta":"1"}, body: rawBody
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok){
+        const err = (j.error && j.error.message) || ("HTTP " + r.status);
+        aiText.textContent = T("错误: ","Error: ") + err;
+        showMetricsFallback(t0);
+        history.pop();
+        throw new Error(err);
+      }
+      const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+      aiText.textContent = cleanDelta(content);
+      rawContent = content;   /* 历史保存用原始文本（cleanDelta 仅用于显示） */
+      curAtt.out = content;
+      if (j.attest) curAtt.proof = j.attest;
+      if (j.history_tokens) historyTokens = j.history_tokens;
+      if (j.metrics) showMetrics(j.metrics);
+      else showMetricsFallback(t0);
+    }
+    if (curAtt.proof) renderAttest(aiBody, curAtt);
+    history.push({role:"assistant", content: rawContent || aiText.textContent});
+  } catch (e) {
+    if (e.name !== "AbortError" && !aiText.textContent) aiText.textContent = T("请求失败: ","Request failed: ") + e;
+    msgStatus(e.message || String(e), true);
+  } finally {
+    streaming = false;
+    refreshStatus();
+  }
+}
+function showMetricsFallback(t0){
+  const dt = performance.now() - t0;
+  showMetrics({prompt_tokens:0, n_tokens:0, ttft_ms:dt, tpot_ms:0, total_ms:dt, prefill_ms:0, tok_s:0});
+}
+async function streamRequest(bodyObj, aiText, t0, onRaw, rawBody){
+  const resp = await fetch("/v1/chat/completions", {
+    method:"POST", headers:{"Content-Type":"application/json","X-Kestrel-Meta":"1"},
+    body: rawBody || JSON.stringify(bodyObj)
+  });
+  if (!resp.ok){
+    const j = await resp.json().catch(() => ({}));
+    const err = (j.error && j.error.message) || ("HTTP " + resp.status);
+    aiText.textContent = T("错误: ","Error: ") + err;
+    history.pop();
+    throw new Error(err);
+  }
+  if (!resp.body){
+    const j = await resp.json();
+    if (j.metrics) showMetrics(j.metrics);
+    else showMetricsFallback(t0);
+    return;
+  }
+  streamT0 = t0;
+  genCount = 0;
+  progTimer = setInterval(() => showProgress(genCount, performance.now() - streamT0), 200);
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;){
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream:true});
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0){
+        const ev = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        parseSSE(ev, aiText, onRaw);
+      }
+    }
+    if (buf.trim()) parseSSE(buf, aiText, onRaw);
+  } finally {
+    stopProgress();
+  }
+}
+function parseSSE(ev, aiText, onRaw){
+  const m = ev.match(/^data: (.*)$/m);
+  if (!m) return;
+  let j;
+  try { j = JSON.parse(m[1]); } catch (e) { return; }
+  if (j.object === "chat.completion.metrics"){
+    stopProgress();
+    showMetrics(j.metrics || {});
+    return;
+  }
+  if (j.object === "chat.completion.tokens" && Array.isArray(j.tokens)){
+    historyTokens = j.tokens;
+    return;
+  }
+  /* 可验证推理凭证：随流末尾独立事件下发（send() 收流后统一渲染） */
+  if (j.object === "chat.completion.attest" && j.attest){
+    if (curAtt) curAtt.proof = j.attest;
+    return;
+  }
+  const c = j.choices && j.choices[0];
+  if (c && c.delta && typeof c.delta.content === "string"){
+    aiText.textContent += cleanDelta(c.delta.content);
+    if (onRaw) onRaw(c.delta.content);
+    genCount++;
+    showProgress(genCount, performance.now() - streamT0);
+  }
+}
+
+/* ============ 可验证推理（attest）浏览器内自验 ============
+ * 与设备端（src/serve/vllm_attest.c）及离线脚本（tools/security/verify_attest.py）用同一套
+ * 帧规范复算，零第三方依赖：
+ *   body_sha = SM3(请求体原始字节)
+ *   digest   = SM3( magic || F(model_fp) || F(model) || F(device) || F(user) ||
+ *                   F(params) || F(prompt_tokens) || F(n_tokens) || F(finish) ||
+ *                   F(ts) || F(body_sha) || frame(输出文本原始字节) )
+ *   其中 F(x)=u32be(len(x))||x，magic 由 schema 决定（3→"VLLM-AT-3"）。
+ * 结论 = SM2(digest) 验签通过 且 digest 与复算一致 且 body_sha 一致。
+ * 注意：面板内“验证”按钮的复算结果仅用于即时自检；权威复验以导出的
+ * proof/request/output 三件套 + 设备公钥跑 verify_attest.py 为准。 */
+
+/* ---------- 字节工具 ---------- */
+function _utf8(s){ return new TextEncoder().encode(s); }
+function _hex(bytes){ let h = ""; for (let i = 0; i < bytes.length; i++) h += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16); return h; }
+function _unhex(h){ const n = h.length >> 1, o = new Uint8Array(n); for (let i = 0; i < n; i++) o[i] = parseInt(h.substr(i * 2, 2), 16); return o; }
+function _cat(list){ let n = 0; for (const a of list) n += a.length; const o = new Uint8Array(n); let p = 0; for (const a of list) { o.set(a, p); p += a.length; } return o; }
+function _u32be(n){ const b = new Uint8Array(4); b[0] = (n >>> 24) & 255; b[1] = (n >>> 16) & 255; b[2] = (n >>> 8) & 255; b[3] = n & 255; return b; }
+function _u16be(n){ return new Uint8Array([(n >> 8) & 255, n & 255]); }
+function _big32(x){ const b = new Uint8Array(32); let v = x; for (let i = 31; i >= 0; i--) { b[i] = Number(v & 255n); v >>= 8n; } return b; }
+
+/* ---------- SM3 (GB/T 32905-2016)，与 src/common/vllm_crypto.c 同源 ---------- */
+const _SM3_IV = [0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600, 0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e];
+function _rotl32(x, n){ n &= 31; return ((x << n) | (x >>> (32 - n))) >>> 0; }
+function _sm3p0(x){ return (x ^ _rotl32(x, 9) ^ _rotl32(x, 17)) >>> 0; }
+function _sm3p1(x){ return (x ^ _rotl32(x, 15) ^ _rotl32(x, 23)) >>> 0; }
+function _sm3Compress(s, block){
+  const w = new Array(68);
+  for (let i = 0; i < 16; i++)
+    w[i] = ((block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3]) >>> 0;
+  for (let j = 16; j < 68; j++)
+    w[j] = (_sm3p1((w[j - 16] ^ w[j - 9] ^ _rotl32(w[j - 3], 15)) >>> 0) ^ _rotl32(w[j - 13], 7) ^ w[j - 6]) >>> 0;
+  const wp = new Array(64);
+  for (let j = 0; j < 64; j++) wp[j] = (w[j] ^ w[j + 4]) >>> 0;
+  let a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
+  for (let j = 0; j < 64; j++){
+    const tj = j < 16 ? 0x79cc4519 : 0x7a879d8a;
+    const ss1 = _rotl32((_rotl32(a, 12) + e + _rotl32(tj, j)) >>> 0, 7);
+    const ss2 = (ss1 ^ _rotl32(a, 12)) >>> 0;
+    const ff = j < 16 ? (a ^ b ^ c) >>> 0 : ((a & b) | (a & c) | (b & c)) >>> 0;
+    const gg = j < 16 ? (e ^ f ^ g) >>> 0 : ((e & f) | ((~e) & g)) >>> 0;
+    const tt1 = (ff + d + ss2 + wp[j]) >>> 0;
+    const tt2 = (gg + h + ss1 + w[j]) >>> 0;
+    d = c; c = _rotl32(b, 9); b = a; a = tt1;
+    h = g; g = _rotl32(f, 19); f = e; e = _sm3p0(tt2);
+  }
+  s[0] = (s[0] ^ a) >>> 0; s[1] = (s[1] ^ b) >>> 0; s[2] = (s[2] ^ c) >>> 0; s[3] = (s[3] ^ d) >>> 0;
+  s[4] = (s[4] ^ e) >>> 0; s[5] = (s[5] ^ f) >>> 0; s[6] = (s[6] ^ g) >>> 0; s[7] = (s[7] ^ h) >>> 0;
+}
+function sm3(bytes){
+  const s = _SM3_IV.slice();
+  const n = bytes.length;
+  const total = (((n + 9 + 63) >> 6) << 6);
+  const m = new Uint8Array(total);
+  m.set(bytes, 0);
+  m[n] = 0x80;
+  const bits = n * 8;
+  const hi = Math.floor(bits / 4294967296), lo = bits % 4294967296;
+  m[total - 8] = (hi >>> 24) & 255; m[total - 7] = (hi >>> 16) & 255; m[total - 6] = (hi >>> 8) & 255; m[total - 5] = hi & 255;
+  m[total - 4] = (lo >>> 24) & 255; m[total - 3] = (lo >>> 16) & 255; m[total - 2] = (lo >>> 8) & 255; m[total - 1] = lo & 255;
+  for (let off = 0; off < total; off += 64) _sm3Compress(s, m.subarray(off, off + 64));
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 8; i++){
+    out[i * 4] = (s[i] >>> 24) & 255; out[i * 4 + 1] = (s[i] >>> 16) & 255;
+    out[i * 4 + 2] = (s[i] >>> 8) & 255; out[i * 4 + 3] = s[i] & 255;
+  }
+  return out;
+}
+
+/* ---------- SM2 验签 (GM/T 0003.2)，与 tools/security/verify_attest.py 同参数 ---------- */
+const _P  = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFFn;
+const _A  = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFCn;
+const _B  = 0x28E9FA9E9D9F5E344D5A9E4BCF6509A7F39789F515AB8F92DDBCBD414D940E93n;
+const _N  = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123n;
+const _GX = 0x32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7n;
+const _GY = 0xBC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0n;
+function _modinv(x){
+  let r = 1n, b = ((x % _P) + _P) % _P, e = _P - 2n;
+  while (e > 0n){ if (e & 1n) r = r * b % _P; b = b * b % _P; e >>= 1n; }
+  return r;
+}
+function _ecAdd(p1, p2){
+  if (!p1) return p2;
+  if (!p2) return p1;
+  const x1 = p1[0], y1 = p1[1], x2 = p2[0], y2 = p2[1];
+  let lam;
+  if (x1 === x2){
+    if (((y1 + y2) % _P) === 0n) return null;
+    lam = (3n * x1 * x1 + _A) * _modinv(2n * y1) % _P;
+  } else {
+    lam = (y2 - y1) * _modinv(((x2 - x1) % _P + _P) % _P) % _P;
+  }
+  const x3 = (((lam * lam - x1 - x2) % _P) + _P) % _P;
+  const y3 = (((lam * (x1 - x3) - y1) % _P) + _P) % _P;
+  return [x3, y3];
+}
+function _ecMul(k, pt){
+  k = ((k % _N) + _N) % _N;
+  let r = null;
+  while (k > 0n){ if (k & 1n) r = _ecAdd(r, pt); pt = _ecAdd(pt, pt); k >>= 1n; }
+  return r;
+}
+function sm2Verify(pubHex, digest, sigHex, userId){
+  if (!pubHex || pubHex.length !== 128 || !sigHex || sigHex.length !== 128) return false;
+  const r = BigInt("0x" + sigHex.slice(0, 64)), s = BigInt("0x" + sigHex.slice(64));
+  const qx = BigInt("0x" + pubHex.slice(0, 64)), qy = BigInt("0x" + pubHex.slice(64));
+  if (r < 1n || r >= _N || s < 1n || s >= _N) return false;
+  if (qx < 0n || qx >= _P || qy < 0n || qy >= _P) return false;
+  if ((qx * qx * qx + _A * qx + _B - qy * qy) % _P !== 0n) return false;
+  const uid = _utf8(userId || "VLLM-ATTEST-1");
+  const za = sm3(_cat([_u16be(uid.length * 8), uid, _big32(_A), _big32(_B), _big32(_GX), _big32(_GY), _big32(qx), _big32(qy)]));
+  const e = BigInt("0x" + _hex(sm3(_cat([za, digest]))));
+  const t = (r + s) % _N;
+  if (t === 0n) return false;
+  const pt = _ecAdd(_ecMul(s, [_GX, _GY]), _ecMul(t, [qx, qy]));
+  if (!pt) return false;
+  return (e + pt[0]) % _N === r;
+}
+
+/* ---------- digest 复算（schema=3 帧规范；schema=2 旧凭证按旧 magic） ---------- */
+function _frame(bytes){ return _cat([_u32be(bytes.length), bytes]); }
+function _fstr(s){ return _frame(_utf8(s == null ? "" : String(s))); }
+function recomputeDigest(pr, bodyShaHex, textBytes){
+  const magic = pr.schema === 3 ? "VLLM-AT-3" : pr.schema === 2 ? "VLLM-AT-2" : null;
+  if (!magic) return null;
+  return _hex(sm3(_cat([
+    _utf8(magic),
+    _fstr(pr.model_fp),
+    _fstr(pr.model || ""),
+    _fstr(pr.device || ""),
+    _fstr(pr.user || ""),
+    _fstr(pr.params || ""),
+    _fstr(pr.prompt_tokens == null ? 0 : pr.prompt_tokens),
+    _fstr(pr.n_tokens == null ? 0 : pr.n_tokens),
+    _fstr(pr.finish || "stop"),
+    _fstr(pr.ts == null ? 0 : pr.ts),
+    _fstr(bodyShaHex),
+    _frame(textBytes)
+  ])));
+}
+
+/* ---------- 设备状态徽标 / 公钥 ---------- */
+function renderAttBadge(){
+  const b = $("attBadge");
+  if (!b) return;
+  if (!lastAttInfo){ b.textContent = "🔏 " + T("可验证: 未知", "Attest: unknown"); b.className = "badge"; return; }
+  if (!lastAttInfo.active){ b.textContent = "🔏 " + T("可验证: 未启用", "Attest: off"); b.className = "badge stop"; return; }
+  b.textContent = "🔏 " + T("可验证: 已启用", "Attest: on");
+  b.className = "badge ok";
+}
+async function refreshAttest(){
+  try {
+    const r = await fetch("/v1/attest").then(x => x.ok ? x.json() : null);
+    lastAttInfo = r;
+    attPub = (r && r.pub) ? r.pub : null;
+  } catch (e) { lastAttInfo = null; attPub = null; }
+  renderAttBadge();
+}
+
+/* ---------- 单条回复的凭证面板 ---------- */
+function _attEsc(s){ return String(s == null ? "" : s).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]); }
+function attPanelRow(k, v){ return '<div class="row"><span class="mut">' + _attEsc(k) + '</span> <code>' + _attEsc(v) + '</code></div>'; }
+function fillAttBar(b){
+  const att = b.__att;
+  b.innerHTML = '<span class="badge ok">🔏 ' + T("可验证凭证", "Verifiable proof") + '</span>' +
+    '<button class="attbtn" data-act="v">' + T("验证", "Verify") + '</button>' +
+    '<button class="attbtn off" data-act="e">' + T("导出凭证", "Export proof") + '</button>';
+  b.querySelector('[data-act="v"]').onclick = function(){
+    const p = b.nextElementSibling;
+    const show = (p.style.display !== "block");
+    p.style.display = show ? "block" : "none";
+    if (show && !p.__res) runAttestVerify(p);
+  };
+  b.querySelector('[data-act="e"]').onclick = function(){ exportAttest(att); };
+}
+function fillAttestPanel(p){
+  const att = p.__att, pr = att.proof || {}, res = p.__res;
+  let h = "";
+  h += attPanelRow("schema", pr.schema);
+  h += attPanelRow("model", pr.model);
+  h += attPanelRow("model_fp", pr.model_fp);
+  h += attPanelRow("device", pr.device);
+  h += attPanelRow("user", pr.user);
+  h += attPanelRow("params", pr.params);
+  h += attPanelRow("prompt_tokens", pr.prompt_tokens);
+  h += attPanelRow("n_tokens", pr.n_tokens);
+  h += attPanelRow("finish", pr.finish);
+  h += attPanelRow("ts", pr.ts);
+  h += attPanelRow("body_sha", pr.body_sha);
+  h += attPanelRow("digest", pr.digest);
+  h += attPanelRow("signature", pr.signature);
+  const mark = (name, ok, extra) => '<div class="row"><span class="' + (ok ? "ok" : "bad") + '">' +
+    (ok ? "✔" : "✘") + " " + _attEsc(name) + ": " + (ok ? "PASS" : "FAIL") + '</span> <code>' + _attEsc(extra || "") + '</code></div>';
+  if (res){
+    h += mark(T("body_sha 复算", "body_sha recompute"), res.c1, att.body.length + T(" 字节（请求体）", " bytes (request body)"));
+    h += mark(T("digest 复算", "digest recompute"), res.c2, res.got ? res.got.slice(0, 32) + "…" : "-");
+    if (res.c3 === null)
+      h += '<div class="row mut">' + T("SM2 验签: 设备公钥不可用（未启用或 /v1/attest 取不到）", "SM2 verify: device public key unavailable (off or /v1/attest unreachable)") + '</div>';
+    else
+      h += mark(T("SM2 验签", "SM2 verify"), res.c3, (attPub || "").slice(0, 16) + "…");
+    h += '<div class="row"><span class="' + (res.all ? "ok" : "bad") + '"><b>' +
+      (res.all ? T("结论: 凭证有效", "Result: VALID") : T("结论: 凭证无效", "Result: INVALID")) + '</b></span></div>';
+  }
+  h += '<div class="row mut" style="margin-top:6px">' + T("离线复验（导出三件套 + 设备公钥）: ", "Offline verify (exported trio + device pubkey): ") +
+    '<code>python tools/security/verify_attest.py --proof proof.json --request request.json --output output.txt --pub vllm_attest.pub</code></div>';
+  p.innerHTML = h;
+}
+function runAttestVerify(p){
+  const att = p.__att, pr = att.proof || {};
+  const bodySha = _hex(sm3(_utf8(att.body)));
+  const c1 = (bodySha === pr.body_sha);
+  const got = recomputeDigest(pr, bodySha, _utf8(att.out));
+  const c2 = (got !== null && got === pr.digest);
+  let c3 = null;
+  try { c3 = (attPub && got) ? sm2Verify(attPub, _unhex(got), pr.signature, (lastAttInfo && lastAttInfo.user_id) || "VLLM-ATTEST-1") : null; }
+  catch (e) { c3 = false; }
+  p.__res = { bodySha, got, c1, c2, c3, all: !!(c1 && c2 && c3 === true) };
+  fillAttestPanel(p);
+}
+function downloadText(name, text){
+  const url = URL.createObjectURL(new Blob([text], {type: "application/octet-stream"}));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+function exportAttest(att){
+  const stamp = String((att.proof && att.proof.ts) || Date.now());
+  downloadText("proof_" + stamp + ".json", JSON.stringify(att.proof, null, 2));
+  downloadText("request_" + stamp + ".json", att.body);
+  downloadText("output_" + stamp + ".txt", att.out);
+  msgStatus(T("凭证已导出（proof/request/output），可用 tools/security/verify_attest.py 离线复验", "Proof exported (proof/request/output); verify offline with tools/security/verify_attest.py"), false);
+}
+function renderAttest(aiBody, att){
+  const snap = { body: att.body, out: att.out, proof: att.proof };
+  const bar = document.createElement("div");
+  bar.className = "attbar";
+  bar.__att = snap;
+  const panel = document.createElement("div");
+  panel.className = "attpanel";
+  panel.style.display = "none";
+  panel.__att = snap;
+  fillAttBar(bar);
+  fillAttestPanel(panel);
+  aiBody.appendChild(bar);
+  aiBody.appendChild(panel);
+}
+function rerenderAttestAll(){
+  document.querySelectorAll(".attbar").forEach(b => { if (b.__att) fillAttBar(b); });
+  document.querySelectorAll(".attpanel").forEach(p => { if (p.__att) fillAttestPanel(p); });
+}
+
+/* Rendering-layer cleanup for residual artifacts:
+ * - model may emit <|im_start|>/<|im_end|> as plain text
+ * - Qwen byte-level BPE maps raw bytes onto U+0100..U+0143 (e.g. Ġ=space,
+ *   Ċ=newline); fully-merged emoji tokens are normal, but stray mid-BPE
+ *   tokens surface as those pseudo-chars and must be dropped. */
+function cleanDelta(s){
+  s = s.replace(/<\|im_(?:start|end)\|>/g, "");
+  s = s.replace(/\u010a/g, "\n").replace(/\u0120/g, " ");
+  s = s.replace(/[\u0100-\u0109\u010b-\u011f\u0121-\u0143]/g, "");
+  return s;
+}
+
+/* ---------- events ---------- */
+$("btn_send").onclick = send;
+$("input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$("btn_clear").onclick = () => {
+  clearHistory();
+  $("settings").classList.add("hidden");
+};
+function clearHistory(){
+  history = [];
+  historyTokens = null;
+  attachments = [];
+  $("main").innerHTML = "";
+  $("metrics").classList.add("hidden");
+}
+$("btn_clear_hist").onclick = () => { clearHistory(); renderAttachments(); };
+$("btn_clear_perf").onclick = () => {
+  metricHistory = [];
+  try { localStorage.removeItem(PERF_KEY); } catch (e) {}
+  renderPerfHistory();
+};
+/* settings & perf modals */
+$("btn_settings").onclick = () => $("settings").classList.remove("hidden");
+$("btn_close_set").onclick = () => $("settings").classList.add("hidden");
+$("btn_done_set").onclick = () => $("settings").classList.add("hidden");
+/* 切换用户 ID：绑定独立上下文，自动清空当前对话。 */
+$("p_user").addEventListener("change", () => {
+  clearHistory();
+  msgStatus(T("已切换用户（","Switched user (") + ($("p_user").value.trim() || T("匿名","anonymous")) + T("），对话已清空","); conversation cleared"), false);
+});
+$("btn_perf").onclick = () => { renderPerfHistory(); $("perf").classList.remove("hidden"); };
+$("btn_close_perf").onclick = () => $("perf").classList.add("hidden");
+$("perf_search").addEventListener("input", renderPerfHistory);
+$("settings").addEventListener("click", e => { if (e.target === $("settings")) $("settings").classList.add("hidden"); });
+$("perf").addEventListener("click", e => { if (e.target === $("perf")) $("perf").classList.add("hidden"); });
+$("langBtn").onclick = function(){ setLang(LANG === "en" ? "zh" : "en"); refreshAfterLang(); };
+applyLang();
+refreshStatus();
+refreshAttest();
+setInterval(refreshStatus, 5000);
+setInterval(refreshAttest, 10000);
+setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,1623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</title>
+<style>
+:root{
+  --bg:#0e131a; --panel:#161d27; --panel2:#1d2734; --bd:#2a3648;
+  --tx:#d7e0ea; --tx2:#8ea0b4; --acc:#4da3ff; --ok:#3ecf8e; --bad:#ff6b6b; --warn:#ffb020;
+  --panel3:#243042; --bd-hi:#3a4a63; --tx3:#61748c; --acc-soft:rgba(77,163,255,.12);
+  --focus:rgba(77,163,255,.3); --tr:.18s;
+  /* ---- Lucide icons (inline data-URI, offline-safe) ---- */
+  --i-zap:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E");
+  --i-langs:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 8 6 6'/%3E%3Cpath d='m4 14 6-6 2-3'/%3E%3Cpath d='M2 5h12'/%3E%3Cpath d='M7 2h1'/%3E%3Cpath d='m22 22-5-10-5 10'/%3E%3Cpath d='M14 18h6'/%3E%3C/svg%3E");
+  --i-eye:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+  --i-msgsq:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E");
+  --i-activity:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2'/%3E%3C/svg%3E");
+  --i-grid:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='7' height='7' x='3' y='3' rx='1'/%3E%3Crect width='7' height='7' x='14' y='3' rx='1'/%3E%3Crect width='7' height='7' x='14' y='14' rx='1'/%3E%3Crect width='7' height='7' x='3' y='14' rx='1'/%3E%3C/svg%3E");
+  --i-package:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7.5 4.27 9 5.15'/%3E%3Cpath d='M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z'/%3E%3Cpath d='m3.3 7 8.7 5 8.7-5'/%3E%3Cpath d='M12 22V12'/%3E%3C/svg%3E");
+  --i-sliders:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='21' x2='14' y1='4' y2='4'/%3E%3Cline x1='10' x2='3' y1='4' y2='4'/%3E%3Cline x1='21' x2='12' y1='12' y2='12'/%3E%3Cline x1='8' x2='3' y1='12' y2='12'/%3E%3Cline x1='21' x2='16' y1='20' y2='20'/%3E%3Cline x1='12' x2='3' y1='20' y2='20'/%3E%3Cline x1='14' x2='14' y1='2' y2='6'/%3E%3Cline x1='8' x2='8' y1='10' y2='14'/%3E%3Cline x1='16' x2='16' y1='18' y2='22'/%3E%3C/svg%3E");
+  --i-globe:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E");
+  --i-cpu:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='16' height='16' x='4' y='4' rx='2'/%3E%3Crect width='6' height='6' x='9' y='9' rx='1'/%3E%3Cpath d='M15 2v2'/%3E%3Cpath d='M15 20v2'/%3E%3Cpath d='M2 15h2'/%3E%3Cpath d='M2 9h2'/%3E%3Cpath d='M20 15h2'/%3E%3Cpath d='M20 9h2'/%3E%3Cpath d='M9 2v2'/%3E%3Cpath d='M9 20v2'/%3E%3C/svg%3E");
+  --i-boxes:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.7a2 2 0 0 0 2.06 0l3-1.7a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71l-3-1.7a2 2 0 0 0-2.06 0l-3 1.7Z'/%3E%3Cpath d='M7 16v-4'/%3E%3Cpath d='m9.5 11.5 5-2.9'/%3E%3Cpath d='M12.97 5.92A2 2 0 0 0 12 7.63v3.24a2 2 0 0 0 .97 1.71l3 1.7a2 2 0 0 0 2.06 0l3-1.7a2 2 0 0 0 .97-1.71V7.63a2 2 0 0 0-.97-1.71l-3-1.7a2 2 0 0 0-2.06 0Z'/%3E%3Cpath d='M17 10.5v-4'/%3E%3Cpath d='m17 2.5 3 1.7'/%3E%3C/svg%3E");
+  --i-layers:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z'/%3E%3Cpath d='m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65'/%3E%3Cpath d='m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65'/%3E%3C/svg%3E");
+  --i-gauge:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 14 4-4'/%3E%3Cpath d='M3.34 19a10 10 0 1 1 17.32 0'/%3E%3C/svg%3E");
+  --i-wrench:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z'/%3E%3C/svg%3E");
+  --i-archive:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='20' height='5' x='2' y='3' rx='1'/%3E%3Cpath d='M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8'/%3E%3Cpath d='M10 12h4'/%3E%3C/svg%3E");
+  --i-table2:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3v18'/%3E%3Crect width='18' height='18' x='3' y='3' rx='2'/%3E%3Cpath d='M3 9h18'/%3E%3Cpath d='M3 15h18'/%3E%3C/svg%3E");
+  --i-shield:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E");
+  --i-gear:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E");
+  --i-file:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/%3E%3Cpath d='M14 2v4a2 2 0 0 0 2 2h4'/%3E%3Cpath d='M10 9H8'/%3E%3Cpath d='M16 13H8'/%3E%3Cpath d='M16 17H8'/%3E%3C/svg%3E");
+  --i-play:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolygon points='6 3 20 12 6 21 6 3'/%3E%3C/svg%3E");
+  --i-refresh:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3Cpath d='M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16'/%3E%3Cpath d='M3 21v-5h5'/%3E%3C/svg%3E");
+  --i-power:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2v10'/%3E%3Cpath d='M18.4 6.6a9 9 0 1 1-12.77.04'/%3E%3C/svg%3E");
+  --i-trash:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/%3E%3Cpath d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/%3E%3C/svg%3E");
+  --i-save:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3Cpath d='M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7'/%3E%3Cpath d='M7 3v4a1 1 0 0 0 1 1h7'/%3E%3C/svg%3E");
+  --i-download:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'/%3E%3Cpolyline points='7 10 12 15 17 10'/%3E%3Cline x1='12' x2='12' y1='15' y2='3'/%3E%3C/svg%3E");
+  --i-search:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E");
+  --i-copy:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='14' height='14' x='8' y='8' rx='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E");
+  --i-pause:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='14' y='4' width='4' height='16' rx='1'/%3E%3Crect x='6' y='4' width='4' height='16' rx='1'/%3E%3C/svg%3E");
+  --i-check:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  --i-alert:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='12' x2='12' y1='8' y2='12'/%3E%3Cline x1='12' x2='12.01' y1='16' y2='16'/%3E%3C/svg%3E");
+}
+*{box-sizing:border-box}
+body{margin:0;background:
+  radial-gradient(1100px 480px at 85% -12%,rgba(77,163,255,.07),transparent 60%),
+  var(--bg);
+  color:var(--tx);font:14px/1.5 "SF Mono",Consolas,"Microsoft YaHei",monospace}
+
+/* ---- 图标：CSS mask 伪元素（免疫 textContent/innerHTML 重写） ---- */
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-langs{--icon:var(--i-langs)}
+.ic-eye{--icon:var(--i-eye)}
+.ic-chat{--icon:var(--i-msgsq)}
+.ic-activity{--icon:var(--i-activity)}
+.ic-grid{--icon:var(--i-grid)}
+.ic-package{--icon:var(--i-package)}
+.ic-sliders{--icon:var(--i-sliders)}
+.ic-globe{--icon:var(--i-globe)}
+.ic-cpu{--icon:var(--i-cpu)}
+.ic-boxes{--icon:var(--i-boxes)}
+.ic-layers{--icon:var(--i-layers)}
+.ic-gauge{--icon:var(--i-gauge)}
+.ic-wrench{--icon:var(--i-wrench)}
+.ic-archive{--icon:var(--i-archive)}
+.ic-table2{--icon:var(--i-table2)}
+.ic-shield{--icon:var(--i-shield)}
+.ic-gear{--icon:var(--i-gear)}
+.ic-file{--icon:var(--i-file)}
+.ic-play{--icon:var(--i-play)}
+.ic-refresh{--icon:var(--i-refresh)}
+.ic-power{--icon:var(--i-power)}
+.ic-save{--icon:var(--i-save)}
+.ic-download{--icon:var(--i-download)}
+.ic-search{--icon:var(--i-search)}
+.ic-copy{--icon:var(--i-copy)}
+.ic-pause{--icon:var(--i-pause)}
+.ic-check{--icon:var(--i-check)}
+.ic-zap{--icon:var(--i-zap)}
+
+header{display:flex;align-items:center;gap:11px;padding:11px 18px;background:linear-gradient(180deg,#1a2330,#161d27);border-bottom:1px solid var(--bd);flex-wrap:wrap;position:sticky;top:0;z-index:20;backdrop-filter:blur(8px)}
+.brand{width:33px;height:33px;border-radius:9px;flex:none;background:linear-gradient(135deg,#57a7ff,#2f6fe0);box-shadow:0 4px 16px rgba(77,163,255,.35);-webkit-mask:var(--i-zap) center/18px no-repeat;mask:var(--i-zap) center/18px no-repeat}
+.brandwrap{display:flex;flex-direction:column;gap:1px;min-width:0;margin-right:2px}
+header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px;line-height:1.25}
+.brandwrap .sub{font-size:9.5px;color:var(--tx3);letter-spacing:2px}
+.badge{display:inline-flex;align-items:center;gap:7px;padding:3px 11px;border-radius:10px;font-size:12px;border:1px solid var(--bd);background:var(--panel2);transition:color var(--tr),border-color var(--tr)}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;box-shadow:0 0 8px currentColor}
+.badge.ok{color:var(--ok);border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.08)}
+.badge.stop{color:#7a8ba0;border-color:var(--bd)}
+.badge.warn{color:var(--warn);border-color:rgba(255,176,32,.55);background:rgba(255,176,32,.08)}
+.badge.bad{color:var(--bad);border-color:rgba(255,107,107,.55);background:rgba(255,107,107,.08)}
+/* 平台适用性标签：RAM=省内存场景有效 / x86=已在本地 x86 复现 / x86no=x86 上无效或负收益 */
+.ptag{display:inline-block;padding:0 7px;border-radius:8px;font-size:10.5px;line-height:17px;
+      border:1px solid var(--bd);color:var(--tx2);margin-left:5px;vertical-align:1px;white-space:nowrap}
+.ptag.ram{color:var(--warn);border-color:rgba(255,176,32,.5);background:rgba(255,176,32,.08)}
+.ptag.x86{color:var(--acc);border-color:rgba(77,163,255,.5);background:rgba(77,163,255,.08)}
+.ptag.x86no{color:var(--bad);border-color:rgba(255,107,107,.5);background:rgba(255,107,107,.08)}
+/* 「当前在用」标记：仅当已保存/运行中的配置命中该组合的开关集合时出现 */
+.inuse{display:inline-block;padding:0 7px;border-radius:8px;font-size:10.5px;line-height:17px;
+       border:1px solid var(--ok);color:var(--ok);margin-left:6px;vertical-align:1px;white-space:nowrap;background:rgba(62,207,142,.08)}
+/* 有效优化组合表 */
+table.combos{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
+table.combos th,table.combos td{border-bottom:1px solid var(--bd);padding:7px 9px;text-align:left;vertical-align:top}
+table.combos th{color:var(--tx2);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px}
+table.combos tr:last-child td{border-bottom:none}
+table.combos tbody tr{transition:background var(--tr)}
+table.combos tbody tr:hover td{background:rgba(77,163,255,.06)}
+table.combos td.ev{color:var(--ok);white-space:nowrap}
+table.combos td.act{white-space:nowrap;text-align:right}
+table.combos button{padding:3px 11px;font-size:12px}
+table.combos button::before{content:"";display:inline-block;width:11px;height:11px;flex:none;background-color:currentColor;-webkit-mask:var(--i-check) center/contain no-repeat;mask:var(--i-check) center/contain no-repeat}
+table.combos .name{font-weight:600}
+table.combos .why{color:var(--tx2)}
+table.combos code{color:var(--acc);word-break:break-all;background:rgba(77,163,255,.08);padding:1px 5px;border-radius:4px;font-size:11.5px}
+/* ---- 顶部分类选项卡（纯表现层归纳；页内模块按单列纵向排列） ---- */
+.tabbar{display:flex;gap:7px;flex-wrap:wrap;padding:14px 16px 0;max-width:1500px;margin:0 auto}
+.tabbtn{display:inline-flex;align-items:center;gap:8px;background:var(--panel2);color:var(--tx2);border:1px solid var(--bd);border-radius:9px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:color var(--tr),border-color var(--tr),background var(--tr),filter var(--tr)}
+.tabbtn:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+.tabbtn:focus-visible{outline:none;box-shadow:0 0 0 3px var(--focus)}
+.tabbtn.on{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+.tabpane{display:none}
+.tabpane.show{display:flex;flex-direction:column;gap:13px}
+main{display:flex;flex-direction:column;padding:13px 16px 26px;max-width:1500px;margin:0 auto;align-items:stretch}
+/* 卡片：统一 padding / 间距；min-width:0 防止内容（宽表/长 token）撑出横向溢出 */
+.card{background:linear-gradient(180deg,#1a2330,var(--panel));border:1px solid var(--bd);border-radius:12px;padding:13px 15px;display:flex;flex-direction:column;gap:2px;min-width:0;box-shadow:0 6px 24px rgba(0,0,0,.22)}
+.card h2{font-size:12.5px;margin:0 0 9px;padding-bottom:9px;border-bottom:1px solid var(--bd);color:var(--tx2);font-weight:600;text-transform:uppercase;letter-spacing:.6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2::before{background-color:var(--acc)}
+.card h2 .sub{font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--tx3)}
+/* 卡片内逻辑分区（标题与卡片头同样式，形成一致的层级） */
+.sec{font-size:11px;color:var(--acc);text-transform:uppercase;letter-spacing:.6px;margin:10px 0 4px;padding-top:8px;border-top:1px dashed var(--bd);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sec:first-of-type{border-top:none;margin-top:0;padding-top:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+/* 卡片内字段栅格：把成组的短字段并排对齐，纵向更紧凑 */
+.fldgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:4px 12px}
+.fldgrid label.fld{margin:4px 0}
+/* 明确两列：用于 4 项一组，排成整齐的 2×2（避免 auto-fit 出现 3+1 的空档） */
+.fldgrid.c2{grid-template-columns:repeat(2,minmax(0,1fr))}
+/* 宽内容（实测台账表）独立横向滚动，不撑破卡片 */
+.tablewrap{overflow-x:auto;border:1px solid var(--bd);border-radius:9px;background:rgba(0,0,0,.14)}
+.kv{background:var(--panel2);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;transition:border-color var(--tr)}
+.kv:hover{border-color:var(--bd-hi)}
+.kv .k{font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.4px}
+.kv .v{font-size:15px;margin-top:3px;word-break:break-all}
+.kv .v.small{font-size:13px}
+label.fld{display:block;margin:6px 0}
+label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:12px;color:var(--tx2);margin-bottom:3px}
+input[type=text],input[type=number],select{width:100%;background:var(--panel2);border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:6px 8px;font-size:13px;font-family:inherit;transition:border-color var(--tr),box-shadow var(--tr)}
+input[type=text]:focus,input[type=number]:focus,select:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--focus)}
+input::placeholder{color:var(--tx3)}
+/* Model-dir field: highlighted so it is impossible to miss */
+label.fld.hl .t{color:var(--acc);font-weight:600}
+#f_model_dir{background:#12233a;border:1px solid var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35);font-weight:600;font-size:13.5px}
+input[type=checkbox]{width:16px;height:16px;accent-color:var(--acc)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;transition:color var(--tr),border-color var(--tr),background var(--tr),filter var(--tr)}
+button:hover{border-color:var(--acc);color:var(--acc);background:var(--acc-soft)}
+button:focus-visible{outline:none;box-shadow:0 0 0 3px var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.08);color:#07131f;background:linear-gradient(180deg,#57a7ff,#3d8bee)}
+button.danger{background:#33191d;border-color:#6b3535;color:#ff9b9b}
+button.danger:hover{border-color:var(--bad);color:var(--bad);background:rgba(255,107,107,.09)}
+button.danger::before{content:"";display:inline-block;width:12px;height:12px;flex:none;background-color:currentColor;-webkit-mask:var(--i-power) center/contain no-repeat;mask:var(--i-power) center/contain no-repeat}
+#btn_l3clear::before{-webkit-mask-image:var(--i-trash);mask-image:var(--i-trash)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.chkrow{display:flex;gap:8px;align-items:flex-start;margin:5px 0;font-size:13px;line-height:1.5}
+.chkrow input{flex:0 0 auto;margin-top:2px}
+.msg{display:none;align-items:center;gap:8px;padding:8px 11px;border-radius:7px;margin-top:8px;font-size:12px;line-height:1.6}
+.msg.show{display:flex}
+.msg::before{content:"";width:14px;height:14px;flex:none;background-color:currentColor;-webkit-mask:var(--i-alert) center/contain no-repeat;mask:var(--i-alert) center/contain no-repeat}
+.msg.ok{background:linear-gradient(90deg,rgba(62,207,142,.12),transparent 60%),#12271b;color:var(--ok);border:1px solid #1f4a30}
+.msg.ok::before{-webkit-mask-image:var(--i-check);mask-image:var(--i-check)}
+.msg.err{background:#2e1518;color:var(--bad);border:1px solid #5c2c30}
+#log{height:380px;overflow:auto;background:#0a0e13;border:1px solid var(--bd);border-radius:9px;padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-all}
+#log .tail{color:var(--tx2)}
+.logfilters{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
+.logfilters button{font-size:12px;padding:3px 11px}
+.logfilters button.on{border-color:var(--acc);color:var(--acc);background:var(--acc-soft)}
+.logfilters .lc{opacity:.6;font-size:11px}
+#log > div{white-space:pre-wrap;word-break:break-all;min-height:15px}
+#log > div.lv-error{color:var(--bad)}
+#log > div.lv-warn{color:var(--warn)}
+#log > div.lv-debug{color:var(--tx2)}
+#log > div.lv-info{color:var(--tx)}
+.progress{height:8px;background:var(--panel2);border:1px solid var(--bd);border-radius:4px;overflow:hidden;margin:6px 0 2px}
+.progress > div{height:100%;background:linear-gradient(90deg,#3d8bee,#57a7ff);width:0%;transition:width .6s}
+.loadbar-t{font-size:11px;color:var(--tx2)}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+footer{padding:12px 20px;color:var(--tx3);font-size:12px}
+a{color:var(--acc)}
+.navlink{display:inline-flex;align-items:center;gap:7px;color:var(--tx2);font-size:12px;text-decoration:none;border:1px solid var(--bd);border-radius:7px;padding:5px 11px;background:var(--panel2);cursor:pointer;font-family:inherit;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+/* K-ADMIN-001：组件配置入口（按钮卡片，单独成页 /admin/{kb,laya,yolo}） */
+.compogrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:4px}
+.compo{display:block;text-decoration:none;color:var(--tx);background:var(--panel2);border:1px solid var(--bd);border-radius:11px;padding:15px;transition:border-color var(--tr),box-shadow var(--tr),transform var(--tr)}
+.compo:hover{border-color:var(--acc);box-shadow:0 0 0 1px rgba(77,163,255,.35),0 8px 24px rgba(0,0,0,.3);transform:translateY(-1px)}
+.compo .tt{font-size:14px;font-weight:600;color:var(--acc)}
+.compo .dd{font-size:12px;color:var(--tx2);margin-top:6px;line-height:1.6}
+.compo .go{margin-top:10px;display:inline-block;font-size:12px;color:var(--tx2);border:1px solid var(--bd);border-radius:7px;padding:3px 10px;transition:color var(--tr),border-color var(--tr)}
+.compo:hover .go{color:var(--acc);border-color:var(--acc)}
+/* K-ADMIN-002：组件开关按钮（状态灯复用 .badge 的 ok/warn/stop/bad） */
+.cbtn{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border:1px solid var(--bd);border-radius:7px;background:var(--panel2);color:var(--tx2);cursor:pointer;transition:color var(--tr),border-color var(--tr)}
+.cbtn:hover{border-color:var(--acc);color:var(--acc)}
+.compo .tt .badge{margin-left:8px;font-size:11px;padding:1px 8px}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--bd);border-radius:5px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:var(--bd-hi)}
+::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand" aria-hidden="true"></span>
+  <div class="brandwrap">
+    <h1 data-en="vLLM-Kestrel Edge-Cloud Coordination Platform · Admin">vLLM-Kestrel 边缘云协调平台 · 管理</h1>
+    <div class="sub">vLLM-KESTREL · ADMIN CONSOLE</div>
+  </div>
+  <span id="engBadge" class="badge">引擎: 未知</span>
+  <span id="mgrBadge" class="badge">supervisor: 未知</span>
+  <span id="cfgBadge" class="badge">配置: -</span>
+  <span style="flex:1"></span>
+  <button id="langBtn" class="navlink ic-langs" type="button" title="切换为中文">EN</button>
+  <a class="navlink ic-eye" href="/review" data-en="Review console /review">审查台 /review</a>
+  <a class="navlink ic-chat" href="/chat" target="_blank" data-en="Chat /chat">对话页 /chat</a>
+  <span id="clock" style="color:var(--tx2);font-size:12px"></span>
+</header>
+<nav class="tabbar" id="tabbar">
+  <button class="tabbtn ic-activity" data-tab="overview" type="button" data-en="Overview">总览</button>
+  <button class="tabbtn ic-package" data-tab="model" type="button" data-en="Model">模型</button>
+  <button class="tabbtn ic-zap" data-tab="perf" type="button" data-en="Performance">性能优化</button>
+  <button class="tabbtn ic-globe" data-tab="server" type="button" data-en="Server &amp; Security">服务与安全</button>
+  <button class="tabbtn ic-gear" data-tab="cfglog" type="button" data-en="Config &amp; Logs">配置与日志</button>
+</nav>
+<main>
+  <div class="tabpane show" data-pane="overview">
+  <!-- 状态 + 引擎控制 -->
+  <div class="card" style="grid-column:1/-1">
+    <h2 class="ic-activity" data-en="Runtime Status">运行状态</h2>
+    <div class="grid" id="stGrid"></div>
+    <div id="loadbar" style="display:none;margin-top:10px"></div>
+    <div class="sec" data-en="Engine Control">引擎控制</div>
+    <div class="row" style="margin-top:2px">
+      <button id="btn_start" class="primary ic-play" data-en="Start Engine">启动引擎</button>
+      <button id="btn_restart" class="ic-refresh" data-en="Restart Engine">重启引擎</button>
+      <button id="btn_stop" class="danger" data-en="Shut Down Engine">关闭引擎</button>
+    </div>
+    <div style="font-size:12px;color:var(--tx2)">
+      <span data-en="Engine process is managed by supervisor (">引擎进程由 supervisor 管理（</span><span id="mgrUrl"></span><span data-en=") · Engine API: ">）· 引擎 API: </span><span id="engUrl"></span>
+    </div>
+    <div class="msg" id="opmsg2"></div>
+  </div>
+
+  <!-- 组件配置入口（K-ADMIN-001：按钮卡片，各自独立成页；云端为可选） -->
+  <div class="card" style="grid-column:1/-1">
+    <h2 class="ic-grid" data-en="Component Configuration">组件配置</h2>
+    <div class="compogrid">
+      <div class="compo">
+        <div class="tt"><span data-en="Vector Model / Knowledge Base">向量模型知识库</span><span class="badge stop" id="cst_embed">-</span></div>
+        <div class="dd" data-en="Embedding model path, KB root dir; manage .vkb docs and run retrieval tests.">向量模型目录、知识库根目录；管理 .vkb 文档并可在线检索试查。</div>
+        <div class="dd" id="warn_embed" style="display:none;color:var(--warn)"></div>
+        <div class="row">
+          <a class="go" href="/admin/kb" data-en="Open KB config →">打开知识库配置 →</a>
+          <button class="cbtn" id="cb_embed" type="button"></button>
+        </div>
+      </div>
+      <div class="compo">
+        <div class="tt"><span data-en="Laya Decision">Laya 决策</span><span class="badge stop" id="cst_laya">-</span></div>
+        <div class="dd" data-en="Laya decision pack path; construct a request to try a decision online.">Laya 决策权重包目录；构造请求在线试决策。</div>
+        <div class="row">
+          <a class="go" href="/admin/laya" data-en="Open Laya config →">打开 Laya 配置 →</a>
+          <button class="cbtn" id="cb_laya" type="button"></button>
+        </div>
+      </div>
+      <div class="compo">
+        <div class="tt"><span data-en="YOLO Detection">YOLO 检测</span><span class="badge stop" id="cst_yolo">-</span></div>
+        <div class="dd" data-en="Detection model (VQF v4); upload an image to test.">检测模型（VQF v4）；传图试检测。</div>
+        <div class="row">
+          <a class="go" href="/admin/yolo" data-en="Open YOLO config →">打开 YOLO 配置 →</a>
+          <button class="cbtn" id="cb_yolo" type="button"></button>
+        </div>
+      </div>
+      <a class="compo" href="/admin/cloud">
+        <div class="tt" data-en="Cloud Model (optional)">云端模型（可选）</div>
+        <div class="dd" data-en="Cloud uplink endpoint / model / fallback mode; test connectivity. Off by default (never).">云端回退地址、模型与回退模式；可测试连通。默认关闭（never）。</div>
+        <span class="go" data-en="Open cloud config →">打开云端配置 →</span>
+      </a>
+    </div>
+  </div>
+
+  </div><!-- /tabpane overview -->
+
+  <div class="tabpane" data-pane="model">
+  <!-- 模型加载 -->
+  <div class="card">
+    <h2 class="ic-package" data-en="Model Loading">模型加载</h2>
+    <div class="sec" data-en="Model Path &amp; Format">模型路径与格式</div>
+    <label class="fld hl"><span class="t"><span data-en="Model folder path ">模型文件夹路径 </span><b style="color:var(--warn);font-weight:600" data-en="(required)">（必填）</b></span>
+      <input type="text" id="f_model_dir" placeholder="D:\Modl\Qwen3-VL-2B-Instruct"></label>
+    <label class="fld"><span class="t" data-en="Model ID (--model-id; the id advertised by /v1/models and required in OpenAI requests)">模型 ID (--model-id；/v1/models 对外标识，OpenAI 请求的 model 字段)</span>
+      <input type="text" id="f_model_id" placeholder="qwen3-vl-2b"></label>
+    <div style="font-size:11px;color:var(--tx2)" data-en-html="The engine is a pure VQF runtime: it auto-locates <b>model.vqf</b> inside the model folder (tries model.vqf / weights.vqf / vllm.vqf in order), mmap-mounts it directly; no format selection needed.">引擎为纯 VQF 运行时：在模型文件夹内自动定位 <b>model.vqf</b>（依次尝试 model.vqf / weights.vqf / vllm.vqf），mmap 直挂加载，无需选择格式。</div>
+    <div style="font-size:11px;color:var(--tx2)" data-en-html="The quantization mode is baked into the VQF file at <b>conversion time</b> (decided by vqf_convert --wmode); the load side cannot change it — re-convert to change the quantization.">量化模式在<b>转换期</b>已固化进 VQF 文件（由 vqf_convert --wmode 决定），加载侧不可更改——要换量化请重新转换。</div>
+    <div style="margin-top:4px;padding:0 10px;border-left:3px solid var(--bd)">
+      <div class="sec" data-en="Load / Unload Policy">加载 / 卸载策略</div>
+      <div class="chkrow"><input type="checkbox" id="f_auto_load"><label for="f_auto_load" data-en="Load on use (--load-on-use): auto-load the model when a request arrives while it is unloaded">用时加载 (--load-on-use)：模型未加载时收到请求自动加载</label></div>
+      <div class="fldgrid">
+        <label class="fld"><span class="t" data-en="Idle auto-unload seconds (--auto-unload, 0=off)">空闲自动卸载秒数 (--auto-unload，0=关闭)</span><input type="number" id="f_auto_unload_s" min="0" value="0"></label>
+        <label class="fld"><span class="t" data-en="Minimum free memory MB (--min-free-mb, reject new requests below this)">最小空闲内存 MB (--min-free-mb，低于则拒绝新请求)</span><input type="number" id="f_min_free_mb" min="0" value="512"></label>
+      </div>
+      <div style="font-size:11px;color:var(--tx2)" data-en="When auto-unload is on, load-on-use is implied: load → use → auto-unload after N idle seconds (frees weights + KV memory) → the next request reloads.">自动卸载开启后隐含启用用时加载：加载 → 使用 → 空闲 N 秒自动卸载（释放权重+KV 内存）→ 下个请求自动重载。</div>
+      <div class="chkrow"><input type="checkbox" id="f_vqf_prewarm"><label for="f_vqf_prewarm" data-en="VQF prewarm after load (VLLM_VQF_PREWARM): background-pull mmap weight pages into RAM to cut first-inference latency">VQF 加载后预热 (VLLM_VQF_PREWARM)：后台把 mmap 权重页拉进 RAM，降低首次推理延迟</label></div>
+      <div class="chkrow" style="flex-wrap:wrap">
+        <input type="checkbox" id="f_vqf_stream"><label for="f_vqf_stream" data-en="VQF layered residency (VLLM_VQF_STREAM): AirLLM-style per-layer eviction/prefetch, RSS drops sharply">VQF 分层驻留 (VLLM_VQF_STREAM)：AirLLM 型逐层驱逐/预读，RSS 大幅下降</label>
+        <span style="font-size:11px;color:var(--tx2);margin-left:2px" data-en="Resident layer window">常驻层窗口</span>
+        <input type="number" id="f_vqf_stream_keep" min="1" max="32" value="1" style="width:56px" title="N：允许常驻的落后层数，1=只留当前层" data-en-title="N: number of trailing layers allowed to stay resident, 1=keep only the current layer">
+      </div>
+      <div style="font-size:11px;color:var(--tx2)" data-en="Plaintext VQF only (encrypted models are rejected); embed/final_norm/lm_head/vision stay resident always; only whole-layer weight segments are evicted, inference stays bit-identical. If the model fits the memory budget, eviction hurts — enable only when needed.">仅明文 VQF 生效（加密模型自动拒绝）；embed/final_norm/lm_head/vision 恒常驻，只驱逐整层权重段，推理位级一致。模型不超过内存预算时逐出反而自伤，需按需开启。</div>
+      <label class="fld"><span class="t" data-en="VQF encryption passphrase (VLLM_VQF_KEY, empty=plaintext)">VQF 加密口令 (VLLM_VQF_KEY，留空=明文)</span>
+        <input type="password" id="f_vqf_key" placeholder="加载加密 VQF 时填写" data-en-ph="Enter when loading an encrypted VQF" autocomplete="off"></label>
+    </div>
+    <div class="row" style="margin-top:4px">
+      <button id="btn_loadmodel" class="primary ic-package" data-en="Load Model">加载模型</button>
+      <button id="btn_unload" class="ic-power" style="display:none" data-en="Unload Model">卸载模型</button>
+      <span id="modelInfo" style="font-size:12px;color:var(--tx2);align-self:center"></span>
+    </div>
+    <div class="msg" id="opmsg"></div>
+  </div>
+
+  <!-- 内存驻留策略（档位阶梯 · 运行时动态） -->
+  <div class="card">
+    <h2 class="ic-layers" data-en="Memory Residency Policy (level ladder · runtime dynamic)">内存驻留策略（档位阶梯 · 运行时动态）</h2>
+    <div class="sec" data-en="Current level">当前档位</div>
+    <div style="font-size:12px;line-height:1.8" id="resStatus">-</div>
+    <div class="sec" data-en="Idle auto-downgrade (model-level global idle → step down one level at a time)">空闲自动降级（模型级全局空闲 → 逐级降档）</div>
+    <div class="chkrow"><input type="checkbox" id="f_res_auto"><label for="f_res_auto" data-en="Enable idle step-by-step auto-downgrade (how long since the client interacted: full residency → KV per-layer eviction → weight window → initial layers → KV to disk + exit)">启用空闲逐级自动降级（客户多久没交互：全层驻留 → KV逐层淘汰 → 权重窗口 → 初始层 → KV落盘退出）</label></div>
+    <div class="fldgrid c2">
+      <label class="fld"><span class="t" data-en="L4→L3 KV per-layer eviction: idle wait seconds (0=stay at L4)">L4→L3 KV 逐层淘汰：空闲等待秒 (0=停在 L4)</span><input type="number" id="f_res_idle4" min="0" value="300"></label>
+      <label class="fld"><span class="t" data-en="L3→L2 weight window: idle wait seconds (0=stay at L3)">L3→L2 权重窗口：空闲等待秒 (0=停在 L3)</span><input type="number" id="f_res_idle3" min="0" value="900"></label>
+      <label class="fld"><span class="t" data-en="L2→L1 initial layers: idle wait seconds (0=stay at L2)">L2→L1 初始层：空闲等待秒 (0=停在 L2)</span><input type="number" id="f_res_idle2" min="0" value="1800"></label>
+      <label class="fld"><span class="t" data-en="L1→L0 KV to disk + unload: idle wait seconds (0=stay at L1)">L1→L0 KV落盘+卸载：空闲等待秒 (0=停在 L1)</span><input type="number" id="f_res_idle1" min="0" value="3600"></label>
+    </div>
+    <label class="fld"><span class="t" data-en="L2 weight-window resident layers w_keep (keep layers 0..N)">L2 权重窗口保留层数 w_keep（保留层 0..N）</span><input type="number" id="f_res_wkeep" min="0" value="8"></label>
+    <div class="sec" data-en="Proactive downgrade on memory pressure (soft watermark; drop one level when below)">内存紧张主动降级（软水位，低于自动降一档）</div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en='Soft watermark MB (0=off; works with the "Core Config - minimum free memory" hard 503)'>软水位 MB（0=关闭；与"核心配置-最低可用内存"硬 503 配合）</span><input type="number" id="f_res_soft" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Lowest level allowed for auto-downgrade (0=unloadable · 3=KV eviction only · 4=no auto-downgrade)">允许自动降到的档位（0=可卸载 · 3=仅KV淘汰 · 4=不自动降）</span><input type="number" id="f_res_lowlvl" min="0" max="4" value="0"></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn_res_cfg" class="primary ic-check" data-en="Apply policy parameters">应用策略参数</button>
+      <button id="btn_res_l4" title="KV 全驻留 + 权重不主动释放" data-en="L4 full-layer residency" data-en-title="KV fully resident + weights not proactively released">L4 全层驻留</button>
+      <button id="btn_res_l3" title="prefill 后按重要性逐层淘汰冷块到磁盘 (需 --sparse-attn 配合自动开)" data-en="L3 KV eviction" data-en-title="After prefill, evict cold blocks to disk layer by layer by importance (auto-enabled with --sparse-attn)">L3 KV淘汰</button>
+      <button id="btn_res_l2" title="释放 layer&gt;w_keep 权重物理页 (需明文 VQF + VLLM_VQF_STREAM)" data-en="L2 weight window" data-en-title="Free physical pages of weights for layer&gt;w_keep (needs plaintext VQF + VLLM_VQF_STREAM)">L2 权重窗口</button>
+      <button id="btn_res_l1" title="从高向低释放到只剩初始层" data-en="L1 initial layers" data-en-title="Release from high to low until only the initial layers remain">L1 初始层</button>
+      <button id="btn_res_l0" class="danger" title="KV 落盘(磁盘KV开时)后整模卸载" data-en="L0 to disk + exit" data-en-title="Persist KV to disk (when disk-KV is on) then unload the whole model">L0 落盘+退出</button>
+    </div>
+    <div class="msg" id="resmsg"></div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html="Level notes: <b>L4</b> full-layer residency throughout (default, fastest); <b>L3</b> KV per-layer eviction (prefix reuse is disabled when L3 is on); <b>L2</b> weight window (madvise frees physical pages, page faults auto-restore, zero numerical impact; available only with plaintext VQF + VLLM_VQF_STREAM layered mode); <b>L1</b> only the initial layers of weights remain; <b>L0</b> whole-model unload (the next request/load returns to L4 automatically). Weight levels (L2/L1) are auto-skipped straight to L0 when unavailable; upgrades/downgrades take effect immediately; upgrading only adds memory without losing context, and moving L3→L4 by turning L3 off resets the current context (recoverable when disk-KV is on).">
+      档位说明：<b>L4</b> 全程全层驻留（默认，最快）；<b>L3</b> KV 逐层淘汰（前缀复用随
+      L3 开启而关闭）；<b>L2</b> 权重窗口（madvise 释放物理页，缺页自动回驻，数值零影响，仅明文 VQF +
+      启动 VLLM_VQF_STREAM 分层模式可用）；<b>L1</b> 权重只剩初始层；<b>L0</b> 整模卸载（下次请求/加载自动回 L4）。
+      权重档（L2/L1）不可用时自动跳过直达 L0；升降档即时生效；升档只加内存不丢上下文，L3→L4 关 L3 会重置当前上下文（磁盘 KV 开时可恢复）。
+    </div>
+  </div>
+
+  <!-- 长上下文淘汰 (L3) -->
+  <div class="card">
+    <h2 class="ic-archive" data-en="Long-Context Eviction (L3)">长上下文淘汰 (L3)</h2>
+    <div class="chkrow"><input type="checkbox" id="f_l3_evict"><label for="f_l3_evict"><span data-en="Enable L3 cold-block eviction (--l3-evict, requires sparse attention)">启用 L3 冷块淘汰 (--l3-evict，需配合稀疏注意力)</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
+    <div class="chkrow"><input type="checkbox" id="f_l3_prefix_reuse"><label for="f_l3_prefix_reuse"><b data-en="L3 prefix-reuse gate (VLLM_L3_PREFIX_REUSE)">L3 前缀复用门 (VLLM_L3_PREFIX_REUSE)</b><span data-en=" — lets L3 eviction coexist with KV prefix reuse"> — 让 L3 驱逐与 KV 前缀复用共存</span><span class="ptag x86" data-en="x86 review −96.9%">x86 复核 −96.9%</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
+    <div class="chkrow" id="p3warn" style="display:none;color:var(--warn);font-size:12px;line-height:1.6" data-en-html="⚠ --l3-evict is on but the P3 gate is off: <code>--prefix-kv</code> is silently dropped and multi-turn follow-ups recompute the full prefill. Turn on the option above.">
+      ⚠ 已开 <code>--l3-evict</code> 但未开 P3 门：<code>--prefix-kv</code> 会被静默打掉，多轮追问将全量重算 prefill。建议开启上面这项。
+    </div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Eviction ratio (--l3-ratio)">淘汰比例 (--l3-ratio)</span><input type="number" id="f_l3_ratio" min="0" max="0.99" step="0.05" value="0.75"></label>
+      <label class="fld"><span class="t" data-en="Trigger: minimum context length (--l3-min-seq)">触发时机: 最小上下文长度 (--l3-min-seq)</span><input type="number" id="f_l3_min_seq" min="0" value="128"></label>
+    </div>
+    <label class="fld"><span class="t" data-en="Eviction cache save path (--l3-path)">淘汰缓存保存路径 (--l3-path)</span><input type="text" id="f_l3_path" placeholder="默认 kv_l3.bin（引擎工作目录）" data-en-ph="default kv_l3.bin (engine working directory)"></label>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Max saved size MB (--l3-max-size)">最大保存大小 MB (--l3-max-size)</span><input type="number" id="f_l3_max_size" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Idle TTL minutes for user eviction files (--l3-user-ttl)">用户淘汰文件闲置 TTL 分钟 (--l3-user-ttl)</span><input type="number" id="f_l3_user_ttl" min="0" value="30"></label>
+    </div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html='0 = always evict after prefill; N&gt;0 = start evicting when the context reaches N tokens (measured value 128; smaller means more wasted eviction overhead).<br>The path may be an eMMC mount point (e.g. /mnt/emmc/kv_l3.bin); max size 0 = unlimited.<br>Each user has an independent cache file, auto-deleted after TTL idle minutes (0 = never clean up).<br><b style="color:var(--warn)">When --l3-evict is on, be sure to also enable the P3 gate above, otherwise KV prefix reuse is silently dropped.</b>'>
+      0 = prefill 后总是淘汰；N&gt;0 = 上下文达到 N tokens 才启动淘汰（实测口径 128，越小越白付驱逐开销）。<br>
+      路径可填 eMMC 挂载点（如 /mnt/emmc/kv_l3.bin）；最大大小 0 = 不限制。<br>
+      每用户独立缓存文件，闲置超 TTL 分钟自动删除（0 = 不清理）。<br>
+      <b style="color:var(--warn)">开 --l3-evict 时务必同时开上面那项 P3 门，否则 KV 前缀复用会被静默打掉。</b>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn_l3clear" class="danger" data-en="Clear user cache">清空用户缓存</button>
+      <div class="msg" id="l3msg"></div>
+    </div>
+  </div>
+  </div><!-- /tabpane model -->
+
+  <div class="tabpane" data-pane="perf">
+  <!-- 核心配置 -->
+  <div class="card">
+    <h2 class="ic-sliders"><span data-en="Core Config ">核心配置 </span><span id="devTag" style="margin-left:8px"></span></h2>
+    <div class="sec" data-en="Device">设备</div>
+    <label class="fld"><span class="t" data-en="Device type (arch × class × model)">设备类型（架构 × 类别 × 型号）</span>
+      <select id="f_device"></select></label>
+    <div class="row" style="margin-top:4px">
+      <button id="btn_applydev" class="ic-check" style="padding:4px 10px;font-size:12px" data-en="Apply device-recommended settings">应用设备推荐参数</button>
+    </div>
+    <div class="sec" data-en="Quantization &amp; Cache">量化与缓存</div>
+    <div class="chkrow"><input type="checkbox" id="f_kv_q4"><label for="f_kv_q4"><span data-en="KV quant Q4 (--kv-q4, 1.65x memory compression, decode +28%)">KV 量化 Q4 (--kv-q4, 内存 1.65x 压缩, decode +28%)</span><span class="ptag ram" data-en="RAM saver">省 RAM</span></label></div>
+    <div class="chkrow"><input type="checkbox" id="f_prefix_kv"><label for="f_prefix_kv"><span data-en="KV prefix reuse (on by default; off = --no-prefix-kv): consecutive requests share the previous KV prefix, P4 multimodal/text prefix skips prefill">KV 前缀复用 (默认开，关=--no-prefix-kv)：连续请求共享上一段 KV 前缀，P4 多模态/文本前缀跳过 prefill</span><span class="ptag x86" data-en="x86 review −97%">x86 复核 −97%</span></label></div>
+    <div class="chkrow"><input type="checkbox" id="f_prefix_cache"><label for="f_prefix_cache" data-en="Prefix cache (--prefix-cache)">前缀缓存 (--prefix-cache)</label></div>
+    <div class="chkrow"><input type="checkbox" id="f_prefill_q8"><label for="f_prefill_q8">Prefill Q8 (--prefill-q8)</label></div>
+    <div class="chkrow"><input type="checkbox" id="f_sparse_attn"><label for="f_sparse_attn"><span data-en="Sparse attention (--sparse-attn)">稀疏注意力 (--sparse-attn)</span><span class="ptag" data-en="Long context">长上下文</span><span class="ptag x86no" data-en="x86 total prefill only −6.7%">x86 总 prefill 仅 −6.7%</span></label></div>
+    <label class="fld"><span class="t" data-en="Decode sparse-k (effective only when &lt; the context block count; block size 32)">解码 sparse-k（须 &lt; 上下文块数才生效，块大小 32）</span><input type="number" id="f_sparse_k" min="1" value="32"></label>
+    <div class="chkrow"><input type="checkbox" id="f_sparse_prefill"><label for="f_sparse_prefill"><span data-en="Sparse prefill too (env VLLM_SPARSE_PREFILL=1) — OFF by default: the prefill kernel's output IS what gets written into the KV, so its approximation damages the context representation. If you turn it on, use the two prefill knobs below.">prefill 也走稀疏 (env VLLM_SPARSE_PREFILL=1) —— 默认关：prefill 的输出就是写进 KV 的内容，它的近似会损坏上下文表示；开它请配合下面两个 prefill 旋钮</span><span class="ptag x86no" data-en="needle loss if left at 0 granularity">粒度为 0 时已知丢针</span></label></div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Prefill sparse-k (--sparse-pf-k; 0 = follow the decode sparse-k)">prefill sparse-k（--sparse-pf-k；0 = 沿用解码档）</span><input type="number" id="f_sparse_pf_k" min="0" value="32"></label>
+      <label class="fld"><span class="t" data-en="Prefill block-selection granularity (--sparse-pf-group G): tokens sharing one selection. 0 = one representative query per whole batch (old behaviour, loses the needle); 4~8 recommended">prefill 选块粒度（--sparse-pf-group G，每 G 个 token 共享一次选块）：0 = 整批一个代表 query（旧行为，会丢针）；推荐 4~8</span><input type="number" id="f_sparse_pf_group" min="0" value="4"></label>
+    </div>
+    <div class="chkrow"><input type="checkbox" id="f_disk_kv"><label for="f_disk_kv"><span data-en="Disk KV persistence (--disk-kv, reuse conversation prefix KV across processes after restart)">磁盘 KV 持久化 (--disk-kv，重启后跨进程复用对话前缀 KV)</span><span class="ptag ram" data-en="KV on disk">KV 落盘</span><span class="ptag x86" data-en="x86 review −97%">x86 复核 −97%</span></label></div>
+    <label class="fld"><span class="t" data-en="KV checkpoint directory">KV checkpoint 目录</span><input type="text" id="f_disk_kv_dir" placeholder="kv_disk（引擎工作目录）" data-en-ph="kv_disk (engine working directory)"></label>
+    <div class="sec" data-en="Industrial Edge: Preset Contexts &amp; Sessions">工业边缘：预置上下文与会话</div>
+    <div class="fldgrid c2">
+      <label class="fld"><span class="t" data-en="Rulebook dir (--rulebook-dir; empty = off)">规则包目录 (--rulebook-dir，留空=关闭)</span><input type="text" id="f_rulebook_dir" placeholder="rulebooks" data-en-ph="rulebooks"></label>
+      <label class="fld"><span class="t" data-en="Session dir (--session-dir; empty = off)">会话目录 (--session-dir，留空=关闭)</span><input type="text" id="f_session_dir" placeholder="sessions" data-en-ph="sessions"></label>
+      <label class="fld"><span class="t" data-en="Session file limit (--session-limit, LRU; 0 = default 1024)">会话文件上限 (--session-limit，LRU；0=默认 1024)</span><input type="number" id="f_session_limit" min="0" value="0"></label>
+      <label class="fld"><span class="t" data-en="Audit log (--audit-log; empty = &lt;session dir&gt;/admin_audit.jsonl, both empty = off)">审计日志 (--audit-log；留空=会话目录/admin_audit.jsonl，两者都空则关闭)</span><input type="text" id="f_audit_log" placeholder="sessions/admin_audit.jsonl" data-en-ph="sessions/admin_audit.jsonl"></label>
+    </div>
+    <div style="font-size:11px;color:var(--tx2)" data-en-html="Rulebooks are built OFFLINE with <b>--rulebook-build &lt;file&gt; --rulebook-id &lt;id&gt; ...</b> (see README). Session / rulebook / audit review lives on a SEPARATE page: <b>/review</b> (not on this page). Changes here require an engine restart — the supervisor rebuilds the command line from this config.">规则包用 <b>--rulebook-build &lt;文件&gt; --rulebook-id &lt;id&gt; ...</b> 离线预置。会话 / 规则包 / 审计的审查在<b>独立页 /review</b>（不在本页）。此处改动需重启引擎——supervisor 会据此重建命令行。</div>
+    <div class="sec" data-en="Sampling &amp; Speculative Decoding">采样与推测解码</div>
+    <div class="chkrow"><input type="checkbox" id="f_spec"><label for="f_spec"><span data-en="Speculative decoding (--spec, n-gram draft + batch verify, greedy mode only)">推测解码 (--spec，n-gram 草稿 + 批量验证，仅贪婪模式)</span><span class="ptag" data-en="Client must send top_p=1.0">须客户端传 top_p=1.0</span><span class="ptag x86no" data-en="x86 2.4× slower">x86 反慢 2.4×</span></label></div>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Draft length (--spec-k)">草稿长度 (--spec-k)</span><input type="number" id="f_spec_k" min="1" max="16" value="4"></label>
+      <label class="fld"><span class="t" data-en="min-p sampling (--min-p, 0=off)">min-p 采样 (--min-p，0=关闭)</span><input type="number" id="f_min_p" min="0" max="1" step="0.01" value="0"></label>
+    </div>
+  </div>
+
+  <!-- MoE 优化 (Qwen3-30B-A3B 稀疏专家) -->
+  <div class="card">
+    <h2 class="ic-boxes" data-en="MoE Optimization (Sparse Experts)">MoE 优化（稀疏专家）</h2>
+    <div class="sec" data-en="Precision / speed track (pick one)">精度 / 速度轨（三选一）</div>
+    <label class="fld"><span class="t" data-en="q4-expert compute track">q4 专家计算轨</span>
+      <select id="f_moe_track">
+        <option value="exact" data-en="Exact track (default): bit-identical, ACTQ16=0 + ACTQ=0, no precision loss">精确轨（默认）：位级一致，ACTQ16=0 + ACTQ=0，无精度损失</option>
+        <option value="s16" data-en="s16 light approximation: ACTQ16=1, error ~1e-5 (x86 kernel only; a no-op on non-x86 platforms)">s16 轻量近似：ACTQ16=1，误差约 1e-5（仅 x86 有内核，非 x86 平台为空操作）</option>
+        <option value="actq" data-en="ACTQ + batching (fastest): ACTQ=1 + MOE_BATCH=1, error ~0.4%, drifts on long text">ACTQ + 批式（最快）：ACTQ=1 + MOE_BATCH=1，误差约 0.4%，长文本会漂移</option>
+      </select></label>
+    <div class="sec" data-en="Batched prefill (cross-token fusion)">批式 prefill（跨 token 融合）</div>
+    <div class="chkrow"><input type="checkbox" id="f_moe_batch"><label for="f_moe_batch"><span data-en="MoE cross-token batching ">MoE 跨 token 批式 </span><b>(VLLM_MOE_BATCH)</b><span data-en=" — on by default: GATEUP 2.60×(t4) / 3.95×(t8), bit-identical to the per-token path; decode unaffected"> — 默认开：GATEUP 2.60×(t4) / 3.95×(t8)，与逐 token 路径位级一致；decode 不受影响</span></label></div>
+    <div class="sec" data-en="Parallelism &amp; SIMD">并行与 SIMD</div>
+    <div class="chkrow"><input type="checkbox" id="f_moe_par"><label for="f_moe_par"><span data-en="Expert parallelism ">专家并行 </span><b>(VLLM_MOE_PAR)</b><span data-en=" — on by default; disabling falls back to a serial expert loop"> — 默认开；关闭回退串行专家循环</span></label></div>
+    <div class="chkrow"><input type="checkbox" id="f_moe_q4simd"><label for="f_moe_q4simd"><span data-en="q4 MoE row-group SIMD ">q4 MoE 行组 SIMD </span><b>(VLLM_MOE_Q4SIMD)</b><span data-en=" — on by default; disabling falls back to scalar"> — 默认开；关闭回退标量</span></label></div>
+    <div class="chkrow" id="trackWarn" style="display:none;color:var(--warn);font-size:12px;line-height:1.6"></div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.75" data-en-html="<b>Notes (the three tracks are mutually exclusive; only the exact track is reproducible)</b><br>1. The exact track is bit-identical (A equals C) and can be matched bit-by-bit against any reference; s16 and ACTQ are approximation tracks whose output is not bit-identical to the exact track.<br>2. s16 and ACTQ are mutually exclusive with s16 taking priority (the engine force-disables ACTQ when the s16 track is active).<br>3. The s16 track currently has an x86 kernel only; on non-x86 platforms it is a constant-0 stub, so selecting it there equals the exact track: no speedup and no error.<br>4. ACTQ uses int8 activation quantization with about 0.4% error; measured greedy decoding starts drifting after about 23 tokens (t about 24 on long text).<br>5. ACTQ also needs three conditions at once: the model was converted with --wmode q4, the expert geometry holds (ff divisible by ne and 4-row aligned), and the build has the SIMD dot-product kernel for the target platform.<br>6. EP (expert parallelism / distributed expert extraction) scenarios must stay on the exact track: main.c forces ACTQ16=0, and either ACTQ or ACTQ16 turns the M1/M2 bit-exact comparison into a false comparison.<br>7. Batched prefill is independent of the track: on the exact track it is still a bit-identical cross-token fusion (on by default, no precision loss); on the ACTQ track it switches to the int8 approximate kernel.<br>8. The env for this card is read once at process start: after changing it, click Save and restart the engine for it to take effect.<br>9. When in doubt, keep the exact track: on the board the 30B exact-track prefill already dropped from about 37 s to about 7 s (5.3x), at the cost of still being about 2.3x slower than ACTQ + batching.">
+      <b>注意事项（三轨互斥，只有精确轨可复现）</b><br>
+      1. 精确轨 = 位级一致（A 等同于 C），可与任意参考实现逐位对拍；s16 与 ACTQ 都是近似轨，输出与精确轨不逐位相同。<br>
+      2. s16 与 ACTQ 互斥且 s16 优先（引擎内命中 s16 时强制关掉 ACTQ）。<br>
+      3. s16 轨目前只有 x86 内核，非 x86 平台是「恒 0」安全桩：在那里选它等于精确轨，不会有任何提速，也不会报错。<br>
+      4. ACTQ 走 int8 激活量化，误差约 0.4%，实测贪婪解码在约 23 token 后开始漂移（长文本 t 约 24 起）。<br>
+      5. ACTQ 生效还需三个条件同时成立：模型按 --wmode q4 转换、专家几何成立（ff 能被 ne 整除且 4 行对齐）、目标平台编译期具备 SIMD 点积内核。<br>
+      6. EP（专家并行 / 分布式专家抽取）场景必须留在精确轨：main.c 会强制 ACTQ16=0，且 ACTQ / ACTQ16 都会让 M1/M2 位级对拍变成假对拍。<br>
+      7. 「批式 prefill」与轨道相互独立：精确轨下它也是位级一致的跨 token 融合（默认开，无精度损失）；ACTQ 轨下它改走 int8 近似核。<br>
+      8. 本卡片的 env 在进程启动时读取一次：改完需「保存配置」并重启引擎才生效。<br>
+      9. 拿不准就留精确轨：板端 30B 精确轨 prefill 已从约 37 s 降到约 7 s（5.3 倍），代价是仍比 ACTQ+批式慢约 2.3 倍。
+    </div>
+    <div style="font-size:12px;color:var(--tx2);margin-top:6px"><span data-en="Applies to ">仅对 </span><b data-en="q4 experts">q4 专家</b><span data-en=" only (non-q4 falls back to per-token automatically); after clicking Save, restart the engine for it to take effect. For parameter details see 《核心性能参数配置注意事项.md》.">生效（非 q4 自动回落逐 token）；标记「保存」后需重启引擎生效。参数口径见《核心性能参数配置注意事项.md》。</span></div>
+  </div>
+
+  <!-- 有效优化组合（实测台账） -->
+  <div class="card" style="grid-column:1/-1">
+    <h2 class="ic-table2"><span data-en="Effective Optimization Combos (measured ledger)">有效优化组合（实测台账）</span><span class="sub" data-en="Click Apply to fill the combo into the form; all are single-flag A/B measurements on the same binary">点「套用」把该组合填进表单；全部为同一二进制单开关 A/B 实测</span></h2>
+    <div class="tablewrap">
+    <table class="combos">
+      <thead><tr>
+        <th style="width:15%" data-en="Combo">组合</th><th style="width:15%" data-en="Use case">适用场景</th>
+        <th style="width:33%" data-en="Key flags">关键开关</th><th style="width:22%" data-en="Measured gain">实测收益</th>
+        <th style="width:9%" data-en="Platform">平台</th><th></th>
+      </tr></thead>
+      <tbody id="comboBody"></tbody>
+    </table>
+    </div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.9;margin-top:10px" data-en-html='<b>Platform tags</b>: <span class="ptag ram">RAM saver</span> effective in memory-constrained cases · <span class="ptag x86">x86 reproduced</span> independently reproduced on local x86 · <span class="ptag x86no">x86 no gain</span> no/negative gain on x86 (<b>board-side data still governs</b>)<br><b>Three hard rules</b>: ① <code>--l3-evict</code> requires <code>VLLM_L3_PREFIX_REUSE=1</code>; ② <code>--sparse-k</code> must not go below 32; ③ encrypted VQF can only be fully resident (per-layer <code>VLLM_VQF_STREAM</code> unavailable).<br><b>Mutually exclusive</b>: <code>--kv-q4</code> × <code>--sparse-attn</code>; <code>--spec</code> × {<code>--sparse-attn</code>, <code>--l3-evict</code>, <code>--batch-max</code>}.'>
+      <b>平台标签</b>：
+      <span class="ptag ram">省 RAM</span> 内存受限场景有效 ·
+      <span class="ptag x86">x86 已复现</span> 已在本地 x86 独立复现 ·
+      <span class="ptag x86no">x86 无效</span> x86 上无收益/负收益（<b>板端数据仍以板端为准</b>）<br>
+      <b>三条铁律</b>：① 开 <code>--l3-evict</code> 必须同时开 <code>VLLM_L3_PREFIX_REUSE=1</code>；
+      ② <code>--sparse-k</code> 不得低于 32；③ 加密 VQF 只能全层驻留（不可用逐层 <code>VLLM_VQF_STREAM</code>）。<br>
+      <b>互斥</b>：<code>--kv-q4</code> × <code>--sparse-attn</code>；<code>--spec</code> × {<code>--sparse-attn</code>, <code>--l3-evict</code>, <code>--batch-max</code>}。
+    </div>
+    <div class="msg" id="combomsg"></div>
+  </div>
+  </div><!-- /tabpane perf -->
+
+  <div class="tabpane" data-pane="server">
+  <!-- 服务 -->
+  <div class="card">
+    <h2 class="ic-globe" data-en="HTTP Server">HTTP 服务</h2>
+    <div class="fldgrid">
+      <label class="fld"><span class="t" data-en="Port (--port)">端口 (--port)</span><input type="number" id="f_port" min="1" max="65535" value="8080"></label>
+      <label class="fld"><span class="t" data-en="Worker threads (--threads)">Worker 线程 (--threads)</span><input type="number" id="f_threads" min="1" max="32" value="8"></label>
+      <label class="fld"><span class="t" data-en="Max queued (--max-queued)">最大排队 (--max-queued)</span><input type="number" id="f_max_queued" min="0" value="16"></label>
+      <label class="fld"><span class="t" data-en="Continuous batching (--batch-max, 0/1 = off, max 32)">连续批处理 (--batch-max，0/1=关，上限 32)</span><input type="number" id="f_batch_max" min="0" max="32" value="0"></label>
+      <label class="fld"><span class="t">OMP_NUM_THREADS</span><input type="text" id="f_omp" value="4"></label>
+    </div>
+  </div>
+
+  <!-- 可验证推理（attest） -->
+  <div class="card">
+    <h2 class="ic-shield"><span data-en="Verifiable Inference (attest) ">可验证推理（attest）</span><span id="attBadge" class="badge" style="margin-left:6px">未知</span></h2>
+    <div class="chkrow"><input type="checkbox" id="f_attest"><label for="f_attest"><span data-en="Per-response attestation (VLLM_ATTEST): every chat response carries an SM2-signed receipt binding the raw request bytes and the output text">逐响应出证 (VLLM_ATTEST)：每条对话响应附 SM2 签名凭证，绑定请求原文与输出原文</span><span class="ptag" data-en="SM2-SM3">SM2-SM3</span></label></div>
+    <label class="fld"><span class="t" data-en="Key / work directory (VLLM_ATTEST_DIR; default = engine cwd; key pair auto-generated on first start. Must be on a filesystem with POSIX permissions, e.g. ext4/f2fs — on vfat/exfat chmod is a no-op and the private key becomes world-readable, with a WARN logged at startup)">密钥 / 工作目录 (VLLM_ATTEST_DIR；缺省=引擎工作目录，首次启动自动生成密钥对；须放在支持 POSIX 权限的文件系统上（ext4/f2fs 等）——vfat/exfat 上 chmod 不生效，私钥会变为世界可读，启动日志打印 WARN)</span><input type="text" id="f_attest_dir" placeholder="."></label>
+    <div class="sec" data-en="Device public key (128 hex, safe to publish)">设备公钥（128 hex，可对外发布）</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <code id="attPub" style="word-break:break-all;font-size:11px;flex:1;min-width:240px">-</code>
+      <button id="btn_attcopy" class="ic-copy" data-en="Copy">复制</button>
+      <button id="btn_attcheck" class="ic-refresh" data-en="Refresh">刷新</button>
+    </div>
+    <div class="msg" id="attmsg"></div>
+    <div style="font-size:11px;color:var(--tx2);line-height:1.7" data-en-html="Verification: the chat page (<b>/chat</b>) marks every reply with a verifiable badge — click it to recompute SM3(request bytes) + SM3(digest) and verify the SM2 signature in-browser, or export proof.json / request.json / output.txt and re-verify offline with <b>tools/security/verify_attest.py</b>. The switch takes effect after saving the config and restarting the engine.">
+      验证方式：对话页（<b>/chat</b>）每条回复带「可验证」徽标 —— 点开即在浏览器内复算
+      SM3(请求原文) + SM3(摘要) 并验证 SM2 签名；也可导出 proof.json / request.json / output.txt，
+      用 <b>tools/security/verify_attest.py</b> 离线复验。开关需「保存配置」并重启引擎后生效。
+    </div>
+  </div>
+
+  </div><!-- /tabpane server -->
+
+  <div class="tabpane" data-pane="cfglog">
+  <!-- 配置与操作 -->
+  <div class="card">
+    <h2 class="ic-gear" data-en="Config Management">配置管理</h2>
+    <div class="sec" data-en="Startup &amp; Presets">启动与预设</div>
+    <div class="chkrow"><input type="checkbox" id="f_auto_start"><label for="f_auto_start" data-en="Auto start (supervisor starts the engine and loads the model when it detects it is not running)">自动启动 (supervisor 检测到引擎未运行时自动拉起并加载模型)</label></div>
+    <label class="fld" style="margin-top:8px"><span class="t" data-en="Quick combo optimization (presets fill the optimization switches below in one click)">快速组合优化（预设一键填充下方优化开关）</span>
+      <select id="f_preset">
+        <option value="" data-en="— Select a preset —">— 选择预设 —</option>
+        <option value="mem" data-en="Low memory: KV Q4 (model must be converted with --wmode q4)">低内存: KV Q4（模型须按 --wmode q4 转换）</option>
+        <option value="long" data-en="Long context + multi-turn: sparse attention + L3 cold-block eviction + P3 prefix-reuse gate (required, decode 3× faster)">长上下文 + 多轮: 稀疏注意力 + L3 冷块淘汰 + P3 前缀复用门（必备，decode 快 3 倍）</option>
+      </select></label>
+    <div class="row">
+      <button id="btn_preset" class="ic-zap" data-en="Apply preset">应用预设</button>
+      <div class="msg" id="presetmsg"></div>
+    </div>
+    <div class="sec" data-en="Persistence">持久化</div>
+    <div class="row">
+      <button id="btn_loadcfg" class="ic-download" data-en="Load current config">载入当前配置</button>
+      <button id="btn_savecfg" class="primary ic-save" data-en="Save config">保存配置</button>
+    </div>
+    <div class="msg" id="cfgmsg"></div>
+  </div>
+
+  <!-- 会话审查 / 规则包 / 审计 已拆分为独立页：/review（见页面顶部导航） -->
+
+  <!-- 日志 -->
+  <div class="card" style="grid-column:1/-1">
+    <h2 class="ic-file" style="display:flex;align-items:center;gap:10px"><span data-en="Engine Log ">引擎日志 </span><span id="logMeta" style="color:var(--tx2);font-weight:400"></span>
+      <span style="flex:1"></span>
+      <button id="btn_logpause" class="ic-pause" style="padding:3px 10px;font-size:12px">暂停</button>
+    </h2>
+    <div class="logfilters" id="logFilters">
+      <button data-lv="" class="on"><span data-en="All ">全部 </span><span class="lc" id="cnt_all">0</span></button>
+      <button data-lv="info">INFO <span class="lc" id="cnt_info">0</span></button>
+      <button data-lv="warn">WARN <span class="lc" id="cnt_warn">0</span></button>
+      <button data-lv="error">ERROR <span class="lc" id="cnt_error">0</span></button>
+      <button data-lv="debug">DEBUG <span class="lc" id="cnt_debug">0</span></button>
+    </div>
+    <div id="log"></div>
+  </div>
+  </div><!-- /tabpane cfglog -->
+</main>
+<footer><span data-en="vLLM-Kestrel management · Config saved at ">vLLM-Kestrel management · 配置保存在 </span><span id="cfgPath">-</span><span data-en=" · When the engine is not running, start supervisor first, then use &quot;Start Engine&quot; on this page"> · 引擎未运行时请启动 supervisor 后使用本页"启动引擎"</span></footer>
+
+<script>
+"use strict";
+const MGR_PORT = 8082;
+const mgrBase = location.protocol + "//" + location.hostname + ":" + MGR_PORT;
+const engBase = "";   // same origin
+let logPaused = false;
+let logAuto = true;
+let logLevel = "";        /* ""=all, "info", "warn", "error", "debug" */
+let allLogLines = [];
+let logBytes = 0;
+let compCfg = null;   /* K-ADMIN-001：组件配置（三个独立页维护），保存时原样回填 */
+
+const $ = id => document.getElementById(id);
+const num = id => parseInt($(id).value, 10) || 0;
+const bool = id => $(id).checked;
+
+/* ============ 双语（中 / 英）================
+ * 中文为源码原文（默认语言，DOM 里原样保留），英文另给一份：
+ *   - HTML 静态文案：元素加 data-en="English"；含子元素需保留标签的用 data-en-html。
+ *     applyLang() 首次运行快照中文原文，之后在中英之间来回切换。
+ *   - JS 动态文案：T("中文", "English")；设备名用 devName(d)（后端同时下发 name/name_en）。
+ *   - 选择写入 localStorage，刷新后保持；<html lang> 同步。
+ * 边界：引擎日志正文与 supervisor 页（vllm_mgr.py）不在本机制内，见 include/common/vllm_i18n.h。 */
+const LANG_KEY = "vllm_lang";
+let LANG = (function(){ try { return localStorage.getItem(LANG_KEY) === "en" ? "en" : "zh"; } catch(e){ return "zh"; } })();
+function T(zh, en){ return LANG === "en" ? en : zh; }
+function devName(d){ return d ? ((LANG === "en" && d.name_en) ? d.name_en : (d.name || "")) : ""; }
+function applyLang(){
+  document.documentElement.lang = (LANG === "en") ? "en" : "zh-CN";
+  document.querySelectorAll("[data-en]").forEach(function(el){
+    if (el.__zh === undefined) el.__zh = el.textContent;
+    el.textContent = (LANG === "en") ? el.dataset.en : el.__zh;
+  });
+  document.querySelectorAll("[data-en-html]").forEach(function(el){
+    if (el.__zhHtml === undefined) el.__zhHtml = el.innerHTML;
+    el.innerHTML = (LANG === "en") ? el.dataset.enHtml : el.__zhHtml;
+  });
+  document.querySelectorAll("[data-en-ph]").forEach(function(el){
+    if (el.__zhPh === undefined) el.__zhPh = el.placeholder;
+    el.placeholder = (LANG === "en") ? el.dataset.enPh : el.__zhPh;
+  });
+  document.querySelectorAll("[data-en-title]").forEach(function(el){
+    if (el.__zhTi === undefined) el.__zhTi = el.title;
+    el.title = (LANG === "en") ? el.dataset.enTitle : el.__zhTi;
+  });
+  var lb = $("langBtn");
+  if (lb){ lb.textContent = T("EN", "中文"); lb.title = T("Switch to English", "切换为中文"); }
+  try { localStorage.setItem(LANG_KEY, LANG); } catch(e){}
+}
+function setLang(l){ LANG = (l === "en") ? "en" : "zh"; applyLang(); }
+
+function badge(el, text, cls){
+  el.textContent = text;
+  el.className = "badge " + (cls || "");
+}
+/* 会随语言变化的状态徽标：记住中英文案与样式，切换语言时可原样重绘
+ * （否则切换语言后徽标会停留在旧语言）。 */
+function badgeT(el, zh, en, cls){
+  el.__zh = zh; el.__en = en; el.__cls = cls;
+  badge(el, T(zh, en), cls);
+}
+function refreshBadgeT(el){
+  if (el && el.__zh !== undefined) badge(el, T(el.__zh, el.__en), el.__cls);
+}
+function msg(el, text, ok){
+  el.textContent = text;
+  el.className = "msg show " + (ok ? "ok" : "err");
+}
+function fmtUptime(s){
+  s = Math.max(0, s|0);
+  const h = (s/3600)|0, m = ((s%3600)/60)|0, sec = s%60;
+  return String(h).padStart(2,"0") + ":" + String(m).padStart(2,"0") + ":" + String(sec).padStart(2,"0");
+}
+function fmtMB(v){
+  if (v == null || v < 0) return "-";
+  if (v >= 1024) return (v/1024).toFixed(2) + " GB";
+  return v + " MB";
+}
+
+/* ---------- engine API ---------- */
+async function eng(fn, opts){
+  const r = await fetch(engBase + fn, opts);
+  return r.json();
+}
+async function mgr(fn, opts){
+  const r = await fetch(mgrBase + fn, opts);
+  return r.json();
+}
+
+/* ---------- status ---------- */
+function loadStateText(s){
+  switch (s.load_state){
+    case 1: return T("加载中 ", "Loading ") + (s.load_total > 0 ? "(" + s.load_layer + "/" + s.load_total + ")" : "");
+    case 2: return T("已就绪", "Ready");
+    case 3: return T("加载失败", "Load failed");
+    default: return T("未加载", "Not loaded");
+  }
+}
+function renderLoadBar(s){
+  const box = $("loadbar");
+  if (!s){ box.style.display = "none"; return; }   /* 引擎不可达（loadStatus 的 catch 会传 null）*/
+  if (s.load_state === 1){
+    const total = s.load_total > 0 ? s.load_total : 1;
+    const pct = Math.min(100, Math.round(s.load_layer / total * 100));
+    box.innerHTML = `
+      <div class="loadbar-t">${T("模型加载中…", "Loading model…")} <span id="loadPct">${pct}%</span> (${T("层", "layer")} ${s.load_layer}/${s.load_total || "?"})</div>
+      <div class="progress"><div style="width:${pct}%"></div></div>`;
+    box.style.display = "block";
+  } else {
+    box.style.display = "none";
+  }
+}
+function updateButtons(s){
+  // engine running + load states
+  const up = !!s;
+  $("btn_start").disabled = up;
+  $("btn_loadmodel").disabled = !up || s.load_state === 1 || s.load_state === 2;
+  $("btn_unload").style.display = (up && s.load_state === 2) ? "" : "none";
+  $("btn_stop").disabled = !up;
+  $("btn_restart").disabled = !up;
+}
+function vqfStreamText(s){
+  const v = s.vqf_stream;
+  if (!v) return T("关闭", "Off");
+  if (!v.on) return T("关闭", "Off");
+  return T("启用", "Enabled") + " · " + T("常驻窗口", "resident window") + " keep=" + v.keep + " · " + v.n_layers + T(" 层 × ", " layers × ") +
+         v.n_segments + T(" 段 · 每层可驱逐 ", " segments · evictable per layer ") +
+         (v.per_layer_mb ? v.per_layer_mb.toFixed(1) : "?") + " MB" +
+         (v.cold ? T(" · 冷驱逐(含页缓存)", " · cold eviction (incl. page cache)") : "");
+}
+/* ---------- 内存驻留策略（档位阶梯）UI ---------- */
+const RES_LVL_CN = ["L0 已卸载(落盘善后)", "L1 初始层(只剩初始层权重)",
+                    "L2 权重窗口(w_keep)", "L3 KV逐层淘汰", "L4 全程全层驻留"];
+const RES_LVL_EN = ["L0 unloaded (persisted)", "L1 initial layers (only initial-layer weights)",
+                    "L2 weight window (w_keep)", "L3 KV per-layer eviction", "L4 full-layer residency throughout"];
+const RES_LVL_SHORT_CN = ["L0 卸载","L1 初始层","L2 权重窗口","L3 KV淘汰","L4 全层驻留"];
+const RES_LVL_SHORT_EN = ["L0 unloaded","L1 initial layers","L2 weight window","L3 KV eviction","L4 full-layer residency"];
+function resLvlName(i){ return (LANG === "en" ? RES_LVL_EN : RES_LVL_CN)[i]; }
+function resLvlShort(i){ return (LANG === "en" ? RES_LVL_SHORT_EN : RES_LVL_SHORT_CN)[i]; }
+function resRender(r){
+  if (!r) return;
+  const wc = r.w_capable ? T("权重分层可用", "Weight layering available") : T("权重分层未启用（L2/L1 自动跳到 L0）", "Weight layering disabled (L2/L1 auto-skip to L0)");
+  $("resStatus").innerHTML =
+    T("当前档位：", "Current level: ") + "<b>" + resLvlName(r.cur_level) + "</b>" +
+    " <span style='color:var(--tx2)'>(cfg L" + r.cfg_level + " · L3 " +
+    (r.l3_evict ? T("开", "on") : T("关", "off")) + T(" · 自动降级 ", " · auto-downgrade ") + r.steps + T(" 次", " times") + ")</span><br>" +
+    T("空闲等待：", "Idle waits: ") + "L4→L3 " + r.idle_s[0] + "s · L3→L2 " + r.idle_s[1] + "s · " +
+    "L2→L1 " + r.idle_s[2] + "s · L1→L0 " + r.idle_s[3] + "s" +
+    T(" · 自动空闲降级 ", " · auto idle downgrade ") + (r.auto_idle ? T("开", "on") : T("关", "off")) + "<br>" +
+    T("软水位 ", "Soft watermark ") + r.mem_soft_mb + T(" MB · 最低允许档 L", " MB · lowest allowed level L") + r.mem_low_lvl +
+    " · " + wc;
+  $("f_res_auto").checked = !!r.auto_idle;
+  $("f_res_idle4").value = r.idle_s[0];
+  $("f_res_idle3").value = r.idle_s[1];
+  $("f_res_idle2").value = r.idle_s[2];
+  $("f_res_idle1").value = r.idle_s[3];
+  $("f_res_wkeep").value = r.w_keep;
+  $("f_res_soft").value = r.mem_soft_mb;
+  $("f_res_lowlvl").value = r.mem_low_lvl;
+}
+async function opResCfg(){
+  const body = {
+    auto_idle: $("f_res_auto").checked,
+    idle_s: [+$("f_res_idle4").value||0, +$("f_res_idle3").value||0,
+             +$("f_res_idle2").value||0, +$("f_res_idle1").value||0],
+    w_keep: +$("f_res_wkeep").value || 0,
+    mem_soft_mb: +$("f_res_soft").value || 0,
+    mem_low_lvl: +$("f_res_lowlvl").value || 0
+  };
+  const m = $("resmsg");
+  try {
+    const r = await eng("/admin/api/policy/config",
+      {method:"POST", headers:{"Content-Type":"application/json"},
+       body: JSON.stringify(body)});
+    m.textContent = (r && r.error) ? (T("失败: ", "Failed: ") + r.error)
+                                   : ((r && r.note) || T("策略参数已应用", "Policy parameters applied"));
+    m.style.color = (r && r.error) ? "var(--bad,#d44)" : "";
+    loadStatus();
+  } catch (e) { m.textContent = T("请求失败: ", "Request failed: ") + e; }
+}
+async function opResSet(level){
+  const m = $("resmsg");
+  try {
+    const r = await eng("/admin/api/policy/set",
+      {method:"POST", headers:{"Content-Type":"application/json"},
+       body: JSON.stringify({level: level})});
+    if (r && r.ok){
+      if (r.clamped){
+        /* 能力钳制：请求 L2/L1 但权重分层未启用 → 只到 L3。显式说明，不静默。 */
+        m.textContent = T("已切换至 ", "Switched to ") + (r.level_name || ("L" + r.level)) +
+          T("（请求的 L" + r.requested + " 不可用：L2/L1 需权重分层（明文 VQF + VLLM_VQF_STREAM），已钳制）",
+            " (requested L" + r.requested + " unavailable: L2/L1 need weight layering (plaintext VQF + VLLM_VQF_STREAM); clamped)");
+        m.style.color = "var(--warn,#b80)";
+      } else {
+        m.textContent = T("已切换至 ", "Switched to ") + (r.level_name || ("L" + level));
+        m.style.color = "";
+      }
+    } else {
+      m.textContent = T("切换失败: ", "Switch failed: ") + (r && r.error ? r.error : T("未知错误", "unknown error"));
+      m.style.color = "var(--bad,#d44)";
+    }
+    loadStatus();
+  } catch (e) { m.textContent = T("请求失败: ", "Request failed: ") + e; }
+}
+async function loadStatus(){
+  let ok = false;
+  let s = null;
+  try {
+    s = await eng("/admin/api/status");
+    ok = true;
+    /* s16 轨是 x86-only（非 x86 平台恒 0 桩），换轨告警文案按平台区分；每轮刷新重绘。 */
+    isX86 = /x86_64|amd64|x86/i.test(s.device_arch || "");
+    if ($("f_moe_track")) updateTrackWarn();
+    const g = $("stGrid");
+    g.innerHTML = "";
+    const items = [
+      [T("引擎", "Engine"), "vllm_kestrel", ""],
+      [T("模型状态", "Model status"), loadStateText(s), ""],
+      [T("设备", "Device"), s.device_id || "-", ""],
+      [T("设备说明", "Device desc"), LANG === "en" ? (s.device_name_en || s.device_name || "-") : (s.device_name || "-"), "small"],
+      [T("架构/类别", "Arch/Class"), (s.device_arch || "-") + " / " + (s.device_class || "-"), ""],
+      [T("模型类型", "Model type"), s.model_name || (s.load_state === 2 ? (s.model_id || "-") : T("未加载", "not loaded")), ""],
+      [T("模型目录", "Model dir"), s.model_dir || "-", "small"],
+      [T("VQF 固化布局", "VQF baked layout"), s.layout || "-", ""],
+      [T("VQF 分层驻留", "VQF layered residency"), vqfStreamText(s), ""],
+      [T("驻留策略档位", "Residency level"), s.res ? (resLvlShort(s.res.cur_level) + (s.res.auto_idle ? T(" · 自动降级", " · auto-downgrade") : "")) : "-", ""],
+      [T("KV 前缀复用", "KV prefix reuse"), s.prefix_kv ? T("开（多模态/文本共用）", "On (shared by multimodal/text)") : T("关 (--no-prefix-kv)", "Off (--no-prefix-kv)"), ""],
+      [T("上次启动耗时", "Last load time"), s.last_load_ms ? (s.last_load_ms + " ms") : "-", ""],
+      [T("卸载次数", "Unload count"), (s.unload_count||0) + (s.auto_unload_count ? (T("（自动 ", " (auto ") + s.auto_unload_count + T("）", ")")) : ""), ""],
+      [T("按需加载/卸载", "Load/unload on demand"), (s.auto_load ? T("用时加载 开", "load-on-use on") : T("用时加载 关", "load-on-use off")) + " / " + (s.auto_unload_s > 0 ? (T("空闲 ", "idle ") + s.auto_unload_s + T("s 卸载", "s unload")) : T("不用时卸载 关", "unload-when-idle off")), ""],
+      [T("端口", "Port"), String(s.port), ""],
+      [T("线程", "Threads"), String(s.threads), ""],
+      [T("运行时长", "Uptime"), fmtUptime(s.uptime_s), ""],
+      [T("推理中", "Inferring"), s.busy ? T("是", "Yes") : T("否", "No"), ""],
+      [T("当前连接", "Connections"), String(s.connections || 0), ""],
+      [T("活跃/排队", "Active/queued"), s.active + " / " + s.queued + T(" (上限 ", " (max ") + s.max_queued + ")", ""],
+      [T("连续批处理", "Continuous batching"), s.batch_max ? ("batch_max=" + s.batch_max + T("，批内 ", "; in-batch ") + (s.batch_active || 0)) : T("关闭", "Off"), ""],
+      [T("累计请求", "Total requests"), String(s.total_requests), ""],
+      [T("RSS 内存", "RSS memory"), fmtMB(s.rss_mb), ""],
+      [T("可用内存", "Available memory"), fmtMB(s.mem_avail_mb) + " / " + fmtMB(s.mem_total_mb), ""],
+      [T("CPU 占用", "CPU usage"), s.cpu_pct != null && s.cpu_pct >= 0 ? s.cpu_pct.toFixed(0) + "%" : "-", ""],
+    ];
+    for (const [k, v, cls] of items){
+      const d = document.createElement("div");
+      d.className = "kv";
+      d.innerHTML = `<div class="k"></div><div class="v ${cls}"></div>`;
+      d.querySelector(".k").textContent = k;
+      d.querySelector(".v").textContent = v;
+      g.appendChild(d);
+    }
+    $("cfgPath").textContent = s.config_path || "-";
+    resRender(s.res);   /* 内存驻留策略：状态 + 表单回填 */
+    renderLoadBar(s);
+    collabRender(s.collab);   /* K-ADMIN-002：组件状态灯 + 开关 */
+    const mi = $("modelInfo");
+    if (s.load_state === 2) mi.textContent = "✓ " + (s.model_name || s.model_id || T("已加载", "loaded"));
+    else if (s.load_state === 1) mi.textContent = T("加载中…", "Loading…");
+    else mi.textContent = (s.unload_count > 0 && s.auto_load)
+      ? T("已卸载（用时加载：下次请求自动重新加载）", "Unloaded (load-on-use: reloads automatically on the next request)")
+      : (s.model_dir ? T("尚未加载（填好上方路径后点「加载模型」）", "Not loaded yet (fill in the path above, then click Load Model)") : T("未加载", "Not loaded"));
+    const st = s.load_state;
+    const stTxt = st === 1 ? T("·加载中", "·loading") : (st === 2 ? T("·已就绪", "·ready") : T("·未加载模型", "·no model loaded"));
+    badge($("engBadge"), T("引擎: 运行中", "Engine: running") + stTxt,
+          st === 1 ? "warn" : (st === 2 ? "ok" : "warn"));
+  } catch (e) {
+    badge($("engBadge"), T("引擎: 已停止", "Engine: stopped"), "stop");
+    renderLoadBar(null);
+  }
+  updateButtons(s);
+  // supervisor
+  try {
+    const m = await mgr("/api/status");
+    const running = m.engine_running;
+    badge($("mgrBadge"), T("supervisor: 在线", "supervisor: online") + (running ? T(" · 引擎运行中", " · engine running") : T(" · 引擎已停止", " · engine stopped")), running ? "ok" : "warn");
+  } catch (e) {
+    badge($("mgrBadge"), T("supervisor: 不可达", "supervisor: unreachable"), "bad");
+  }
+  applyLang();
+  return ok;
+}
+
+/* ---------- K-ADMIN-002：协作组件状态灯 + 启用/停用开关（保存配置 → 重启生效） ----------
+ * 只读状态来自 /admin/api/status 的 collab 字段；开关只 patch 单个配置键，
+ * 由 supervisor 重启引擎生效——不新增任何运行时动态加载/卸载 API。 */
+function collabBadge(id, txt, cls){ const el=$(id); if(!el) return; el.textContent=txt; el.className="badge "+cls; }
+function collabRender(c){
+  if(!c) return;
+  /* 向量（embed）：未配置 = 复用主模型，不是"停用"，显式警示避免静默降级误读 */
+  const e=c.embed||{};
+  if(e.failed) collabBadge("cst_embed", T("加载失败","load failed"), "bad");
+  else if(e.loaded) collabBadge("cst_embed", T("专用·已加载","dedicated · loaded"), "ok");
+  else if(e.enabled) collabBadge("cst_embed", T("专用·未加载","dedicated · not loaded"), "warn");
+  else collabBadge("cst_embed", T("复用主模型","falls back to main model"), "stop");
+  const we=$("warn_embed");
+  if(we){
+    if(!e.enabled){
+      we.style.display="";
+      we.textContent=T("未配置专用向量模型：RAG 检索将复用主模型出向量，检索质量下降（这是回退，不是停用）。",
+                       "No dedicated embedding model: RAG falls back to the main model for vectors — lower retrieval quality (a fallback, not a disable).");
+    } else we.style.display="none";
+  }
+  const be=$("cb_embed");
+  if(be){
+    be.textContent = e.enabled ? T("切回复用主模型","Fall back to main model") : T("配置专用向量模型 →","Configure dedicated model →");
+    be.onclick = e.enabled ? ()=>collabDisable("embed_model","embed") : ()=>{location.href="/admin/kb";};
+  }
+  /* Laya */
+  const l=c.laya||{};
+  if(l.loaded) collabBadge("cst_laya", T("已加载","loaded"), "ok");
+  else if(l.enabled) collabBadge("cst_laya", T("已启用·未加载","enabled · not loaded"), "warn");
+  else collabBadge("cst_laya", T("未启用","disabled"), "stop");
+  const bl=$("cb_laya");
+  if(bl){
+    bl.textContent = l.enabled ? T("停用","Disable") : T("启用 →","Enable →");
+    bl.onclick = l.enabled ? ()=>collabDisable("laya_pack","laya") : ()=>{location.href="/admin/laya";};
+  }
+  /* YOLO */
+  const y=c.yolo||{};
+  if(y.loaded) collabBadge("cst_yolo", T("已加载","loaded"), "ok");
+  else if(y.enabled) collabBadge("cst_yolo", T("已启用·未加载","enabled · not loaded"), "warn");
+  else collabBadge("cst_yolo", T("未启用","disabled"), "stop");
+  const by=$("cb_yolo");
+  if(by){
+    by.textContent = y.enabled ? T("停用","Disable") : T("启用 →","Enable →");
+    by.onclick = y.enabled ? ()=>collabDisable("yolo_model","yolo") : ()=>{location.href="/admin/yolo";};
+  }
+}
+/* 停用 / 切回复用：只 patch 单个键 → 保存 → 询问是否重启生效 */
+async function collabDisable(key, which){
+  const isEmbed = which==="embed";
+  const q = isEmbed
+    ? T("切换回「复用主模型」？\n注意：这不是停用——RAG 检索将改用主模型出向量，检索质量会下降。\n保存后需重启引擎生效。",
+        "Switch back to 'falls back to the main model'?\nNote: this is NOT a disable — RAG retrieval will use the main model for vectors and quality drops.\nRestart the engine to apply.")
+    : T("停用该组件？\n该组件端点将返回 404（显式报错，不静默降级）。\n保存后需重启引擎生效。",
+        "Disable this component?\nIts endpoint will return 404 (explicit error, no silent fallback).\nRestart the engine to apply.");
+  if(!confirm(q)) return;
+  const patch = {}; patch[key] = "";
+  try {
+    const r = await eng("/admin/api/config/patch", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(patch)
+    });
+    if(!r.ok){ alert(T("保存失败: ","Save failed: ")+(r.error||"")); return; }
+    if(confirm(T("已保存（需重启引擎生效）。是否立即重启？","Saved (restart required to apply). Restart the engine now?"))) opRestart();
+    else loadStatus();
+  } catch(err){ alert(T("请求失败: ","Request failed: ")+err); }
+}
+
+/* ---------- config ---------- */
+function fillForm(c){
+  const ev = c.env || {};   /* 必须在下面的 ev.* 读取之前声明（原实现声明靠后，触发 TDZ） */
+  $("f_model_dir").value = c.model_dir || "";
+  $("f_model_id").value = c.model_id || "";
+  $("f_kv_q4").checked = !!c.kv_q4;
+  $("f_prefix_cache").checked = !!c.prefix_cache;
+  $("f_prefix_kv").checked = c.prefix_kv !== false;
+  $("f_prefill_q8").checked = !!c.prefill_q8;
+  $("f_sparse_attn").checked = !!c.sparse_attn;
+  $("f_sparse_k").value = c.sparse_k || 32;
+  $("f_sparse_prefill").checked = ((c.env || {}).VLLM_SPARSE_PREFILL === "1");
+  $("f_sparse_pf_k").value = c.sparse_pf_k == null ? 32 : c.sparse_pf_k;
+  $("f_sparse_pf_group").value = c.sparse_pf_group == null ? 4 : c.sparse_pf_group;
+  $("f_disk_kv").checked = !!c.disk_kv;
+  $("f_disk_kv_dir").value = c.disk_kv_dir || "";
+  $("f_rulebook_dir").value = c.rulebook_dir || "";
+  $("f_session_dir").value = c.session_dir || "";
+  $("f_session_limit").value = c.session_limit == null ? 0 : c.session_limit;
+  $("f_audit_log").value = c.audit_log || "";
+  $("f_spec").checked = !!c.spec;
+  $("f_spec_k").value = c.spec_k || 4;
+  $("f_min_p").value = c.min_p == null ? 0 : c.min_p;
+  $("f_l3_evict").checked = !!c.l3_evict;
+  $("f_l3_prefix_reuse").checked = ev.VLLM_L3_PREFIX_REUSE === "1";
+  $("f_l3_ratio").value = c.l3_ratio == null ? 0.75 : c.l3_ratio;
+  $("f_l3_min_seq").value = c.l3_min_seq == null ? 128 : c.l3_min_seq;
+  $("f_l3_path").value = c.l3_path || "";
+  $("f_l3_max_size").value = c.l3_max_size || 0;
+  $("f_l3_user_ttl").value = c.l3_user_ttl == null ? 30 : c.l3_user_ttl;
+  $("f_port").value = c.port || 8080;
+  $("f_threads").value = c.threads || 8;
+  $("f_max_queued").value = c.max_queued == null ? 16 : c.max_queued;
+  $("f_batch_max").value = c.batch_max == null ? 0 : c.batch_max;
+  $("f_min_free_mb").value = c.min_free_mb == null ? 512 : c.min_free_mb;
+  $("f_auto_load").checked = !!c.auto_load;
+  $("f_auto_unload_s").value = c.auto_unload_s == null ? 0 : c.auto_unload_s;
+  $("f_omp").value = (c.env && c.env.OMP_NUM_THREADS) ? c.env.OMP_NUM_THREADS : "4";
+  $("f_vqf_prewarm").checked = ev.VLLM_VQF_PREWARM === "1";
+  const vqs = parseInt(ev.VLLM_VQF_STREAM || "0", 10);
+  $("f_vqf_stream").checked = vqs > 0;
+  $("f_vqf_stream_keep").value = vqs > 0 ? String(vqs) : "1";
+  $("f_vqf_key").value = ev.VLLM_VQF_KEY || "";
+  /* 可验证推理（attest）：开关 + 密钥/工作目录（首次启动自动生成密钥对） */
+  $("f_attest").checked = ev.VLLM_ATTEST === "1";
+  $("f_attest_dir").value = ev.VLLM_ATTEST_DIR || "";
+  /* MoE 优化：默认开项用「!== "0"」，默认关项用「=== "1"」 */
+  $("f_moe_batch").checked = ev.VLLM_MOE_BATCH !== "0";
+  /* 精度/速度轨（三选一）：与引擎侧 actq16_env()/moe_q4_actq_ok() 同口径 ——
+   * ACTQ16 与 ACTQ 互斥且 ACTQ16 优先；ACTQ16 未显式给定时按平台默认
+   * （x86 默认开、非 x86 平台为恒 0 安全桩）→ 非 x86 平台缺省即精确轨。 */
+  $("f_moe_track").value = (ev.VLLM_ACTQ === "1") ? "actq"
+      : (ev.VLLM_ACTQ16 === "1" || (ev.VLLM_ACTQ16 === undefined && isX86)) ? "s16"
+      : "exact";
+  $("f_moe_par").checked = ev.VLLM_MOE_PAR !== "0";
+  $("f_moe_q4simd").checked = ev.VLLM_MOE_Q4SIMD !== "0";
+  $("f_auto_start").checked = !!c.auto_start;
+  /* K-ADMIN-001：组件配置（embed/kb/laya/yolo）与云边协同（cloud_*）由独立页或
+   * config.json 维护，主管理页无对应输入框；这里原样留存，保存时回填，避免主管理页
+   * 保存时把它们从 config.json 抹掉。（cloud_key 为凭据，不走 config.json，故不含。） */
+  compCfg = {
+    embed_model: c.embed_model || "",
+    kb_root: c.kb_root || "",
+    laya_pack: c.laya_pack || "",
+    yolo_model: c.yolo_model || "",
+    yolo_conf: (c.yolo_conf == null ? 0 : c.yolo_conf),
+    yolo_iou: (c.yolo_iou == null ? 0 : c.yolo_iou),
+    cloud_endpoint: c.cloud_endpoint || "",
+    cloud_model: c.cloud_model || "",
+    cloud_fallback: c.cloud_fallback || "never"
+  };
+  updateP3Warn();
+  updateTrackWarn();
+  badgeT($("cfgBadge"), "配置: 已载入", "Config: loaded", "ok");
+  applyLang();
+}
+function collectForm(){
+  const o = {
+    model_dir: $("f_model_dir").value.trim(),
+    model_id: $("f_model_id").value.trim(),
+    kv_q4: bool("f_kv_q4"),
+    prefix_cache: bool("f_prefix_cache"),
+    prefix_kv: bool("f_prefix_kv"),
+    prefill_q8: bool("f_prefill_q8"),
+    sparse_attn: bool("f_sparse_attn"),
+    sparse_k: num("f_sparse_k"),
+    sparse_prefill: bool("f_sparse_prefill"),
+    sparse_pf_k: num("f_sparse_pf_k"),
+    sparse_pf_group: num("f_sparse_pf_group"),
+    disk_kv: bool("f_disk_kv"),
+    disk_kv_dir: $("f_disk_kv_dir").value.trim(),
+    rulebook_dir: $("f_rulebook_dir").value.trim(),
+    session_dir: $("f_session_dir").value.trim(),
+    session_limit: num("f_session_limit"),
+    audit_log: $("f_audit_log").value.trim(),
+    spec: bool("f_spec"),
+    spec_k: num("f_spec_k"),
+    min_p: parseFloat($("f_min_p").value) || 0,
+    l3_evict: bool("f_l3_evict"),
+    l3_ratio: parseFloat($("f_l3_ratio").value) || 0,
+    l3_min_seq: num("f_l3_min_seq"),
+    l3_path: $("f_l3_path").value.trim(),
+    l3_max_size: num("f_l3_max_size"),
+    l3_user_ttl: num("f_l3_user_ttl"),
+    port: num("f_port"),
+    threads: num("f_threads"),
+    max_queued: num("f_max_queued"),
+    batch_max: num("f_batch_max"),
+    min_free_mb: num("f_min_free_mb"),
+    auto_load: bool("f_auto_load"),
+    auto_unload_s: num("f_auto_unload_s"),
+    auto_start: bool("f_auto_start"),
+    device: $("f_device").value,
+    env: collectEnv()
+  };
+  /* K-ADMIN-001：组件配置由三个独立页维护，主管理页保存时原样回填。 */
+  if (compCfg) Object.assign(o, compCfg);
+  return o;
+}
+function collectEnv(){
+  const ev = { OMP_NUM_THREADS: $("f_omp").value.trim() || "4" };
+  /* 稀疏 prefill 只有 env 门（VLLM_SPARSE_PREFILL），CLI 侧是 --sparse-pf-k / --sparse-pf-group，
+   * 由 vllm_mgr.py 按本配置组装。 */
+  if ($("f_sparse_prefill").checked) ev.VLLM_SPARSE_PREFILL = "1";
+  /* MoE 优化：只写非默认值，保持 config.json 精简（缺省即引擎默认） */
+  /* 精度/速度轨（三选一）：ACTQ16 一律显式写 —— x86 上它默认开，不写 0 会让
+   * 「精确轨」退化成 s16 轨；非 x86 平台它是恒 0 桩，写了也无副作用。
+   * actq 轨还必须显式关 ACTQ16（引擎内 ACTQ16 优先），否则仍走 s16。 */
+  const track = $("f_moe_track").value;
+  if (track === "actq") { ev.VLLM_ACTQ16 = "0"; ev.VLLM_ACTQ = "1"; }
+  else if (track === "s16") { ev.VLLM_ACTQ16 = "1"; }
+  else { ev.VLLM_ACTQ16 = "0"; }
+  if (!$("f_moe_batch").checked) ev.VLLM_MOE_BATCH = "0";
+  if (!$("f_moe_par").checked) ev.VLLM_MOE_PAR = "0";
+  if (!$("f_moe_q4simd").checked) ev.VLLM_MOE_Q4SIMD = "0";
+  if ($("f_vqf_prewarm").checked) ev.VLLM_VQF_PREWARM = "1";
+  /* P3 门：让 --l3-evict 与 --prefix-kv 共存（缺它就等于关掉前缀复用） */
+  if ($("f_l3_prefix_reuse").checked) ev.VLLM_L3_PREFIX_REUSE = "1";
+  if ($("f_vqf_stream").checked) {
+    const kk = parseInt($("f_vqf_stream_keep").value, 10);
+    ev.VLLM_VQF_STREAM = String(Math.max(1, Math.min(32, kk || 1)));
+  }
+  const vk = $("f_vqf_key").value.trim();
+  if (vk) ev.VLLM_VQF_KEY = vk;
+  /* 可验证推理：开启才写 VLLM_ATTEST（缺省=关，故取消勾选时留空即生效） */
+  if ($("f_attest").checked) ev.VLLM_ATTEST = "1";
+  const ad = $("f_attest_dir").value.trim();
+  if (ad) ev.VLLM_ATTEST_DIR = ad;
+  return ev;
+}
+
+/* ---- quick combo presets (fill only optimization-related fields) ----
+ * 只填「运行时开关」：量化模式与布局开关（Q8 8x8 / 4x4 / lane 等）已从管理页移除，
+ * 转换期由 vqf_convert --wmode 固化，运行时不再暴露。 */
+const PRESETS = {
+  mem:  { prefill_q8: false, kv_q4: true },
+  /* 长上下文优化 (≥4K 建议)：稀疏注意力 top-k=32 + L3 冷块淘汰 + P3 前缀复用门。
+   * 板端 5.2K 实测 prefill 41 tok/s、decode TPOT 99.7ms（llama.cpp exact 需 300ms，
+   * 快 3 倍），KV 内存释放 ~1GB（3416 块淘汰到磁盘）。注意：不可与 KV Q4 同开（decode
+   * 会退化为 exact 全量扫描导致长上下文卡死/断连）；P3 门必须开，否则 --prefix-kv
+   * 被 L3 静默打掉、多轮追问全量重算（x86 复核 −96.9% 即来自这一项）。 */
+  long: { prefill_q8: true, kv_q4: false,
+          sparse_attn: true, sparse_k: 32, l3_evict: true, l3_ratio: 0.75, l3_min_seq: 128,
+          l3_prefix_reuse: true, prefix_kv: true,
+          desc: "长上下文 + 多轮优化：稀疏注意力 + L3 冷块淘汰 + P3 前缀复用门（这三项要一起开）。5.2K 下 decode 比 llama.cpp 快 3 倍，KV 省 ~1GB，追问轮 prefill 降 93~97%。勿再开 KV Q4。",
+          desc_en: "Long context + multi-turn optimization: sparse attention + L3 cold-block eviction + P3 prefix-reuse gate (these three go together). At 5.2K, decode is 3× faster than llama.cpp, KV saves ~1GB, and follow-up-turn prefill drops 93~97%. Do not also enable KV Q4." },
+};
+function applyFields(o){
+  /* 只写显式给出的键（undefined 一律不触碰），让预设与「组合套用」共用同一语义。 */
+  if (o.prefill_q8 != null)      $("f_prefill_q8").checked = !!o.prefill_q8;
+  if (o.kv_q4 != null)           $("f_kv_q4").checked = !!o.kv_q4;
+  if (o.batch_max != null)       $("f_batch_max").value = String(o.batch_max);
+  if (o.max_queued != null)      $("f_max_queued").value = String(o.max_queued);
+  if (o.prefix_kv != null)       $("f_prefix_kv").checked = !!o.prefix_kv;
+  if (o.sparse_attn != null)     $("f_sparse_attn").checked = !!o.sparse_attn;
+  if (o.sparse_k != null)        $("f_sparse_k").value = String(o.sparse_k);
+  if (o.sparse_prefill != null)  $("f_sparse_prefill").checked = !!o.sparse_prefill;
+  if (o.sparse_pf_k != null)     $("f_sparse_pf_k").value = String(o.sparse_pf_k);
+  if (o.sparse_pf_group != null) $("f_sparse_pf_group").value = String(o.sparse_pf_group);
+  if (o.l3_evict != null)        $("f_l3_evict").checked = !!o.l3_evict;
+  if (o.l3_ratio != null)        $("f_l3_ratio").value = String(o.l3_ratio);
+  if (o.l3_min_seq != null)      $("f_l3_min_seq").value = String(o.l3_min_seq);
+  if (o.l3_prefix_reuse != null) $("f_l3_prefix_reuse").checked = !!o.l3_prefix_reuse;
+  if (o.disk_kv != null)         $("f_disk_kv").checked = !!o.disk_kv;
+  if (o.spec != null)            $("f_spec").checked = !!o.spec;
+  if (o.spec_k != null)          $("f_spec_k").value = String(o.spec_k);
+  if (o.moe_batch != null)       $("f_moe_batch").checked = !!o.moe_batch;
+  if (o.moe_track != null)       $("f_moe_track").value = o.moe_track;
+  /* 兼容台账的简写：actq:true = 选中 ACTQ 轨，false = 回到精确轨 */
+  if (o.actq != null)            $("f_moe_track").value = o.actq ? "actq" : "exact";
+  if (o.vqf_stream != null)      $("f_vqf_stream").checked = !!o.vqf_stream;
+  updateP3Warn();
+  updateTrackWarn();
+}
+function applyPreset(){
+  const p = PRESETS[$("f_preset").value];
+  if (!p){ msg($("presetmsg"), T("请先选择预设", "Select a preset first"), false); return; }
+  applyFields(p);
+  badgeT($("cfgBadge"), "配置: 已载入预设", "Config: preset loaded", "ok");
+  msg($("presetmsg"), p.desc ? (LANG === "en" && p.desc_en ? p.desc_en : p.desc) : T("预设已填充，可微调后保存配置", "Preset filled; fine-tune and save the config"), true);
+}
+
+/* ---- 有效优化组合台账 ----
+ * 每行给出「适用场景 / 关键开关 / 实测收益 / 平台适用性」，点「套用」直接填表。
+ * 数据来源：资料/模型优化开关组合-稠密与MoE.md（板端 ARM 实测 + 2026-09-11 本地
+ * x86 逐开关复核 §7.2）。plat: ram=省内存场景有效 / x86=x86 复现 / x86no=x86 无效。 */
+const COMBO_ROWS = [
+  { name: "① 多轮长上下文服务", name_en: "① Multi-turn long-context serving",
+    scene: "对话 / 问答，多轮追问", scene_en: "Chat / Q&A, multi-turn follow-ups",
+    sw: "--sparse-attn --sparse-k 32 --l3-evict --l3-min-seq 128 + env VLLM_L3_PREFIX_REUSE=1 + --prefix-kv",
+    sw_en: "--sparse-attn --sparse-k 32 --l3-evict --l3-min-seq 128 + env VLLM_L3_PREFIX_REUSE=1 + --prefix-kv",
+    ev: "追问轮 prefill <b>−93% ~ −97%</b>（2B/8B/30B × 全层/逐层 四象限）",
+    ev_en: "Follow-up prefill <b>−93% ~ −97%</b> (2B/8B/30B × full-layer/per-layer, four quadrants)",
+    note: "本仓库收益最大的组合；缺 P3 门则 --prefix-kv 被静默打掉",
+    note_en: "Largest win in this repo; without the P3 gate, --prefix-kv is silently dropped",
+    plat: ["x86"],
+    set: { prefix_kv: true, sparse_attn: true, sparse_k: 32, l3_evict: true,
+           l3_ratio: 0.75, l3_min_seq: 128, l3_prefix_reuse: true, kv_q4: false } },
+
+  { name: "② 内存受限（逐层驻留）", name_en: "② Memory-constrained (per-layer residency)",
+    scene: "权重放不下整份 RAM", scene_en: "Weights do not fit in full RAM",
+    sw: "env VLLM_VQF_STREAM=1（逐层）+ 叠 ① 的 L3 + P3",
+    sw_en: "env VLLM_VQF_STREAM=1 (per-layer) + stack L3 + P3 from ①",
+    ev: "权重 RSS 省 <b>4.6× ~ 21.8×</b>（2B 0.40GB / 8B 0.47GB / 30B 0.50GB）",
+    ev_en: "Weight RSS reduced <b>4.6× ~ 21.8×</b> (2B 0.40GB / 8B 0.47GB / 30B 0.50GB)",
+    note: "代价 prefill +11~25% / decode +121~259%；仅明文 VQF",
+    note_en: "Cost: prefill +11~25% / decode +121~259%; plaintext VQF only",
+    plat: ["ram"],
+    set: { vqf_stream: true, prefix_kv: true, sparse_attn: true, sparse_k: 32,
+           l3_evict: true, l3_min_seq: 128, l3_prefix_reuse: true } },
+
+  { name: "③ 重启后复用会话", name_en: "③ Reuse session across restarts",
+    scene: "升级 / 重启引擎后接着聊", scene_en: "Keep chatting after engine upgrade / restart",
+    sw: "--disk-kv &lt;目录&gt; + --prefix-kv",
+    sw_en: "--disk-kv &lt;dir&gt; + --prefix-kv",
+    ev: "重启后第 2/3 轮 prefill <b>−97.3%</b>（38.3s → 1.05s）",
+    ev_en: "2nd/3rd turn prefill after restart <b>−97.3%</b> (38.3s → 1.05s)",
+    note: "KV 落盘，对 RAM 也友好",
+    note_en: "KV persisted to disk; also RAM-friendly",
+    plat: ["x86", "ram"],
+    set: { disk_kv: true, prefix_kv: true } },
+
+  { name: "④ KV 内存吃紧", name_en: "④ Tight KV memory",
+    scene: "长上下文 + RAM 紧", scene_en: "Long context + tight RAM",
+    sw: "--kv-q4 + --l3-evict --l3-min-seq 128 + P3 门",
+    sw_en: "--kv-q4 + --l3-evict --l3-min-seq 128 + P3 gate",
+    ev: "KV <b>1.65×</b> 压缩、decode +28%；L3 再释放 ~1GB（5.2K）",
+    ev_en: "KV <b>1.65×</b> compression, decode +28%; L3 frees another ~1GB (5.2K)",
+    note: "⚠ --kv-q4 与 --sparse-attn 互斥：L3 侧会自动开稀疏，二者不可同开",
+    note_en: "⚠ --kv-q4 and --sparse-attn are mutually exclusive: the L3 side auto-enables sparse, so they cannot both be on",
+    plat: ["ram"],
+    set: { kv_q4: true, prefix_kv: true, l3_evict: true, l3_min_seq: 128,
+           l3_prefix_reuse: true, sparse_attn: false } },
+
+  { name: "⑤ MoE 模型服务", name_en: "⑤ MoE model serving",
+    scene: "30B-A3B 等稀疏专家", scene_en: "Sparse-expert models like 30B-A3B",
+    sw: "env VLLM_ACTQ=1 VLLM_MOE_BATCH=1（+ 逐层 / P3）；模型须按 --wmode q4 转换",
+    sw_en: "env VLLM_ACTQ=1 VLLM_MOE_BATCH=1 (+ per-layer / P3); model must be converted with --wmode q4",
+    ev: "prefill <b>10.78×</b>（37.5s → 3.48s）/ decode <b>3.20×</b>（30B 逐层 t4）",
+    ev_en: "prefill <b>10.78×</b> (37.5s → 3.48s) / decode <b>3.20×</b> (30B per-layer t4)",
+    note: "ACTQ 是近似轨（与精确轨非位级一致，长文本约 23 token 后漂移）；批式 prefill 与轨道无关，精确轨下同样位级一致",
+    note_en: "ACTQ is an approximation track (not bit-identical to the exact track; drifts after about 23 tokens on long text); batched prefill is independent of the track and is bit-identical on the exact track too",
+    plat: [],
+    set: { actq: true, moe_batch: true } },
+
+  { name: "⑥ 并发多用户", name_en: "⑥ Multi-user concurrency",
+    scene: "多人同时用同一引擎", scene_en: "Several users sharing one engine",
+    sw: "--batch-max 8（上限 32）+ --max-queued 16",
+    sw_en: "--batch-max 8 (max 32) + --max-queued 16",
+    ev: "板端 ~1.7×；<b>x86 实测仅 +4.5%</b>（GEMM 算力瓶颈，批处理摊不掉算力）",
+    ev_en: "Board ~1.7×; <b>x86 measured only +4.5%</b> (GEMM compute-bound; batching cannot amortize compute)",
+    plat: ["x86no"],
+    set: { batch_max: 8, max_queued: 16 } },
+
+  { name: "⑦ 精确重复文本", name_en: "⑦ Exact repeated text",
+    scene: "模板 / 列表 / 代码复读", scene_en: "Templates / lists / repeated code",
+    sw: "--spec --spec-k 4（须与 sparse / l3 / batch 互斥）",
+    sw_en: "--spec --spec-k 4 (must be exclusive with sparse / l3 / batch)",
+    ev: "板端 1.30× 文本 / 1.64× 多模态；<b>x86 实测反慢 2.4×</b>",
+    ev_en: "Board 1.30× text / 1.64× multimodal; <b>x86 measured 2.4× slower</b>",
+    note: "⚠ 必须由客户端传 top_p=1.0，否则 spec 静默不生效；仅字面重复有效",
+    note_en: "⚠ The client must send top_p=1.0, otherwise spec is silently ignored; only literal repetition helps",
+    plat: ["x86no"],
+    set: { spec: true, spec_k: 4, prefix_kv: true } },
+
+  { name: "⑧ 最小回退 / 排障", name_en: "⑧ Minimal fallback / troubleshooting",
+    scene: "怀疑优化引入问题时复现基线", scene_en: "Reproduce the baseline when suspecting an optimization",
+    sw: "--no-prefix-kv，且不设任何 VLLM_* 优化 env",
+    sw_en: "--no-prefix-kv, and set no VLLM_* optimization env",
+    ev: "基线档，用于对照",
+    ev_en: "Baseline, for comparison",
+    plat: [],
+    set: { prefix_kv: false, sparse_attn: false, l3_evict: false, l3_prefix_reuse: false,
+           kv_q4: false, spec: false, disk_kv: false, vqf_stream: false } },
+];
+const PTAG_TEXT = { ram: ["ram", "省 RAM", "RAM saver"], x86: ["x86", "x86 已复现", "x86 reproduced"], x86no: ["x86no", "x86 无效", "x86 no gain"] };
+function renderCombos(){
+  const tb = $("comboBody");
+  if (!tb) return;
+  tb.innerHTML = COMBO_ROWS.map((r, i) => {
+    const tags = (r.plat || []).map(p =>
+      `<span class="ptag ${PTAG_TEXT[p][0]}" data-en="${PTAG_TEXT[p][2]}">${PTAG_TEXT[p][1]}</span>`).join("");
+    const enHtml = (r.ev_en || r.ev) + (r.note ? `<br><span class=&quot;why&quot;>${r.note_en || r.note}</span>` : "");
+    return `<tr>
+      <td class="name"><span data-en="${r.name_en || r.name}">${r.name}</span><span class="inuse" id="comboInUse${i}" style="display:none" data-en="In use">当前在用</span></td>
+      <td data-en="${r.scene_en || r.scene}">${r.scene}</td>
+      <td><code data-en="${r.sw_en || r.sw}">${r.sw}</code></td>
+      <td class="ev" data-en-html='${enHtml}'>${r.ev}${r.note ? `<br><span class="why">${r.note}</span>` : ""}</td>
+      <td>${tags}</td>
+      <td class="act"><button data-combo="${i}" data-en="Apply">套用</button></td>
+    </tr>`;
+  }).join("");
+  tb.querySelectorAll("button[data-combo]").forEach(b => {
+    b.onclick = () => comboApply(parseInt(b.dataset.combo, 10));
+  });
+  refreshComboInUse();
+  applyLang();
+}
+function comboApply(i){
+  const r = COMBO_ROWS[i];
+  if (!r) return;
+  applyFields(r.set || {});
+  badgeT($("cfgBadge"), "配置: 已载入组合", "Config: combo loaded", "ok");
+  msg($("combomsg"),
+      T(`已套用「${r.name}」。可微调后点「保存配置」，再重启引擎生效。`,
+        `Applied "${r.name_en || r.name}". Fine-tune, then click "Save config" and restart the engine to take effect.`), true);
+}
+/* ---- 「当前在用」标记 ----
+ * 判定口径：以「已保存 / 运行中的配置」（/admin/api/config）为准，而不是表单草稿
+ * ——表单里改了但没保存、没重启，不算在用。规则：组合 set 里的每个键都与该配置
+ * 一致即命中；set 为空（⑥ 的 --batch-max 页面上无对应控件）不参与判定；多行同时
+ * 命中是正常的（②/③/④ 都是在①的重叠子集上叠加）。 */
+let curCfg = null;
+/* 引擎所在设备的架构（/admin/api/status 的 device_arch）：s16 轨只有 x86 内核，
+ * 非 x86 平台上是恒 0 安全桩，换轨告警与配置回填都要按平台区分。 */
+let isX86 = false;
+function cfgNum(v, d){ return (v == null || v === "") ? d : Number(v); }
+function cfgValOf(c, k){
+  const ev = c.env || {};
+  switch (k){
+    case "prefix_kv":       return c.prefix_kv !== false;
+    case "kv_q4":           return !!c.kv_q4;
+    case "batch_max":       return cfgNum(c.batch_max, 0);
+    case "max_queued":      return cfgNum(c.max_queued, 16);
+    case "prefill_q8":      return !!c.prefill_q8;
+    case "sparse_attn":     return !!c.sparse_attn;
+    case "sparse_k":        return cfgNum(c.sparse_k, 32);
+    case "l3_evict":        return !!c.l3_evict;
+    case "l3_ratio":        return cfgNum(c.l3_ratio, 0.75);
+    case "l3_min_seq":      return cfgNum(c.l3_min_seq, 128);
+    case "l3_prefix_reuse": return ev.VLLM_L3_PREFIX_REUSE === "1";
+    case "vqf_stream":      return parseInt(ev.VLLM_VQF_STREAM || "0", 10) > 0;
+    case "disk_kv":         return !!c.disk_kv;
+    case "spec":            return !!c.spec;
+    case "spec_k":          return cfgNum(c.spec_k, 4);
+    case "actq":            return ev.VLLM_ACTQ === "1";
+    case "moe_batch":       return ev.VLLM_MOE_BATCH !== "0";
+    default:                return undefined;
+  }
+}
+function comboInUse(r){
+  if (!curCfg || !r.set) return false;
+  const keys = Object.keys(r.set);
+  if (!keys.length) return false;
+  return keys.every(k => cfgValOf(curCfg, k) === r.set[k]);
+}
+function refreshComboInUse(){
+  COMBO_ROWS.forEach((r, i) => {
+    const el = $("comboInUse" + i);
+    if (el) el.style.display = comboInUse(r) ? "inline-block" : "none";
+  });
+}
+/* 开 --l3-evict 却没开 P3 门 → 显式告警（这是最容易踩的坑） */
+function updateP3Warn(){
+  const el = $("p3warn");
+  if (!el) return;
+  el.style.display = ($("f_l3_evict").checked && !$("f_l3_prefix_reuse").checked)
+                     ? "block" : "none";
+}
+/* 精度/速度轨联动告警：选近似轨就明说「与精确轨不逐位一致」；s16 轨在非 x86 平台
+ * 是恒 0 桩（引擎侧无内核），必须点破「选了等于没选」，否则用户会以为提速了。 */
+function updateTrackWarn(){
+  const el = $("trackWarn");
+  if (!el) return;
+  const tr = $("f_moe_track").value;
+  if (tr === "s16"){
+    el.textContent = T(
+      !isX86 ? "s16 近似轨：误差约 1e-5，与精确轨不逐位一致。当前引擎非 x86，无 s16 内核（恒 0 安全桩）：此选择不会生效，等价于精确轨。"
+             : "s16 近似轨：误差约 1e-5，与精确轨不逐位一致（TOKIDS 锚点级一致）。",
+      !isX86 ? "s16 approximation track: about 1e-5 error, not bit-identical to the exact track. This engine is not x86 and has no s16 kernel (constant-0 stub): the selection has no effect and equals the exact track."
+             : "s16 approximation track: about 1e-5 error, not bit-identical to the exact track (anchor-level TOKIDS agreement).");
+  } else if (tr === "actq"){
+    el.textContent = T(
+      "ACTQ 近似轨：int8 激活量化误差约 0.4%，长文本贪婪解码约 23 token 后开始漂移；需模型按 --wmode q4 转换、专家几何成立。",
+      "ACTQ approximation track: about 0.4% int8 activation-quantization error; greedy decoding drifts after about 23 tokens on long text. Needs a --wmode q4 model and valid expert geometry.");
+  } else {
+    el.textContent = "";
+  }
+  el.style.display = el.textContent ? "block" : "none";
+}
+
+/* ---- device profile helpers ---- */
+function fillDeviceSelect(r){
+  const sel = $("f_device");
+  const cur = (r.device && r.device.id) || "";
+  sel.innerHTML = "";
+  for (const d of (r.devices || [])){
+    const opt = document.createElement("option");
+    opt.value = d.id;
+    opt.textContent = devName(d) + "  (" + d.arch + " / " + d.class + ")";
+    sel.appendChild(opt);
+  }
+  if (cur) sel.value = cur;
+  $("devTag").textContent = (r.device && r.device.name) ? "· " + devName(r.device) : "";
+}
+async function applyDevRecommend(){
+  const id = $("f_device").value;
+  if (!id){ msg($("cfgmsg"), T("请先选择设备", "Select a device first"), false); return; }
+  try {
+    const r = await eng("/admin/api/device?id=" + encodeURIComponent(id));
+    const rec = r.device_recommend;
+    if (!rec){ msg($("cfgmsg"), T("该设备没有推荐参数", "No recommended parameters for this device"), false); return; }
+    $("f_threads").value = rec.threads || 4;
+    $("f_omp").value = rec.omp || 4;
+    $("f_prefill_q8").checked = !!rec.prefill_q8;
+    if (rec.model_dir) $("f_model_dir").value = rec.model_dir;
+    if (rec.mem_limit_mb > 0) $("f_min_free_mb").value = rec.mem_limit_mb;
+    badgeT($("cfgBadge"), "设备推荐已应用", "Device recommendation applied", "ok");
+    msg($("cfgmsg"), T("已按设备 ", "Recommended parameters prefilled for ") + devName(r.device) + T(" 预填推荐参数，请核对后保存", "; review before saving"), true);
+  } catch (e) { msg($("cfgmsg"), T("获取设备推荐失败: ", "Failed to get device recommendation: ") + e, false); }
+}
+async function loadConfig(){
+  try {
+    const r = await eng("/admin/api/config");
+    if (r.config) {
+      fillForm(r.config);
+      curCfg = r.config;              /* 「当前在用」判定基准 = 已保存配置 */
+      refreshComboInUse();
+      badgeT($("cfgBadge"), "配置: 已载入", "Config: loaded", "ok");
+    }
+    fillDeviceSelect(r);
+  } catch (e) { msg($("cfgmsg"), T("读取配置失败: ", "Failed to read config: ") + e, false); }
+}
+async function saveConfig(){
+  const cfg = collectForm();
+  $("btn_savecfg").disabled = true;
+  try {
+    const r = await eng("/admin/api/config/save", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(cfg)
+    });
+    if (r.ok) { curCfg = cfg; refreshComboInUse(); }
+    msg($("cfgmsg"), r.ok ? T("已保存到 ", "Saved to ") + (r.path||"") + T("。", ".") + (r.note||"") : (T("保存失败: ", "Save failed: ") + (r.error||"")), !!r.ok);
+  } catch (e) { msg($("cfgmsg"), T("保存失败: ", "Save failed: ") + e, false); }
+  $("btn_savecfg").disabled = false;
+}
+
+/* ---------- ops ---------- */
+async function opLoadModel(){
+  const modelDir = $("f_model_dir").value.trim();
+  msg($("opmsg"), T("正在加载模型（VQF 单文件，量化由文件固化）…", "Loading model (single VQF file; quantization is baked in)…"), true);
+  try {
+    const r = await eng("/admin/api/model/load", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({model_dir: modelDir})
+    });
+    if (r.ok) { msg($("opmsg"), r.note || T("已开始加载", "Loading started"), true); loadStatus(); }
+    else msg($("opmsg"), T("加载失败: ", "Load failed: ") + (r.error||""), false);
+  } catch (e) { msg($("opmsg"), T("请求失败: ", "Request failed: ") + e, false); }
+}
+async function opUnload(){
+  if (!confirm(T("卸载当前模型？将释放权重与 KV 缓存内存（约数 GB），未保存的对话上下文会丢失。\n若已启用「用时加载」，下一次请求会自动重新加载。", "Unload the current model? This frees weights and KV-cache memory (several GB); unsaved conversation context is lost.\nIf load-on-use is enabled, the next request reloads it automatically."))) return;
+  msg($("opmsg"), T("正在卸载模型…", "Unloading model…"), true);
+  try {
+    const r = await eng("/admin/api/model/unload", {method: "POST"});
+    msg($("opmsg"), r.ok ? (r.note || T("已卸载", "Unloaded")) : (T("卸载失败: ", "Unload failed: ") + (r.error||"")), !!r.ok);
+    loadStatus();
+  } catch (e) { msg($("opmsg"), T("请求失败: ", "Request failed: ") + e, false); }
+}
+async function opStart(){
+  msg($("opmsg2"), T("正在通过 supervisor 启动引擎…", "Starting the engine via supervisor…"), true);
+  try {
+    const r = await mgr("/api/start", {method: "POST"});
+    msg($("opmsg2"), r.ok ? T("已提交启动。模型加载约需数分钟，请查看日志。", "Start submitted. Model loading takes a few minutes; check the log.") : T("启动失败: ", "Start failed: ") + (r.error||""), !!r.ok);
+  } catch (e) { msg($("opmsg2"), T("supervisor 不可达 (", "supervisor unreachable (") + mgrBase + T(")。请在板端运行: python3 tools/ops/vllm_mgr.py --serve", "). Run on the board: python3 tools/ops/vllm_mgr.py --serve"), false); }
+  setTimeout(loadStatus, 1500);
+}
+async function opRestart(){
+  if (!confirm(T("重启引擎？当前配置将被保存并应用。", "Restart the engine? The current config will be saved and applied."))) return;
+  await saveConfig();
+  msg($("opmsg2"), T("正在重启（保存配置 → 设置重启标志 → 关闭引擎 → supervisor 拉起）…", "Restarting (save config → set restart flag → shut down engine → supervisor starts it)…"), true);
+  try { await mgr("/api/restart", {method: "POST"}); }
+  catch (e) { msg($("opmsg2"), T("supervisor 不可达，无法自动重启: ", "supervisor unreachable; cannot auto-restart: ") + e, false); return; }
+  try { await eng("/admin/api/shutdown", {method: "POST"}); } catch (e) {}
+  setTimeout(loadStatus, 2000);
+}
+async function opStop(){
+  if (!confirm(T("关闭引擎？运行中的推理请求将被中断。", "Shut down the engine? In-flight inference requests will be interrupted."))) return;
+  msg($("opmsg2"), T("正在关闭引擎…", "Shutting down the engine…"), true);
+  try { await eng("/admin/api/shutdown", {method: "POST"}); } catch (e) {}
+  setTimeout(loadStatus, 1500);
+}
+async function opL3Clear(){
+  if (!confirm(T("清空所有用户的 L3 淘汰缓存文件？\n推理不受影响，当前用户的缓存会在下一次请求时重建。", "Clear all users' L3 eviction cache files?\nInference is unaffected; the current user's cache is rebuilt on the next request."))) return;
+  msg($("l3msg"), T("正在清空…", "Clearing…"), true);
+  try {
+    const r = await eng("/admin/api/l3/clear", {method: "POST"});
+    msg($("l3msg"), r.ok ? (T("已清空 ", "Cleared ") + (r.removed||0) + T(" 个用户缓存文件", " user cache files")) : (T("清空失败: ", "Clear failed: ") + (r.error||"")), !!r.ok);
+  } catch (e) { msg($("l3msg"), T("请求失败: ", "Request failed: ") + e, false); }
+}
+/* ---------- log ---------- */
+/* Engine log lines carry no uniform severity prefix (e.g. "[FAIL]", "[PASS]",
+ * "[SERVE] WARNING:", "[SRV] ..."), so the level is inferred per line from
+ * well-known markers. ERROR wins over WARN over DEBUG; anything else is INFO. */
+function classifyLevel(line){
+  const s = line || "";
+  if (/\[FAIL\]|HCK-FAIL|ERROR|error|failed|failure|FATAL|fatal|panic|out of memory|OOM|assert|abort/i.test(s)) return "error";
+  if (/WARN|WARNING|warning|warn/i.test(s)) return "warn";
+  if (/DEBUG|debug|\[DBG/i.test(s)) return "debug";
+  return "info";
+}
+function updateLogCounts(){
+  const c = {info:0, warn:0, error:0, debug:0};
+  for (const l of allLogLines) c[classifyLevel(l)]++;
+  $("cnt_all").textContent = allLogLines.length;
+  $("cnt_info").textContent = c.info;
+  $("cnt_warn").textContent = c.warn;
+  $("cnt_error").textContent = c.error;
+  $("cnt_debug").textContent = c.debug;
+}
+function renderLog(){
+  const box = $("log");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  const filtered = logLevel ? allLogLines.filter(l => classifyLevel(l) === logLevel) : allLogLines;
+  box.innerHTML = "";
+  for (const l of filtered){
+    const d = document.createElement("div");
+    d.className = "lv-" + classifyLevel(l);
+    d.textContent = l;
+    box.appendChild(d);
+  }
+  updateLogCounts();
+  $("logMeta").textContent = "(" + filtered.length + "/" + allLogLines.length + T(" 行 · ", " lines · ") + logBytes + " B)";
+  if (atBottom || logAuto) box.scrollTop = box.scrollHeight;
+}
+function setLogLevel(lv){
+  logLevel = lv;
+  document.querySelectorAll("#logFilters button").forEach(b =>
+    b.classList.toggle("on", b.dataset.lv === lv));
+  renderLog();
+}
+async function pollLog(){
+  if (logPaused) { setTimeout(pollLog, 2000); return; }
+  try {
+    const r = await eng("/admin/api/log?n=200");
+    const lines = r.lines || [];
+    if (lines.length){
+      allLogLines = lines;
+      logBytes = r.bytes || 0;
+      renderLog();
+    } else if (r.error) {
+      allLogLines = [];
+      logBytes = 0;
+      $("log").textContent = r.error;
+      updateLogCounts();
+      $("logMeta").textContent = "";
+    }
+  } catch (e) {}
+  setTimeout(pollLog, 2000);
+}
+
+/* 语言切换时同步「暂停/继续」按钮与初始状态文案 */
+function refreshPauseBtn(){ $("btn_logpause").textContent = logPaused ? T("继续", "Resume") : T("暂停", "Pause"); }
+function refreshInitTexts(){
+  badge($("engBadge"), T("引擎: 未知", "Engine: unknown"), "");
+  badge($("mgrBadge"), T("supervisor: 未知", "supervisor: unknown"), "");
+  badgeT($("cfgBadge"), "配置: -", "Config: -", "");
+  refreshPauseBtn();   /* 静态「暂停」按钮按当前语言初始化 */
+}
+
+/* ---------- 可验证推理（attest） ---------- */
+let lastAttest = null;   /* 最近一次 /v1/attest 结果，用于切换语言时重绘 */
+function renderAttestInfo(r){
+  lastAttest = r;
+  const on = !!r.attest, act = !!r.active;
+  const has = !!(r.pub && r.pub.length === 128);
+  if (!on)       badgeT($("attBadge"), "未启用", "Disabled", "warn");
+  else if (act)  badgeT($("attBadge"), "已启用", "Enabled", "ok");
+  else           badgeT($("attBadge"), "已启用（模型未加载）", "Enabled (no model loaded)", "warn");
+  $("attPub").textContent = has ? r.pub
+    : T("(未生成：引擎未启用出证或密钥不可用)", "(not generated: attestation off or key unavailable)");
+}
+async function refreshAttest(){
+  try {
+    renderAttestInfo(await eng("/v1/attest"));
+  } catch (e) {
+    lastAttest = null;
+    badgeT($("attBadge"), "未知", "Unknown", "");
+    $("attPub").textContent = "-";
+  }
+}
+function copyAttPub(){
+  const t = ($("attPub").textContent || "").trim();
+  if (t.length !== 128){ msg($("attmsg"), T("没有可复制的公钥", "No public key to copy"), false); return; }
+  const done = () => msg($("attmsg"), T("设备公钥已复制", "Device public key copied"), true);
+  const fb = () => {
+    const ta = document.createElement("textarea");
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); done(); }
+    catch (e) { msg($("attmsg"), T("复制失败，请手工选中", "Copy failed; select it manually"), false); }
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).then(done).catch(fb);
+  else fb();
+}
+
+/* ---------- init ---------- */
+$("btn_loadcfg").onclick = loadConfig;
+$("btn_savecfg").onclick = saveConfig;
+$("btn_preset").onclick = applyPreset;
+/* L3 卡片的联动告警 + 有效组合台账渲染 */
+$("f_l3_evict").onchange = updateP3Warn;
+$("f_l3_prefix_reuse").onchange = updateP3Warn;
+/* MoE 精度/速度轨联动告警（选近似轨时明示精度代价） */
+$("f_moe_track").onchange = updateTrackWarn;
+renderCombos();
+$("btn_applydev").onclick = applyDevRecommend;
+$("btn_start").onclick = opStart;
+$("btn_loadmodel").onclick = opLoadModel;
+$("btn_unload").onclick = opUnload;
+$("btn_restart").onclick = opRestart;
+$("btn_stop").onclick = opStop;
+$("btn_l3clear").onclick = opL3Clear;
+$("btn_res_cfg").onclick = opResCfg;
+$("btn_res_l4").onclick = () => opResSet(4);
+$("btn_res_l3").onclick = () => opResSet(3);
+$("btn_res_l2").onclick = () => opResSet(2);
+$("btn_res_l1").onclick = () => opResSet(1);
+$("btn_res_l0").onclick = () => opResSet(0);
+$("btn_attcopy").onclick = copyAttPub;
+$("btn_attcheck").onclick = refreshAttest;
+refreshAttest();
+$("btn_logpause").onclick = () => {
+  logPaused = !logPaused;
+  refreshPauseBtn();
+};
+document.querySelectorAll("#logFilters button").forEach(b => {
+  b.onclick = () => setLogLevel(b.dataset.lv);
+});
+$("langBtn").onclick = function(){
+  setLang(LANG === "en" ? "zh" : "en");
+  renderCombos(); loadStatus(); refreshPauseBtn();
+  refreshBadgeT($("cfgBadge"));   /* 配置徽标按当前语言重绘（不重读配置，避免覆盖未保存编辑） */
+  if (lastAttest) renderAttestInfo(lastAttest); else refreshBadgeT($("attBadge"));
+  /* 设备下拉的选项文案含中英两名，需要重拉设备列表；只刷下拉、
+   * 不调 fillForm 以免覆盖用户未保存的表单编辑。 */
+  eng("/admin/api/config").then(function(r){ if (r && r.devices) fillDeviceSelect(r); }).catch(function(){});
+};
+/* ============ 会话审查 / 规则包 / 审计 已拆分为独立页 /review ============
+ * 原「预置上下文 / 会话审查 / 管理面审计」三块卡片与脚本已迁出本页，
+ * 见 src/serve/review.html（引擎路由 /review）。本页只保留引擎/模型/配置/日志。 */
+
+$("mgrUrl").textContent = mgrBase;
+$("engUrl").textContent = location.protocol + "//" + location.hostname + ":" + (location.port || 80);
+refreshInitTexts();
+applyLang();
+
+// try to load config when engine is up
+(async () => {
+  const ok = await loadStatus();
+  if (ok){
+    await loadConfig();
+    pollLog();
+  }
+})();
+setInterval(loadStatus, 5000);
+setInterval(() => { $("clock").textContent = new Date().toLocaleString(); }, 1000);
+</script>
+<script>
+/* ---- 顶部分类选项卡切换（纯表现层；不触碰上方主脚本逻辑） ---- */
+(function(){
+  var KEY = "vllm_admtab";
+  var btns = document.querySelectorAll(".tabbtn");
+  var panes = document.querySelectorAll(".tabpane");
+  function show(name){
+    btns.forEach(function(b){ b.classList.toggle("on", b.dataset.tab === name); });
+    panes.forEach(function(p){ p.classList.toggle("show", p.dataset.pane === name); });
+    try { localStorage.setItem(KEY, name); } catch(e){}
+    window.scrollTo(0, 0);
+  }
+  btns.forEach(function(b){ b.onclick = function(){ show(b.dataset.tab); }; });
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch(e){}
+  var valid = Array.prototype.some.call(btns, function(b){ return b.dataset.tab === saved; });
+  show(valid ? saved : "overview");
+})();
+</script>
+</body>
+</html>

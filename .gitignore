@@ -1,0 +1,32 @@
+# ---- 构建产物 ----
+build-riscv/
+build-x64/
+*.exe
+*.dll
+*.o
+*.a
+*.so
+
+# ---- 工具二进制（无扩展名） ----
+/vqf_convert/vqf_conv
+/tools/yolo/bench_dotprod
+/tools/yolo/bench_winograd
+/tools/yolo/test_rdtime
+/tools/yolo/test_vexp
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 模型权重产物（体积大，不随源码分发） ----
+*.vqf
+*.safetensors
+*.pt
+*.onnx
+*.gguf
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

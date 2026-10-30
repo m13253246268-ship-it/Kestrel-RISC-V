@@ -1,0 +1,2052 @@
+/* ================================================================
+ * vqf.c - VQF (vLLM Quantized Format) writer + mmap loader.
+ *
+ * 转换（vqf_write）在引擎加载完成后调用：权重已在内存中完成量化+repack
+ * （Q8 8x8 tiled / Q4 4x4 / Q4 8x8l），VQF 直接固化该最终布局字节。
+ * 加载（vqf_load）= mmap 整文件 + 元数据校验 + 指针直挂权重结构体，
+ * 零转换零计算，加载耗时从 ~23s 降到 ~2s（映射 + 校验）。
+ *
+ * 位级一致性（fixedpoint_quantize_saturate red line）：转换与推理共用
+ * 引擎同一套 f32_to_q8_0/f32_to_q4_0/repack_* 代码路径，因此 VQF 权重
+ * 与内存加载结果逐位一致；加载时校验布局 flags 与当前引擎配置一致。
+ * ================================================================ */
+#include "vqf.h"
+#include "vllm_platform.h"
+#include "vllm_util.h"     /* st_fopen：Windows 下的 UTF-8 路径打开 */
+#include "vllm_vision.h"   /* STVisionWeights: VQF vision 张量收集/挂载 */
+#include "vllm_crypto.h"   /* VQF-Enc: SM4-CTR + HMAC-SM3；SM2 签名 */
+#include "vllm_sign_keys.h" /* SM2 验签信任公钥（编译期内嵌） */
+
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>   /* GetProcessMemoryInfo（WorkingSet=RSS 采样） */
+#include <io.h>       /* _get_osfhandle/_fileno（EP 分片稀疏标记） */
+#include <winioctl.h> /* FSCTL_SET_SPARSE（EP 分片稀疏标记） */
+#ifndef MADV_DONTNEED
+#define MADV_DONTNEED 0
+#endif
+#ifndef MADV_WILLNEED
+#define MADV_WILLNEED 1
+#endif
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define Q8_BYTES(n) ((size_t)((n) + 31) / 32 * 34)
+#define Q4_BYTES(n) ((size_t)((n) + 31) / 32 * 18)
+
+/* 分层驻留：vqf_load 成功路径传入当前 VQF 的 fd（setup/advise 共用） */
+static int g_vqf_stream_fd = -1;
+
+/* 已加载 VQF 的文件内固化布局（只读展示，/admin 用）：量化在转换期已固化，
+ * 加载侧不可更改，故此处只回填文件头的 flags/version 供读取。 */
+static uint32_t g_vqf_loaded_flags = 0;
+static uint32_t g_vqf_loaded_version = 0;
+
+int vqf_layout_state(uint32_t *flags, uint32_t *version) {
+    if (!g_vqf_loaded_flags) return 0;
+    if (flags)   *flags   = g_vqf_loaded_flags;
+    if (version) *version = g_vqf_loaded_version;
+    return 1;
+}
+
+/* 引擎全局布局开关（vllm_safetensors.c）：几何门控失败会被清零，转换时
+ * 以实际状态为准。 */
+extern int g_st_q8_repack;
+extern int g_st_q4_repack;
+
+
+static uint64_t vqf_fnv_update(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+/* ---------------- VQF-Enc（SM4-CTR + HMAC-SM3） ----------------
+ * 存储态加密：数据区（data_offset..file_len）用 SM4-CTR 逐字节加密（密文
+ * 长度==明文长度，mmap 布局不变），尾部以 HMAC-SM3 tag 取代 FNV 做完整性/
+ * 认证（防篡改）。密钥来自环境变量 VLLM_VQF_KEY 口令，经 SM3 派生 32 字节：
+ *   [0..16) SM4 密钥，[16..32) HMAC-SM3 密钥。
+ * 认证范围（彻底防篡改）：头部（VQFHeader 全体，file_len 视为 0，含 arch/
+ * flags/enc_iv/data_offset/n_tensors）+ 目录（明文）+ 数据区（密文）。
+ * file_len 因回填晚于数据写出而不纳入，由加载侧 size mismatch 校验兜底。
+ * 口令为空 → 明文 VQF（向后兼容，零成本）。 */
+
+/* 由口令派生 SM4/HMAC 密钥；返回 1=加密，0=明文（无口令）。 */
+static int vqf_enc_derive(const char *pass, uint8_t sm4key[16], uint8_t hmackey[16]) {
+    if (!pass || !pass[0]) return 0;
+    uint8_t mat[32];
+    vc_sm3(pass, strlen(pass), mat);
+    memcpy(sm4key, mat, 16);
+    memcpy(hmackey, mat + 16, 16);
+    return 1;
+}
+
+
+/* 取验签信任公钥：优先运行时 VLLM_VQF_SIGN_PUB（128 hex），其次编译期内嵌
+ * VLLM_SM2_PUB_HEX。返回 0 成功；-1 无信任公钥（fail-closed）。 */
+static int vqf_trusted_pub(uint8_t pub[64]) {
+    const char *e = getenv("VLLM_VQF_SIGN_PUB");
+    if (e && e[0] && vc_hex_decode(e, pub, 64) == 64) return 0;
+#ifdef VLLM_SM2_PUB_HEX
+    if (vc_hex_decode(VLLM_SM2_PUB_HEX, pub, 64) == 64) return 0;
+#endif
+    return -1;
+}
+
+
+/* ---------------- 加载 ---------------- */
+int vqf_is_file(const char *path) {
+    FILE *f = st_fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t m = 0;
+    int ok = (fread(&m, 1, 4, f) == 4);
+    fclose(f);
+    return ok && m == VQF_MAGIC;
+}
+
+/* 当前引擎布局 flags（加载时由环境 + wmode 决定） */
+static uint32_t vqf_cur_flags(const STModelWeights *w) {
+    uint32_t f = 0;
+    if (g_st_q8_repack) {
+        const char *e = getenv("VLLM_Q8_8X8");
+        if (!(e && e[0] == '0')) f |= VQF_FLAG_Q8_8X8;
+    }
+    if (g_st_q4_repack) f |= VQF_FLAG_Q4_4X4;
+    if (w->q8_buf_q4)   f |= VQF_FLAG_Q8BUF_Q4;
+    if (st_wmode_effective() == 4) f |= VQF_FLAG_G256;
+    return f;
+}
+
+static void *vqf_mount(const void *base, uint64_t off) {
+    return (uint8_t *)base + (size_t)off;
+}
+
+/* ---------------- 旧版 41 字段 VQFArch 头兼容 ----------------
+ * 成因：MoE 支持在 VQFArch 尾部追加 n_experts/moe_ffn/top_k/shared_experts
+ * 四字段（arch 164B→180B、header 432B→448B），但稠密文件的 version 仍写 2，
+ * 故同一 version=2 存在「旧 41 字段头」与「新 45 字段头」。两者 arch 前 41 字段
+ * 偏移一致、目录偏移（sizeof 对齐到 64B）=448 也一致，仅 arch 之后的
+ * data_offset/file_len/enc_iv/sig 整体错位 16B（旧头 184/192，新头 200/208）。
+ *
+ * 判据：分别按新、旧偏移取候选 (data_offset,file_len)，候选有效须同时满足
+ *   1) data_offset 非 0、64B(VQF_ALIGN) 对齐、>= 目录末尾 dir_end、< 文件大小；
+ *   2) file_len = 文件大小 - tag_len（tag：明文 FNV 8B / VQF_FLAG_ENC HMAC 32B），
+ *      与真实文件长度严格自洽；
+ *   3) file_len > data_offset（数据区非空）。
+ * 恰好一种布局满足 → 采用；两种都满足（歧义）或都不满足 → 拒绝并报错，
+ * 绝不静默按错误偏移继续。 */
+
+/* 候选 (data_offset,file_len) 自洽性校验 */
+static int vqf_cand_valid(uint64_t d_off, uint64_t f_len, size_t file_size,
+                          size_t tag_len, uint64_t dir_end) {
+    if (d_off == 0 || f_len == 0) return 0;
+    if ((d_off & (uint64_t)(VQF_ALIGN - 1)) != 0) return 0;   /* 64B 对齐 */
+    if (d_off < dir_end) return 0;                            /* 不覆盖头+目录 */
+    if (d_off >= (uint64_t)file_size) return 0;
+    if (f_len + (uint64_t)tag_len != (uint64_t)file_size) return 0;  /* 尾部 tag 自洽 */
+    if (f_len <= d_off) return 0;                             /* 数据区非空 */
+    return 1;
+}
+
+/* 判定头布局并归一化到新 45 字段布局；返回 0 成功（*out 可直接当 VQFHeader 用），
+ * -1 失败（几何非法 / 布局无法判定）。 */
+static int vqf_header_normalize(const uint8_t *raw, size_t file_size,
+                                VQFHeader *out) {
+    const VQFHeader *h = (const VQFHeader *)raw;
+    size_t tag_len = (h->flags & VQF_FLAG_ENC) ? 32 : 8;
+    uint64_t dir_end = (uint64_t)((sizeof(VQFHeader) + 63) & ~(size_t)63) +
+                       (uint64_t)h->n_tensors * sizeof(VQFTensor);
+
+    /* arch 前 41 字段在新旧头偏移一致：先做语义门，剔除明显非法头 */
+    const VQFArch *a = &h->arch;
+    if (!(a->dim > 0 && a->n_layers > 0 && a->n_heads > 0 && a->head_dim > 0 &&
+          a->ffn_dim > 0 && a->vocab_size > 0)) {
+        fprintf(stderr, "[VQF] arch geometry invalid (dim=%u layers=%u heads=%u "
+                        "head_dim=%u ffn=%u vocab=%u)\n",
+                a->dim, a->n_layers, a->n_heads, a->head_dim, a->ffn_dim,
+                a->vocab_size);
+        return -1;
+    }
+
+    uint64_t d_new, f_new, d_old, f_old;
+    memcpy(&d_new, raw + offsetof(VQFHeader, data_offset), 8);
+    memcpy(&f_new, raw + offsetof(VQFHeader, file_len), 8);
+    memcpy(&d_old, raw + offsetof(VQFHeaderLegacy, data_offset), 8);
+    memcpy(&f_old, raw + offsetof(VQFHeaderLegacy, file_len), 8);
+    int ok_new = vqf_cand_valid(d_new, f_new, file_size, tag_len, dir_end);
+    int ok_old = vqf_cand_valid(d_old, f_old, file_size, tag_len, dir_end);
+
+    *out = *h;   /* 整体拷贝：magic/version/flags/n_tensors/arch 前 41 字段均正确 */
+    if (ok_new && !ok_old) return 0;                    /* 新 45 字段头：无需调整 */
+
+    if (ok_old && !ok_new) {                            /* 旧 41 字段头 */
+        if (h->flags & (VQF_FLAG_ENC | VQF_FLAG_SIGNED)) {
+            fprintf(stderr, "[VQF] legacy 41-field header with ENC/SIGNED flag "
+                            "unsupported (authentication accounting undefined)\n");
+            return -1;
+        }
+        /* arch 尾部 4 个 MoE 字段在旧头中不存在（该偏移实为 data_offset/
+         * file_len），清零；尾部字段按旧偏移（整体前移 16B）读入。 */
+        out->arch.n_experts = 0;
+        out->arch.moe_ffn = 0;
+        out->arch.top_k = 0;
+        out->arch.shared_experts = 0;
+        memcpy(&out->data_offset, raw + offsetof(VQFHeaderLegacy, data_offset), 8);
+        memcpy(&out->file_len,    raw + offsetof(VQFHeaderLegacy, file_len), 8);
+        memcpy(out->enc_iv,       raw + offsetof(VQFHeaderLegacy, enc_iv), 16);
+        memcpy(out->enc_rsvd,     raw + offsetof(VQFHeaderLegacy, enc_rsvd), 16);
+        memcpy(&out->sig,         raw + offsetof(VQFHeaderLegacy, sig), sizeof(VQFSig));
+        fprintf(stderr, "[VQF] legacy 41-field VQFArch header detected "
+                        "(data_offset@%zu file_len@%zu), normalized\n",
+                offsetof(VQFHeaderLegacy, data_offset),
+                offsetof(VQFHeaderLegacy, file_len));
+        return 0;
+    }
+
+    fprintf(stderr, "[VQF] header layout undetermined "
+                    "(new: data_offset=%llu file_len=%llu valid=%d; "
+                    "legacy: data_offset=%llu file_len=%llu valid=%d; file=%zu)\n",
+            (unsigned long long)d_new, (unsigned long long)f_new, ok_new,
+            (unsigned long long)d_old, (unsigned long long)f_old, ok_old,
+            file_size);
+    return -1;
+}
+
+int vqf_load(STModelWeights *w, const char *path) {
+    st_mmap_t m;
+    g_vqf_loaded_flags = 0;      /* 布局展示：加载失败/未加载时归零 */
+    g_vqf_loaded_version = 0;
+    m.fi = -1; m.data = NULL; m.len = 0; m.fd = -1;
+    if (st_mmap_open(&m, 0, path) != 0) {
+        fprintf(stderr, "[VQF] mmap failed: %s\n", path);
+        return -1;
+    }
+    if (m.len < sizeof(VQFHeader) + sizeof(VQFTensor)) {
+        fprintf(stderr, "[VQF] file too small\n");
+        st_mmap_close(&m); return -1;
+    }
+    const VQFHeader *raw = (const VQFHeader *)m.data;
+    if (raw->magic != VQF_MAGIC) { st_mmap_close(&m); return -1; }
+    if (raw->version != VQF_VERSION && raw->version != VQF_VERSION_MOE &&
+        raw->version != VQF_VERSION_LANE) {
+        if (raw->version == VQF_VERSION_DET) {
+            fprintf(stderr, "[VQF] v%u is a DETECTION model (YOLO) - "
+                            "load it via the YOLO path, not the LLM loader\n",
+                    raw->version);
+        } else {
+            fprintf(stderr, "[VQF] version %u unsupported (need %u/%u/%u)\n",
+                    raw->version, VQF_VERSION, VQF_VERSION_MOE, VQF_VERSION_LANE);
+        }
+        st_mmap_close(&m); return -1;
+    }
+    /* v5 lane-major：版本号与 Q4_LANE flag 必须一致（防头/目录漂移静默错）。 */
+    if ((raw->version == VQF_VERSION_LANE) != ((raw->flags & VQF_FLAG_Q4_LANE) != 0)) {
+        fprintf(stderr, "[VQF] version %u vs Q4_LANE flag mismatch\n", raw->version);
+        st_mmap_close(&m); return -1;
+    }
+    /* 兼容旧版 41 字段 VQFArch 头：判定布局并归一化为新头（新头原样拷贝） */
+    VQFHeader hdr;
+    if (vqf_header_normalize((const uint8_t *)m.data, m.len, &hdr) != 0) {
+        st_mmap_close(&m); return -1;
+    }
+    const VQFHeader *h = &hdr;
+    int enc = (h->flags & VQF_FLAG_ENC) ? 1 : 0;
+    size_t tag_len = enc ? 32 : 8;
+    if (h->file_len != 0 && (uint64_t)m.len != h->file_len + tag_len) {
+        fprintf(stderr, "[VQF] size mismatch: file=%zu header=%llu\n",
+                m.len, (unsigned long long)h->file_len);
+        st_mmap_close(&m); return -1;
+    }
+    size_t d_off = (sizeof(VQFHeader) + 63) & ~(size_t)63;
+    int signed_ = (h->flags & VQF_FLAG_SIGNED) ? 1 : 0;
+    /* 验签决策：签名模型默认走加密（验签随解密单遍完成，默认开）；明文模型
+     * 验签需全量读数据区（抵消 mmap 收益），仅 VLLM_VQF_VERIFY=1 显式开启。 */
+    const char *vq = getenv("VLLM_VQF_VERIFY");
+    int do_verify = signed_ && (enc || (vq && vq[0] == '1'));
+    vc_sm3_ctx vdig;
+    uint8_t vdig_out[32];
+    if (do_verify) {
+        vc_sm3_init(&vdig);
+        VQFHeader hsig = *h;
+        hsig.file_len = 0;
+        memset(&hsig.sig, 0, sizeof(hsig.sig));
+        vc_sm3_update(&vdig, &hsig, sizeof(hsig));
+        vc_sm3_update(&vdig, (const uint8_t *)m.data + d_off,
+                      (size_t)h->n_tensors * sizeof(VQFTensor));
+    }
+    /* VQF-Enc：SM4-CTR 加密文件。验证 HMAC-SM3 tag（覆盖 头部+目录+数据区），
+     * 通过后原位解密（mprotect 加写，MAP_PRIVATE COW，磁盘文件不变）。
+     * 无口令/口令错 → 拒绝加载。 */
+    if (enc) {
+        const char *pass = getenv("VLLM_VQF_KEY");
+        uint8_t sm4key[16], hmackey[16];
+        if (!vqf_enc_derive(pass, sm4key, hmackey)) {
+            fprintf(stderr, "[VQF] encrypted model requires VLLM_VQF_KEY\n");
+            st_mmap_close(&m); return -1;
+        }
+        vc_hmac_ctx hc;
+        vc_hmac_init(&hc, hmackey, 16);
+        /* 头部认证：file_len 与 sig 块均回填后 ≠ 写入侧（写入侧 HMAC 时
+         * file_len=0 且 sig 全 0），故复制并按 0 喂入；file_len 本身由上方
+         * size mismatch 校验兜底，sig 由 SM2 验签单独覆盖。 */
+        VQFHeader hdr_auth = *h;
+        hdr_auth.file_len = 0;
+        memset(&hdr_auth.sig, 0, sizeof(hdr_auth.sig));
+        vc_hmac_update(&hc, &hdr_auth, sizeof(hdr_auth));
+        vc_hmac_update(&hc, (const uint8_t *)m.data + d_off,
+                       (size_t)h->n_tensors * sizeof(VQFTensor));
+        /* 单遍：HMAC（密文）+ 原位解密。先使整映射可写（POSIX: mprotect；
+         * Windows FILE_MAP_COPY 视图本就 COW 可写，no-op 成功）。 */
+        if (st_mmap_write_enable(&m) != 0) {
+            fprintf(stderr, "[VQF] mprotect failed\n");
+            st_mmap_close(&m); return -1;
+        }
+        vc_sm4_ctx sm4ctx;
+        uint8_t ctr[16];
+        memcpy(ctr, h->enc_iv, 16);
+        vc_sm4_setkey_enc(&sm4ctx, sm4key);
+        uint8_t *dp = (uint8_t *)m.data + h->data_offset;
+        size_t dlen = (size_t)(h->file_len - h->data_offset);
+        size_t done = 0;
+        while (done < dlen) {
+            size_t k = dlen - done;
+            if (k > (1u << 20)) k = 1u << 20;
+            vc_hmac_update(&hc, dp + done, k);                     /* 密文 */
+            vc_sm4_ctr_crypt(&sm4ctx, ctr, dp + done, dp + done, k); /* 原位解密 */
+            if (do_verify) vc_sm3_update(&vdig, dp + done, k);      /* 明文摘要 */
+            done += k;
+        }
+        uint8_t tag[32];
+        vc_hmac_final(&hc, tag);
+        const uint8_t *stored = (const uint8_t *)m.data + m.len - 32;
+        if (memcmp(tag, stored, 32) != 0) {
+            fprintf(stderr, "[VQF] HMAC-SM3 mismatch (tampered or wrong key)\n");
+            st_mmap_close(&m); return -1;
+        }
+        fprintf(stderr, "[VQF] decrypted %s (SM4-CTR, HMAC-SM3 ok)\n", path);
+    }
+    /* 尾部 FNV-1a checksum（仅明文文件；enc 文件由 HMAC-SM3 覆盖）。
+     * （覆盖 目录 + 数据区，与 vqf_write 边写边算一致）。
+     * 默认跳过整文件校验：转换时已 self-check 通过，位级一致由构造保证；
+     * mmap 页由内核按需加载，整文件校验会把 4GB 从 eMMC 全量读一遍
+     * （~20s），直接抵消 mmap 的加载收益。设 VLLM_VQF_CHECK=1 才校验
+     * （完整性诊断用）。 */
+    const char *chk = getenv("VLLM_VQF_CHECK");
+    if (!enc && chk && chk[0] == '1') {
+        uint64_t want_sum = 0;
+        if (m.len >= 8) memcpy(&want_sum, (const uint8_t *)m.data + m.len - 8, 8);
+        if (want_sum != 0) {
+            uint64_t calc = 0xcbf29ce484222325ull;
+            calc = vqf_fnv_update(calc, (const uint8_t *)m.data + d_off,
+                                  (size_t)h->n_tensors * sizeof(VQFTensor));
+            calc = vqf_fnv_update(calc, (const uint8_t *)m.data + h->data_offset,
+                                  (size_t)(h->file_len - h->data_offset));
+            if (calc != want_sum) {
+                fprintf(stderr, "[VQF] checksum mismatch\n");
+                st_mmap_close(&m); return -1;
+            }
+        }
+    }
+    /* SM2 验签：签名模型按 do_verify 判定（加密默认开，明文 VLLM_VQF_VERIFY=1）。
+     * 加密模型已在解密循环单遍喂入明文摘要；明文模型在此全量读数据区。 */
+    if (do_verify && !enc) {
+        const uint8_t *vdp = (const uint8_t *)m.data + h->data_offset;
+        size_t vlen = (size_t)(h->file_len - h->data_offset);
+        size_t vdone = 0;
+        while (vdone < vlen) {
+            size_t k = vlen - vdone;
+            if (k > (1u << 20)) k = 1u << 20;
+            vc_sm3_update(&vdig, vdp + vdone, k);
+            vdone += k;
+        }
+    }
+    if (do_verify) {
+        vc_sm3_final(&vdig, vdig_out);
+        /* 快速自检：摘要与头内 digest 不等 → 直接拒绝（省一次 ECC 标量乘） */
+        if (memcmp(vdig_out, h->sig.digest, 32) != 0) {
+            fprintf(stderr, "[VQF] SM2 digest mismatch (tampered)\n");
+            st_mmap_close(&m); return -1;
+        }
+        uint8_t vpub[64];
+        if (vqf_trusted_pub(vpub) != 0) {
+            fprintf(stderr, "[VQF] signed model requires trusted public key "
+                            "(VLLM_VQF_SIGN_PUB or embedded VLLM_SM2_PUB_HEX)\n");
+            st_mmap_close(&m); return -1;
+        }
+        /* 验签必须用可信公钥（非文件内 sig.pub），ID 以内嵌固定 ID 为准 */
+        if (!vc_sm2_verify(vpub, vdig_out, 32, (const uint8_t *)VQF_SM2_ID,
+                           strlen(VQF_SM2_ID), h->sig.r, h->sig.s)) {
+            fprintf(stderr, "[VQF] SM2 verify failed (model replaced/tampered)\n");
+            st_mmap_close(&m); return -1;
+        }
+        /* 交叉校验：文件内 sig.pub 与可信公钥不一致 → 拒绝（默认） */
+        if (memcmp(h->sig.pub, vpub, 64) != 0) {
+            fprintf(stderr, "[VQF] SM2 pub mismatch (sig.pub != trusted key)\n");
+            st_mmap_close(&m); return -1;
+        }
+        fprintf(stderr, "[VQF] SM2 verify ok\n");
+    }
+    /* 布局 flags 一致性：文件固化布局必须与当前引擎配置一致 */
+    uint32_t cur = vqf_cur_flags(w);
+    uint32_t want = h->flags & (VQF_FLAG_Q8_8X8 | VQF_FLAG_Q4_4X4 |
+                                VQF_FLAG_X8 | VQF_FLAG_Q8BUF_Q4 | VQF_FLAG_G256);
+    uint32_t curm = cur & (VQF_FLAG_Q8_8X8 | VQF_FLAG_Q4_4X4 |
+                           VQF_FLAG_X8 | VQF_FLAG_Q8BUF_Q4 | VQF_FLAG_G256);
+    /* 非默认档直挂适配（serve/--stream-test 的 VQF 直挂路径不经过 alloc，
+     * w 为 calloc 全零，q8_buf_q4/repack 状态缺失导致 flags 校验误判）：
+     *   - 文件声明 Q8BUF_Q4（q4i 档，q8_* 缓冲存 pre-unpacked Q4 int8）时，
+     *     引擎必须关闭 Q8 8x8 repack（q4i 无 8x8 tile），并把该语义同步到 w；
+     *   - 若 w 已由 alloc 预置（is_allocated），保持其状态不变。 */
+    if (!w->is_allocated && (h->flags & VQF_FLAG_Q8BUF_Q4)) {
+        w->q8_buf_q4 = 1;
+        g_st_q8_repack = 0;   /* 与 st_weights_alloc wmode==3 分支一致 */
+        cur = vqf_cur_flags(w);
+        curm = cur & (VQF_FLAG_Q8_8X8 | VQF_FLAG_Q4_4X4 |
+                      VQF_FLAG_X8 | VQF_FLAG_Q8BUF_Q4 | VQF_FLAG_G256);
+    }
+    if (want != curm) {
+        fprintf(stderr, "[VQF] layout mismatch: file=0x%x engine=0x%x "
+                        "(check VLLM_Q8_8X8 / wmode match the conversion)\n",
+                want, curm);
+        st_mmap_close(&m); return -1;
+    }
+
+    memset(w, 0, sizeof(*w));
+    const VQFArch *a = &h->arch;
+    STModelConfig *c = &w->cfg;
+    c->dim = (int)a->dim; c->n_layers = (int)a->n_layers;
+    c->n_heads = (int)a->n_heads; c->n_kv_heads = (int)a->n_kv_heads;
+    c->head_dim = (int)a->head_dim; c->ffn_dim = (int)a->ffn_dim;
+    c->vocab_size = (int)a->vocab_size; c->max_seq_len = (int)a->max_seq_len;
+    c->rope_theta = a->rope_theta; c->norm_eps = a->norm_eps;
+    c->bos_id = (int)a->bos_id; c->eos_id = (int)a->eos_id;
+    c->has_q_norm = a->has_q_norm; c->has_mrope = a->has_mrope;
+    c->head_dim_full = (int)a->head_dim_full; c->kv_lora_rank = (int)a->kv_lora_rank;
+    c->has_vision = (int)a->has_vision; c->vis_depth = (int)a->vis_depth;
+    c->vis_hidden = (int)a->vis_hidden; c->vis_heads = (int)a->vis_heads;
+    c->vis_ffn = (int)a->vis_ffn; c->vis_patch = (int)a->vis_patch;
+    c->vis_temporal = (int)a->vis_temporal; c->vis_merge = (int)a->vis_merge;
+    c->vis_out_dim = (int)a->vis_out_dim; c->vis_in_chan = (int)a->vis_in_chan;
+    c->vis_max_pos = (int)a->vis_max_pos; c->vis_ds_count = (int)a->vis_ds_count;
+    c->mrope_n_sec = (int)a->mrope_n_sec;
+    for (int i = 0; i < 4; i++) {
+        c->vis_ds_idx[i] = (int)a->vis_ds_idx[i];
+        c->mrope_sections[i] = (int)a->mrope_sections[i];
+    }
+    c->vision_start_id = (int)a->vision_start_id;
+    c->vision_end_id = (int)a->vision_end_id;
+    c->image_token_id = (int)a->image_token_id;
+    c->video_token_id = (int)a->video_token_id;
+    /* MoE arch tail（v3；dense v2 文件该区恒 0 → is_moe 判定取 flags/version） */
+    c->is_moe = (h->flags & VQF_FLAG_MOE) || h->version == VQF_VERSION_MOE;
+    c->n_experts = (int)a->n_experts;
+    c->moe_ffn = (int)a->moe_ffn;
+    c->top_k = (int)a->top_k;
+    c->shared_experts = (int)a->shared_experts;
+
+    int nl = c->n_layers;
+    int q_out = c->n_heads * c->head_dim;
+    int k_out = c->n_kv_heads * c->head_dim;
+    int ff = c->ffn_dim, vc = c->vocab_size, dim = c->dim;
+
+    size_t dir_off = (sizeof(VQFHeader) + 63) & ~(size_t)63;
+    uint64_t data_end = h->file_len;   /* file_len = 数据区绝对结束位置（含 data_offset） */
+    for (uint32_t i = 0; i < h->n_tensors; i++) {
+        const VQFTensor *e = (const VQFTensor *)((const uint8_t *)m.data + dir_off +
+                                                (size_t)i * sizeof(VQFTensor));
+        if ((uint64_t)e->offset + e->bytes > data_end) {
+            fprintf(stderr, "[VQF] tensor %s out of range\n", e->name);
+            st_mmap_close(&m); return -1;
+        }
+        void *p = vqf_mount(m.data, e->offset);
+        const char *name = e->name;
+        if (strcmp(name, "token_embed") == 0)      w->token_embed = (float *)p;
+        else if (strcmp(name, "final_norm") == 0)  w->final_norm  = (float *)p;
+        else if (strcmp(name, "moe_router") == 0)  w->moe_router  = (float *)p;
+        else if (strcmp(name, "attn_norm") == 0)   w->attn_norm   = (float *)p;
+        else if (strcmp(name, "ffn_norm") == 0)    w->ffn_norm    = (float *)p;
+        else if (strcmp(name, "q_norm") == 0)      w->q_norm      = (float *)p;
+        else if (strcmp(name, "k_norm") == 0)      w->k_norm      = (float *)p;
+        /* Qwen2 系 q/k/v 投影 bias（Qwen3 文件里没有这三个张量 → 保持 NULL）。
+         * 必须排在下面的 "v_" vision 前缀分支之前，否则会被当成 vision 张量吞掉。 */
+        else if (strcmp(name, "q_bias") == 0)      w->q_bias      = (float *)p;
+        else if (strcmp(name, "k_bias") == 0)      w->k_bias      = (float *)p;
+        else if (strcmp(name, "v_bias") == 0)      w->v_bias      = (float *)p;
+        else if (strcmp(name, "q8_q") == 0)        w->q8_q_weight    = (uint8_t *)p;
+        else if (strcmp(name, "q8_k") == 0)        w->q8_k_weight    = (uint8_t *)p;
+        else if (strcmp(name, "q8_v") == 0)        w->q8_v_weight    = (uint8_t *)p;
+        else if (strcmp(name, "q8_o") == 0)        w->q8_o_weight    = (uint8_t *)p;
+        else if (strcmp(name, "q8_gate") == 0)     w->q8_gate_weight = (uint8_t *)p;
+        else if (strcmp(name, "q8_up") == 0)       w->q8_up_weight   = (uint8_t *)p;
+        else if (strcmp(name, "q8_down") == 0)     w->q8_down_weight = (uint8_t *)p;
+        else if (strcmp(name, "q8_lm") == 0)       w->q8_lm_weight   = (uint8_t *)p;
+        else if (strcmp(name, "q4_q") == 0) {
+            w->q4_q_weight = (uint8_t *)p;
+            w->q4_q_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_k") == 0) {
+            w->q4_k_weight = (uint8_t *)p;
+            w->q4_k_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_v") == 0) {
+            w->q4_v_weight = (uint8_t *)p;
+            w->q4_v_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_o") == 0) {
+            w->q4_o_weight = (uint8_t *)p;
+            w->q4_o_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_gate") == 0) {
+            w->q4_gate_weight = (uint8_t *)p;
+            w->q4_gate_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_up") == 0) {
+            w->q4_up_weight = (uint8_t *)p;
+            w->q4_up_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_down") == 0) {
+            w->q4_down_weight = (uint8_t *)p;
+            w->q4_down_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "q4_lm") == 0) {
+            w->q4_lm_weight = (uint8_t *)p;
+            w->q4_lm_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
+        }
+        else if (strcmp(name, "x8_q") == 0)        w->x8_q_weight    = (uint8_t *)p;
+        else if (strcmp(name, "x8_k") == 0)        w->x8_k_weight    = (uint8_t *)p;
+        else if (strcmp(name, "x8_v") == 0)        w->x8_v_weight    = (uint8_t *)p;
+        else if (strcmp(name, "x8_o") == 0)        w->x8_o_weight    = (uint8_t *)p;
+        else if (strcmp(name, "x8_gate") == 0)     w->x8_gate_weight = (uint8_t *)p;
+        else if (strcmp(name, "x8_up") == 0)       w->x8_up_weight   = (uint8_t *)p;
+        else if (strcmp(name, "x8_down") == 0)     w->x8_down_weight = (uint8_t *)p;
+        /* Vision 张量（VQF_FLAG_VISION）：mmap 直挂。指针 alias vqf_map，
+         * 结构体本身由 vqf_load calloc，st_weights_free 的 vqf_map 分支释放。 */
+        else if (name[0] == 'v' && name[1] == '_') {
+            struct STVisionWeights *vw = w->vision;
+            if (!vw) {
+                vw = (struct STVisionWeights *)calloc(1, sizeof(*vw));
+                if (!vw) { st_mmap_close(&m); return -1; }
+                w->vision = vw;
+            }
+            if      (strcmp(name, "v_q8_qkv") == 0) vw->q8_attn_qkv_weight  = (uint8_t *)p;
+            else if (strcmp(name, "v_q8_proj") == 0) vw->q8_attn_proj_weight = (uint8_t *)p;
+            else if (strcmp(name, "v_q8_fc1") == 0)  vw->q8_mlp_fc1_weight   = (uint8_t *)p;
+            else if (strcmp(name, "v_q8_fc2") == 0)  vw->q8_mlp_fc2_weight   = (uint8_t *)p;
+            else if (strcmp(name, "v_patch_embed") == 0) vw->patch_embed_weight = (float *)p;
+            else if (strcmp(name, "v_patch_bias") == 0)  vw->patch_embed_bias   = (float *)p;
+            else if (strcmp(name, "v_pos_embed") == 0)   vw->pos_embed          = (float *)p;
+            else if (strcmp(name, "v_qkv_bias") == 0)    vw->attn_qkv_bias      = (float *)p;
+            else if (strcmp(name, "v_proj_bias") == 0)   vw->attn_proj_bias     = (float *)p;
+            else if (strcmp(name, "v_norm1_w") == 0)     vw->norm1_weight       = (float *)p;
+            else if (strcmp(name, "v_norm1_b") == 0)     vw->norm1_bias         = (float *)p;
+            else if (strcmp(name, "v_norm2_w") == 0)     vw->norm2_weight       = (float *)p;
+            else if (strcmp(name, "v_norm2_b") == 0)     vw->norm2_bias         = (float *)p;
+            else if (strcmp(name, "v_fc1_bias") == 0)    vw->mlp_fc1_bias       = (float *)p;
+            else if (strcmp(name, "v_fc2_bias") == 0)    vw->mlp_fc2_bias       = (float *)p;
+            else if (strcmp(name, "v_merger_nw") == 0)   vw->merger_norm_weight = (float *)p;
+            else if (strcmp(name, "v_merger_nb") == 0)   vw->merger_norm_bias   = (float *)p;
+            else if (strcmp(name, "v_merger_f1w") == 0)  vw->merger_fc1_weight  = (float *)p;
+            else if (strcmp(name, "v_merger_f1b") == 0)  vw->merger_fc1_bias    = (float *)p;
+            else if (strcmp(name, "v_merger_f2w") == 0)  vw->merger_fc2_weight  = (float *)p;
+            else if (strcmp(name, "v_merger_f2b") == 0)  vw->merger_fc2_bias    = (float *)p;
+            else if (strcmp(name, "v_ds_nw") == 0)   vw->ds_norm_weight = (float *)p;
+            else if (strcmp(name, "v_ds_nb") == 0)   vw->ds_norm_bias   = (float *)p;
+            else if (strcmp(name, "v_ds_f1w") == 0)  vw->ds_fc1_weight  = (float *)p;
+            else if (strcmp(name, "v_ds_f1b") == 0)  vw->ds_fc1_bias    = (float *)p;
+            else if (strcmp(name, "v_ds_f2w") == 0)  vw->ds_fc2_weight  = (float *)p;
+            else if (strcmp(name, "v_ds_f2b") == 0)  vw->ds_fc2_bias    = (float *)p;
+            vw->is_allocated = 1;
+        }
+        /* 未知名字忽略（向前兼容） */
+    }
+    (void)nl; (void)q_out; (void)k_out; (void)ff; (void)vc; (void)dim;
+
+    if (!w->token_embed || (!w->q8_q_weight && !w->q4_q_weight)) {
+        fprintf(stderr, "[VQF] missing core tensors (embed / q/k/v)\n");
+        st_mmap_close(&m); return -1;
+    }
+    if (c->is_moe) {
+        /* 专家可 q4 nibble 或 q8_0（A：wmode=q8 文件无 q4_gate）；
+         * 解码内核在 st_moe_ffn_sparse 内按可用权重分流。 */
+        if (!w->moe_router || (!w->q4_gate_weight && !w->q8_gate_weight) ||
+            c->n_experts <= 0) {
+            fprintf(stderr, "[VQF] MoE file missing moe_router/expert weights\n");
+            st_mmap_close(&m); return -1;
+        }
+        fprintf(stderr, "[VQF] MoE v3: experts=%d top_k=%d moe_ffn=%d shared=%d "
+                        "ffn_dim=%d router=%.1fMB (f32 resident) experts=%s\n",
+                c->n_experts, c->top_k, c->moe_ffn, c->shared_experts, c->ffn_dim,
+                (double)c->n_layers * c->n_experts * c->dim * 4.0 / 1048576.0,
+                w->q4_gate_weight ? "q4" : "q8");
+    }
+    w->has_q8  = w->q8_q_weight ? 1 : 0;
+    w->has_q4  = w->q4_q_weight ? 1 : 0;
+    w->has_x8  = (h->flags & VQF_FLAG_X8) ? 1 : 0;
+    w->q8_buf_q4 = (h->flags & VQF_FLAG_Q8BUF_Q4) ? 1 : 0;
+    w->emb_f16 = (h->flags & VQF_FLAG_EMB_F16) ? 1 : 0;
+    /* v5 lane-major：文件已固化 32 行 tile 布局，只有 RVV 内核（VLLM_Q4_RVV=1/2）
+     * 能吃下它；标量 mode2 比 4x4 更慢（按 tile 跳访存），故未启用时明确告警，
+     * 避免"安了 v5 模型却没开 RVV"变成静默性能回退。 */
+    if (w->q4_q_layout >= 2 || w->q4_k_layout >= 2 || w->q4_v_layout >= 2 ||
+        w->q4_o_layout >= 2 || w->q4_gate_layout >= 2 || w->q4_up_layout >= 2 ||
+        w->q4_down_layout >= 2 || w->q4_lm_layout >= 2) {
+        int rvv_on = 0;
+#if ST_HAVE_RVV
+        const char *e = getenv("VLLM_Q4_RVV");
+        rvv_on = (e && e[0] && atoi(e) >= 1);
+#endif
+        if (!rvv_on) {
+            fprintf(stderr, "[VQF] WARN: q4 lane-major(v5) 布局需要 VLLM_Q4_RVV=1/2；"
+                            "当前走标量 mode2，prefill/decode 会显著变慢\n");
+#if !ST_HAVE_RVV
+            fprintf(stderr, "[VQF] WARN: 本构建未启用 RVV，lane-major 只剩标量路径\n");
+#endif
+        }
+    }
+    g_vqf_loaded_flags = h->flags;      /* /admin 只读展示"文件内固化布局" */
+    g_vqf_loaded_version = h->version;
+    w->n_layers_allocated = c->n_layers;
+    w->is_allocated = 1;
+    w->vqf_map = m.data;
+    w->vqf_map_len = m.len;
+    g_vqf_stream_fd = m.fd;      /* 成功路径持有 fd（st_weights_free 仅 munmap） */
+    vqf_stream_setup(w);   /* 分层驻留：解析 VLLM_VQF_STREAM（明文 VQF 专属） */
+    return 0;
+}
+
+/* ---------------- 预热（可选，VLLM_VQF_PREWARM=1） ---------------- */
+#ifndef _WIN32
+#include <pthread.h>
+#include <sys/mman.h>
+#include <errno.h>
+
+static void *vqf_prewarm_worker(void *arg) {
+    const STModelWeights *w = (const STModelWeights *)arg;
+    const uint8_t *p = (const uint8_t *)w->vqf_map;
+    size_t len = w->vqf_map_len;
+    double t0 = st_now_sec();
+    madvise((void *)p, len, MADV_WILLNEED);   /* 内核异步预读提示 */
+    /* 逐页 touch：同步把页 fault 进 RAM（WILLNEED 是异步提示，逐页读确保完成）。
+     * 只读首字节即触发整页 fault；稀疏跳读降低 touch 开销。 */
+    volatile uint8_t sink = 0;
+    for (size_t off = 0; off < len; off += 4096)
+        sink ^= p[off];
+    sink ^= p[len - 1];
+    (void)sink;
+    fprintf(stderr, "[VQF] prewarm done: %.2f s (%zu MB)\n",
+            st_now_sec() - t0, len / 1048576);
+    return NULL;
+}
+#endif
+
+void vqf_prewarm(const STModelWeights *w) {
+    if (!w || !w->vqf_map || !w->vqf_map_len) return;
+#ifdef _WIN32
+    (void)w;   /* Windows 无 madvise/忽略（开发机不需要预热） */
+    return;
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, vqf_prewarm_worker, (void *)w) == 0)
+        pthread_detach(th);
+#endif
+}
+
+/* ================================================================
+ * 分层驻留（AirLLM 型 layer streaming）—— 仅明文 VQF
+ *
+ * 数据区布局（vqf_write/vqf_collect）：per-layer 张量 rows=n_layers*R 整层
+ * 堆叠连续存放，层 l 切片 = [tensor.offset + l*step, +step)，
+ * step = e->bytes / n_layers（层内几何整除时恒定，repack 层内闭合保证）。
+ * 常驻段 = embed/final_norm/lm_head/vision 等 rows 非 n_layers 倍数的张量。
+ * 驱逐只对"干净文件页"（MAP_PRIVATE 只读 mmap）做 MADV_DONTNEED：
+ * 丢 PTE，再访问从 eMMC 重新 fault → 字节由文件重建，位级一致不受影响。
+ * ================================================================ */
+#define VQF_STREAM_MAX_SEG 32
+
+typedef struct {
+    uint64_t off;    /* layer-0 起始（文件内偏移 == 映射内偏移，mmap 全文件） */
+    uint64_t step;   /* 单层字节数（本张量恒定） */
+    int is_expert;   /* 1 = MoE 专家张量（q4/q8_gate/up/down 且 MoE 几何成立） */
+    int kind;        /* 0=其它 1=gate/up（按专家段连续） 2=down（列带碎片化） */
+} VQFStreamSeg;
+
+static struct {
+    const void *map;     /* 当前 w->vqf_map（模型换载后失效） */
+    int         keep;    /* VLLM_VQF_STREAM=N */
+    int         log;
+    int         cold;    /* VLLM_VQF_STREAM_COLD=1：驱逐时连带丢页缓存（fadvise） */
+    int         fd;      /* 当前 VQF 的文件描述符（vqf_load 成功路径持有） */
+    int         nl;
+    int         nseg;
+    VQFStreamSeg seg[VQF_STREAM_MAX_SEG];
+    uint64_t    per_layer;   /* 每层可驱逐字节合计 */
+    uint64_t    total;       /* 数据区字节（报告/日志用） */
+} g_vqf_stream;
+
+/* 形态 A（专家级加载/驱逐）状态，定义与语义见下方 form-A 段。
+ * 放在此处是因为 vqf_stream_advise（更早）要按页计数。 */
+typedef struct {
+    int       active;       /* VLLM_SA=1 */
+    int       down_keep;    /* VLLM_SA_DOWN=keep（D2：down 不做任何 madvise） */
+    int       evl;          /* VLLM_SA_EVL=1：层尾驱逐——进入 layer l 时丢掉 R_{l-keep} 的激活段
+                             * （把 decode 期驻留从"48 层激活集之并"压到"单层瞬时"；默认关） */
+    int       stat;         /* VLLM_SA_STAT=1：每 token 打印建页量 */
+    int       in_batch;     /* 批式/prefill 期间置 1（形态 A 的同步只在 decode 生效） */
+    int       warm;         /* 1 = 本 token 已完成过专家级同步，层入口才可跳过 gate/up 整层驱逐
+                             * （否则 prefill 期间会**从不驱逐** gate/up ⇒ 驻留涨到接近全量） */
+    uint8_t  *res;          /* nl × rb（rb = ceil(ne/8) 字节）：每层驻留专家记账 R_l */
+    int       nl, ne, rb;
+    uint64_t  g_off, u_off; /* q4_gate / q4_up 张量文件偏移（== 映射偏移） */
+    uint64_t  layerB, expB; /* 每层字节 / 每专家段字节（expB 整页对齐） */
+    uint64_t  pg_w, pg_d;   /* 累计 madvise 覆盖页数（诊断） */
+    uint64_t  pg_w0, pg_d0; /* 上一 token 的基线 */
+    long      mf0;          /* 上一 token 的 minor fault 基线 */
+    int       have_base;    /* 基线是否已采集（不能用 mf0>0 判断：Windows 下 minflt 恒 0） */
+    int       tok;          /* 已统计 token 数 */
+    int       async;        /* VLLM_SA_ASYNC=1：sync_token 的 madvise 交后台线程（不改输出） */
+    int       order;        /* VLLM_SA_ORDER=1：先预取 A 再驱逐 R\A（语义等价） */
+    int       dn_sapf;      /* VLLM_DN_SAPF=1：down sidecar 也按专家级预取/驱逐（默认关，
+                             * 仅 DN_LANE 注册了 down sidecar 时有意义；见 vqf_sa_set_dn_alt） */
+    int       pf_gu, pf_dn; /* VLLM_SA_PF 掩码：选路后是否对 gate/up、down 发 WILLNEED。
+                             * 只影响「预取」，不影响驱逐与 R 记账 ⇒ 逐位安全。
+                             * all(默认)=both · dn=只预取 down · gu=只预取 gate/up · none=都不预取 */
+    int       selprobe;     /* VLLM_SA_SELPROBE=1：逐层统计相邻 token 激活集复用率 |A_t ∩ A_{t-1}|/tk
+                             * （只读诊断，零数值影响；用于裁决跨层投机预取是否成立） */
+    int       sel_hit, sel_total;   /* token 内跨层累计命中 / 总数 */
+    int       bigrd;        /* VLLM_SA_BIGRD=1（实验，默认关）：选路后预取改用 MADV_POPULATE_READ
+                             * 整段同步读入（宜配 VLLM_SA_ASYNC=1）；内核不支持则退回 WILLNEED。
+                             * 只改页何时进缓存，不改数值 ⇒ 逐位不变 */
+} VQFSA;
+static VQFSA g_sa;
+
+/* ---- f1：形态 A 的异步 madvise（SPSC 环形队列 + 单后台线程） ----
+ * madvise 只动页表/页缓存，不改任何浮点顺序 ⇒ 输出逐位不变；最坏多一次 major fault。
+ * 状态放在 g_sa 之外（vqf_sa_setup 会 memset g_sa）。 */
+#ifndef _WIN32
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22   /* Linux 5.14+ */
+#endif
+/* madvise 包装：POPULATE_READ 被内核拒绝（EINVAL）时退回 WILLNEED，之后不再尝试 */
+static void vqf_madvise(void *p, size_t n, int adv) {
+    static int s_pr_bad = 0;
+    if (adv == MADV_POPULATE_READ) {
+        if (!s_pr_bad) {
+            if (madvise(p, n, adv) == 0) return;
+            if (errno != EINVAL) return;   /* EFAULT/ENOMEM 等：本段放弃，不影响正确性 */
+            s_pr_bad = 1;
+            fprintf(stderr, "[VQF-SA] MADV_POPULATE_READ unsupported, fallback WILLNEED\n");
+        }
+        adv = MADV_WILLNEED;
+    }
+    madvise(p, n, adv);
+}
+#define VQF_ADV_PF_BIG MADV_POPULATE_READ
+#define VQF_AQ_CAP 1024
+typedef struct { void *p; size_t n; int adv; } VQFAqItem;
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv_put, cv_idle;
+    VQFAqItem       q[VQF_AQ_CAP];
+    unsigned        head, tail;   /* head = 下一个出队，tail = 下一个入队 */
+    int             busy;         /* worker 正在执行一项 */
+    int             started;
+} g_aq = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER };
+
+static void *vqf_aq_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_aq.mu);
+        while (g_aq.head == g_aq.tail) {
+            g_aq.busy = 0;
+            pthread_cond_broadcast(&g_aq.cv_idle);
+            pthread_cond_wait(&g_aq.cv_put, &g_aq.mu);
+        }
+        VQFAqItem it = g_aq.q[g_aq.head % VQF_AQ_CAP];
+        g_aq.head++;
+        g_aq.busy = 1;
+        pthread_mutex_unlock(&g_aq.mu);
+        vqf_madvise(it.p, it.n, it.adv);
+    }
+    return NULL;
+}
+
+static int vqf_aq_start(void) {
+    if (g_aq.started) return 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, vqf_aq_worker, NULL) != 0) return 0;
+    pthread_detach(th);
+    g_aq.started = 1;
+    return 1;
+}
+
+/* 入队；队列满则同步执行（不丢请求） */
+static void vqf_aq_push(void *p, size_t n, int adv) {
+    pthread_mutex_lock(&g_aq.mu);
+    if (g_aq.tail - g_aq.head >= VQF_AQ_CAP) {
+        pthread_mutex_unlock(&g_aq.mu);
+        vqf_madvise(p, n, adv);
+        return;
+    }
+    VQFAqItem *it = &g_aq.q[g_aq.tail % VQF_AQ_CAP];
+    it->p = p; it->n = n; it->adv = adv;
+    g_aq.tail++;
+    pthread_cond_signal(&g_aq.cv_put);
+    pthread_mutex_unlock(&g_aq.mu);
+}
+#else
+#define VQF_ADV_PF_BIG 22   /* Windows：入口处映射回 WILLNEED */
+#endif
+
+/* 等待异步队列清空（释放映射前必须调用）；未启用时立即返回 */
+void vqf_sa_async_drain(void) {
+#ifndef _WIN32
+    if (!g_aq.started) return;
+    pthread_mutex_lock(&g_aq.mu);
+    while (g_aq.head != g_aq.tail || g_aq.busy)
+        pthread_cond_wait(&g_aq.cv_idle, &g_aq.mu);
+    pthread_mutex_unlock(&g_aq.mu);
+#endif
+}
+
+static long vqf_stream_rss_kb_impl(void) {
+#ifndef _WIN32
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    long kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) { sscanf(line + 6, "%ld", &kb); break; }
+    }
+    fclose(f);
+    return kb;
+#else
+    /* Windows：Working Set（当前驻留物理页）≈ POSIX VmRSS。GetProcessMemoryInfo
+     * 需 psapi.lib（构建脚本 -lpsapi 已提供；MinGW 亦可在运行时经 K32GetProcessMemoryInfo
+     * kernel32 解析）。返回 kB。 */
+    PROCESS_MEMORY_COUNTERS pmc;
+    SIZE_T cb = sizeof(pmc);
+    HANDLE h = GetCurrentProcess();
+    BOOL ok = FALSE;
+    ok = GetProcessMemoryInfo(h, &pmc, cb);
+    return ok ? (long)(pmc.WorkingSetSize / 1024) : 0;
+#endif
+}
+
+long vqf_stream_rss_kb(void) {
+    return vqf_stream_rss_kb_impl();
+}
+
+int vqf_stream_state(int *keep, int *nl, int *nseg,
+                     unsigned long long *per_layer, int *cold) {
+    if (!g_vqf_stream.map || g_vqf_stream.keep <= 0) return 0;
+    if (keep) *keep = g_vqf_stream.keep;
+    if (nl) *nl = g_vqf_stream.nl;
+    if (nseg) *nseg = g_vqf_stream.nseg;
+    if (per_layer) *per_layer = g_vqf_stream.per_layer;
+    if (cold) *cold = g_vqf_stream.cold;
+    return 1;
+}
+
+/* setup：在 vqf_load 挂载完成后调用（幂等；新加载会重建表）。
+ * 只接受明文 VQF；加密（VQF_FLAG_ENC）与整文件单遍 SM4-CTR/HMAC 语义冲突，
+ * 逐层驱逐会丢失 COW 解密页 → 拒绝并告警。 */
+/* 专家窗口（EW，定义见下）：setup 中优先尝试接管。前置声明。 */
+static int vqf_ew_setup(STModelWeights *w, const VQFHeader *h);
+/* 形态 A（专家级加载/驱逐）：setup 尾部建表。实现见下方 form-A 段。 */
+static void vqf_sa_setup(STModelWeights *w);
+static int  vqf_sa_stat_env(void);
+
+void vqf_stream_setup(STModelWeights *w) {
+    memset(&g_vqf_stream, 0, sizeof(g_vqf_stream));
+    g_vqf_stream.nl = w && w->cfg.n_layers > 0 ? w->cfg.n_layers : 0;
+    if (!w || !w->vqf_map || w->vqf_map_len < sizeof(VQFHeader)) return;
+    const VQFHeader *h = (const VQFHeader *)w->vqf_map;
+    if (h->flags & VQF_FLAG_ENC) {
+        fprintf(stderr, "[VQF-STREAM/EW] REFUSED: encrypted VQF (SM4-CTR whole-file "
+                        "single-pass + HMAC) cannot be layer/experts-evicted; "
+                        "plaintext VQF only\n");
+        return;
+    }
+    /* 专家窗口（EW）优先：VLLM_EW / VLLM_EW_MASK 激活后接管层入口钩子 */
+    if (vqf_ew_setup(w, h)) {
+        g_vqf_stream.map  = w->vqf_map;   /* advance 的 map 校验走 EW 分支 */
+        g_vqf_stream.keep = 0;
+        return;
+    }
+    const char *e = getenv("VLLM_VQF_STREAM");
+    int keep = (e && e[0]) ? atoi(e) : 0;
+    if (keep <= 0 || g_vqf_stream.nl <= 0) return;          /* 默认关闭 */
+
+    g_vqf_stream.map  = w->vqf_map;
+    g_vqf_stream.keep = keep;
+    g_vqf_stream.fd   = g_vqf_stream_fd;
+    const char *lg = getenv("VLLM_VQF_STREAM_LOG");
+    g_vqf_stream.log = (lg && lg[0] == '1');
+    const char *cd = getenv("VLLM_VQF_STREAM_COLD");
+    g_vqf_stream.cold = (cd && cd[0] == '1');
+
+    int nl = g_vqf_stream.nl;
+    size_t dir_off = (sizeof(VQFHeader) + 63) & ~(size_t)63;
+    /* MoE 几何成立时，q4/q8_gate/up/down 才是「专家张量」（稠密文件的同名张量不是） */
+    int moe_geom = (h->arch.n_experts > 0 && h->arch.moe_ffn > 0 &&
+                    (uint64_t)h->arch.n_experts * h->arch.moe_ffn == h->arch.ffn_dim);
+    int n = 0;
+    uint64_t pl = 0;
+    for (uint32_t i = 0; i < h->n_tensors && n < VQF_STREAM_MAX_SEG; i++) {
+        const VQFTensor *te = (const VQFTensor *)((const uint8_t *)w->vqf_map +
+                                                  dir_off +
+                                                  (size_t)i * sizeof(VQFTensor));
+        const char *nm = te->name;
+        /* 允许集 = 逐层 RMSNorm + 逐层量化投影；lm/embed/final_norm/vision 常驻 */
+        int evict = 0;
+        if (strcmp(nm, "attn_norm") == 0 || strcmp(nm, "ffn_norm") == 0 ||
+            strcmp(nm, "q_norm") == 0 || strcmp(nm, "k_norm") == 0 ||
+            strcmp(nm, "q_bias") == 0 || strcmp(nm, "k_bias") == 0 ||
+            strcmp(nm, "v_bias") == 0) evict = 1;
+        else if (strncmp(nm, "q8_", 3) == 0 && strcmp(nm, "q8_lm") != 0) evict = 1;
+        else if (strncmp(nm, "q4_", 3) == 0 && strcmp(nm, "q4_lm") != 0) evict = 1;
+        else if (strncmp(nm, "x8_", 3) == 0) evict = 1;
+        if (!evict) continue;
+        /* 几何门控：整层堆叠且单层字节恒定（rows%nl==0 且 bytes%nl==0） */
+        if ((uint64_t)te->rows % (uint64_t)nl != 0) continue;
+        if ((uint64_t)te->rows / (uint64_t)nl == 0) continue;
+        if (te->bytes % (uint64_t)nl != 0) continue;
+        g_vqf_stream.seg[n].off  = te->offset;
+        g_vqf_stream.seg[n].step = te->bytes / (uint64_t)nl;
+        int kd = 0;
+        if (moe_geom) {
+            if (strcmp(nm, "q4_gate") == 0 || strcmp(nm, "q4_up") == 0 ||
+                strcmp(nm, "q8_gate") == 0 || strcmp(nm, "q8_up") == 0) kd = 1;
+            else if (strcmp(nm, "q4_down") == 0 || strcmp(nm, "q8_down") == 0) kd = 2;
+        }
+        g_vqf_stream.seg[n].kind = kd;
+        g_vqf_stream.seg[n].is_expert = kd ? 1 : 0;
+        pl += g_vqf_stream.seg[n].step;
+        n++;
+    }
+    if (n == 0) {
+        fprintf(stderr, "[VQF-STREAM] REFUSED: no per-layer tensors found "
+                        "(format geometry mismatch)\n");
+        g_vqf_stream.map = NULL;
+        return;
+    }
+    g_vqf_stream.nseg = n;
+    g_vqf_stream.per_layer = pl;
+    g_vqf_stream.total = h->file_len > h->data_offset
+                         ? (uint64_t)(h->file_len - h->data_offset) : 0;
+    fprintf(stderr,
+            "[VQF-STREAM] enabled keep=%d nl=%d segs=%d per-layer=%.1fMB "
+            "data=%.1fMB resident~%.1fMB rss=%ldkB\n",
+            keep, nl, n, pl / 1048576.0, g_vqf_stream.total / 1048576.0,
+            (g_vqf_stream.total > (uint64_t)nl * pl)
+                ? (g_vqf_stream.total - (uint64_t)nl * pl) / 1048576.0 : 0.0,
+            vqf_stream_rss_kb_impl());
+    vqf_sa_setup(w);   /* 形态 A：可选（VLLM_SA=1），失败静默保持现状 */
+    g_sa.stat = vqf_sa_stat_env();   /* 计量独立于 VLLM_SA（L0 档也要能测建页量） */
+}
+
+/* 页对齐的 madvise/VirtualUnlock（start 下取整 / end 上取整；文件偏移 == 映射偏移） */
+static void vqf_stream_advise_ex(int advice, uint64_t lo, uint64_t hi,
+                                 const void *map, int async) {
+    if (hi <= lo) return;
+#ifndef _WIN32
+    static uintptr_t s_psz = 0;
+    if (!s_psz) {
+        long ps = sysconf(_SC_PAGESIZE);
+        s_psz = (uintptr_t)(ps > 0 ? ps : 4096);
+    }
+    uintptr_t psz = s_psz;
+#else
+    (void)async;
+    uintptr_t psz = 4096;
+#endif
+    uintptr_t a = (uintptr_t)lo / psz * psz;
+    uintptr_t b = ((uintptr_t)hi + psz - 1) / psz * psz;
+    if (b <= a) return;
+
+    /* 形态 A 诊断（VLLM_SA_STAT=1）：按页统计 madvise 覆盖量 = 「建页/拆页」工作量。
+     * 纯计数，不影响任何语义。 */
+    if (g_sa.stat) {
+        uint64_t pg = (uint64_t)((b - a) / psz);
+        if (advice == MADV_WILLNEED || advice == VQF_ADV_PF_BIG) g_sa.pg_w += pg;
+        else if (advice == MADV_DONTNEED) g_sa.pg_d += pg;
+    }
+
+#ifndef _WIN32
+    {
+        void *pp = (void *)((const uint8_t *)map + a);
+        size_t nn = (size_t)(b - a);
+        if (async) vqf_aq_push(pp, nn, advice);
+        else vqf_madvise(pp, nn, advice);
+    }
+#else
+    if (advice == VQF_ADV_PF_BIG) advice = MADV_WILLNEED;
+    if (advice == MADV_DONTNEED) {
+        /* Windows x86 内存释放方案：VirtualUnlock 会把指定的虚拟内存页从当前工作集(Working Set)中移除，
+         * 从而让系统认为该部分内存已被释放，实现了等效于 Linux MADV_DONTNEED 的可测物理内存收益。 */
+        VirtualUnlock((void *)((const uint8_t *)map + a), (size_t)(b - a));
+    } else if (advice == MADV_WILLNEED) {
+        /* Windows 无 madvise(WILLNEED) 等价物：动态解析 PrefetchVirtualMemory
+         * （Win8+，kernel32），把页从 standby/文件预取进工作集（≈ Linux WILLNEED）。
+         * 需 SeIncreaseQuota 类特权，缺失/不可用则静默跳过（退回按需 fault，行为
+         * 与未启用一致）。函数指针静态缓存，只探测一次（与 moe_q4_simd_ok 同款）。 */
+        typedef BOOL (WINAPI *pf_pvm_t)(HANDLE, ULONG_PTR, const void *, ULONG);
+        static pf_pvm_t pf_pvm = (pf_pvm_t)0;
+        if (pf_pvm == (pf_pvm_t)0) {
+            pf_pvm = (pf_pvm_t)(uintptr_t)GetProcAddress(
+                GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+            if (!pf_pvm) pf_pvm = (pf_pvm_t)-1;   /* -1 = 不可用（探测一次） */
+        }
+        if (pf_pvm != (pf_pvm_t)-1) {
+            struct { void *va; SIZE_T n; } rng;   /* 布局 == WIN32_MEMORY_RANGE_ENTRY */
+            rng.va = (void *)((const uint8_t *)map + a);
+            rng.n  = (SIZE_T)(b - a);
+            pf_pvm(GetCurrentProcess(), 1, &rng, 0);
+        }
+    }
+#endif
+}
+
+static void vqf_stream_advise(int advice, uint64_t lo, uint64_t hi, const void *map) {
+    vqf_stream_advise_ex(advice, lo, hi, map, 0);
+}
+
+/* ================================================================
+ * 方向 E 探针：逐层驻留的权重读取降到「专家级」（判别实验，默认关）
+ *
+ * VLLM_STREAM_PROBE=<n>（未设/0 = 逐字节现状）：
+ *   1 = 只保留整层 DONTNEED(l-keep)，关闭整层 WILLNEED(l+1)
+ *   2 = 只保留整层 WILLNEED(l+1)，关闭整层 DONTNEED(l-keep)
+ *   3 = 专家段不做任何 madvise（区间→0 的乐观地板；RSS 无界，仅大内存机可跑）
+ *   4 = 区间同现状，但每次调用按 16 片等分发出（syscall 计数对照）
+ * 只改 madvise 的目标区间与调用切分，不触碰任何浮点序 → A≡C 位级一致。
+ * 判据与口径见 docs/PRE_REG_STREAM_EXPERT_GRAIN_PROBE.txt。
+ * ================================================================ */
+#define VQF_STREAM_PROBE_CHUNKS 16
+
+static int vqf_stream_probe_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("VLLM_STREAM_PROBE");
+        m = (e && e[0]) ? atoi(e) : 0;
+        if (m < 0 || m > 4) m = 0;
+    }
+    return m;
+}
+
+/* mode=4：把 [lo,hi) 等分 VQF_STREAM_PROBE_CHUNKS 片分别下发（模拟专家粒度调用数）。 */
+static void vqf_stream_advise_gran(int mode, int advice, uint64_t lo, uint64_t hi,
+                                   const void *map) {
+    if (hi <= lo) return;
+    if (mode != 4) { vqf_stream_advise(advice, lo, hi, map); return; }
+    uint64_t n = (hi - lo + VQF_STREAM_PROBE_CHUNKS - 1) / VQF_STREAM_PROBE_CHUNKS;
+    if (n == 0) n = 1;
+    for (uint64_t o = lo; o < hi; o += n) {
+        uint64_t e = (o + n < hi) ? (o + n) : hi;
+        vqf_stream_advise(advice, o, e, map);
+    }
+}
+
+/* 一次性生效自证（未设探针时无任何输出 → 零回归可核）。 */
+static void vqf_stream_probe_attest(int probe, int nl, int nseg) {
+    static int logged = 0;
+    if (!probe || logged) return;
+    logged = 1;
+    int ne_seg = 0;
+    for (int s = 0; s < nseg; s++) ne_seg += g_vqf_stream.seg[s].is_expert;
+    fprintf(stderr, "[STREAM-PROBE] mode=%d nl=%d segs=%d expert_segs=%d "
+                    "per-layer=%.1fMB%s\n",
+            probe, nl, nseg, ne_seg, g_vqf_stream.per_layer / 1048576.0,
+            ne_seg ? "" : " (no MoE expert segs)");
+    if (probe == 3 && ne_seg == 0)
+        fprintf(stderr, "[STREAM-PROBE] WARN: mode=3 finds no expert segs "
+                        "(non-MoE file) -> degenerates to L0\n");
+    fflush(stderr);
+}
+
+/* ================================================================
+ * 专家窗口驻留（EW，expert window）——热专家常驻 + 冷专家页级流转
+ *
+ * 把分层驻留的粒度从"整层"降到"专家页"（Kestrel 正轨，§10.17 原型落地）：
+ *   VLLM_EW=<H>          启用，热集 = 每层 rank<H 的专家（合成占位热集）
+ *   VLLM_EW_MASK=<path>  显式热掩码文件，每行 "l:e1,e2,..."（真实热度喂入）
+ *   VLLM_EW_LOG=1        层边界日志（rss + 热专家数）
+ *
+ * 有界窗口语义（§10.17 关键结论：必须驱逐层内"全体非热页"才能收敛）：
+ *   - 常驻永不驱逐：router/attn/norm/lm/embed；
+ *   - 热专家 gate/up 常驻（掩码内不驱逐）；
+ *   - 进入层 l 时（层循环入口钩子，先于本层权重读取）：
+ *       a) gate/up：驱逐本层全部非热专家段（连续冷段合并，每段 1 次 PTE 操作）；
+ *       b) down  ：整层驱逐——q4 4x4 / q8 8x8 下专家沿行组列窗碎片散布、页被
+ *                  邻专家共享，整层清除最省 syscall；热 down 由本层 FFN 计算自然重驻。
+ *   - A≡C：驱逐只改 PTE，页由文件/页缓存按字节重建；FFN 零改动、数值不变。
+ *
+ * 几何（q4 4x4 tiled / q8 8x8 tiled 双支持，2026-09-09 扩展）：
+ *   gate/up：rows/层 = ff = ne×moe_ffn，cols = d；专家段 = moe_ffn 行 →
+ *            连续字节 expB = bytes(moe_ffn×d)（q4 = 0.844MB/216 页、q8 = 1.67MB/
+ *            408 页，均整页对齐、行组不跨专家段 → 1 段驱逐）；
+ *   down  ：rows/层 = d，cols = ff；行组字节 = (ff/32)×组块（q4 72B/4行组、
+ *            q8 272B/8行组）；专家列窗碎片化 → 整层驱逐。
+ * ================================================================ */
+typedef struct {
+    int active, nl, ne, moe_ffn, d, ff;
+    int is_q8;                     /* 1=q8 8x8 tiled；0=q4 4x4 tiled */
+    uint64_t layerB, expB;         /* gate/up/down 每层字节 / gate-up 每专家段字节 */
+    uint64_t g_off, u_off, d_off;  /* q4/q8_gate/up/down 张量文件偏移 */
+    uint8_t *mask;                 /* nl×ne bits（按层 128 位） */
+    int log;
+} VQFEW;
+static VQFEW g_ew;
+
+static uint64_t vqf_q4_bytes(uint64_t n) { return (n + 31) / 32 * 18; }
+static uint64_t vqf_q8_bytes(uint64_t n) { return (n + 31) / 32 * 34; }
+
+static int vqf_ew_hot(const VQFEW *e, int l, int x) {
+    /* mask 按位打包：每层 ne 位 = ne/8 字节（vqf_ew_setup 分配 nl*ne/8 字节） */
+    return (e->mask[(size_t)l * (e->ne / 8) + (size_t)x / 8] >> (x & 7)) & 1;
+}
+
+static const VQFTensor *vqf_ew_find(const VQFHeader *h, const char *want) {
+    const VQFTensor *dir = (const VQFTensor *)((const uint8_t *)h + sizeof(VQFHeader));
+    for (uint32_t i = 0; i < h->n_tensors; i++)
+        if (strcmp(dir[i].name, want) == 0) return &dir[i];
+    return NULL;
+}
+
+/* 解析 VLLM_EW 掩码；几何/格式校验通过才激活。返回 1 = EW 接管。
+ * 布局：q4_4x4（VQF_FLAG_Q4_4X4）与 q8_8x8（VQF_FLAG_Q8_8X8）双支持——
+ * 两种 repack 均不改变每元素字节（q4 18B/32elt、q8 34B/32elt），专家段几何
+ * 同构：gate/up 每专家 = me 行 × d 列，行组（q4=4 / q8=8）不跨专家段
+ * （me%行组==0，§4 整除实证），专家段整页对齐（q4 gate/up 216 页 / q8 408 页）。
+ * q4 族张量优先（与引擎权重加载同序），无则回落 q8 族。 */
+static int vqf_ew_setup(STModelWeights *w, const VQFHeader *h) {
+    memset(&g_ew, 0, sizeof(g_ew));
+    const char *env = getenv("VLLM_EW");
+    const char *mf  = getenv("VLLM_EW_MASK");
+    if (!(env && env[0]) && !(mf && mf[0])) return 0;   /* 默认关 */
+    if (h->flags & VQF_FLAG_ENC) {
+        fprintf(stderr, "[VQF-EW] REFUSED: 加密 VQF（EW 需明文按层驱逐）\n");
+        return 0;
+    }
+    const VQFArch *a = &h->arch;
+    int ne = (int)a->n_experts, me = (int)a->moe_ffn;
+    int d = (int)a->dim, ff = (int)a->ffn_dim, nl = (int)a->n_layers;
+    if (ne <= 0 || me <= 0 || d <= 0 || ff <= 0 || nl <= 0 || (uint64_t)ne * me != (uint64_t)ff) {
+        fprintf(stderr, "[VQF-EW] REFUSED: 非 MoE 或几何不成立\n");
+        return 0;
+    }
+    const VQFTensor *G = vqf_ew_find(h, "q4_gate");
+    const VQFTensor *U = vqf_ew_find(h, "q4_up");
+    const VQFTensor *D = vqf_ew_find(h, "q4_down");
+    int is_q8 = 0;
+    if (!G || !U || !D) {
+        G = vqf_ew_find(h, "q8_gate");
+        U = vqf_ew_find(h, "q8_up");
+        D = vqf_ew_find(h, "q8_down");
+        is_q8 = 1;
+    }
+    if (!G || !U || !D) { fprintf(stderr, "[VQF-EW] REFUSED: 无 q4/q8_gate/up/down\n"); return 0; }
+    uint32_t need = is_q8 ? VQF_FLAG_Q8_8X8 : VQF_FLAG_Q4_4X4;
+    if (!(h->flags & need)) {
+        fprintf(stderr, "[VQF-EW] REFUSED: %s 请求但文件缺布局 flag 0x%x\n",
+                is_q8 ? "q8_8x8" : "q4_4x4", (unsigned)need);
+        return 0;
+    }
+    uint64_t layerB = is_q8 ? vqf_q8_bytes((uint64_t)ff * (uint64_t)d)
+                            : vqf_q4_bytes((uint64_t)ff * (uint64_t)d);
+    uint64_t expB   = is_q8 ? vqf_q8_bytes((uint64_t)me * (uint64_t)d)
+                            : vqf_q4_bytes((uint64_t)me * (uint64_t)d);
+    /* 几何自检：整层堆叠 + 专家段整页对齐（q4 gate/up 216 页 / q8 408 页） */
+    if ((uint64_t)G->rows != (uint64_t)nl * ff || (uint64_t)D->rows != (uint64_t)nl * d ||
+        (uint64_t)G->bytes != layerB * nl || (uint64_t)D->bytes != layerB * nl ||
+        (expB & 4095) != 0) {
+        fprintf(stderr, "[VQF-EW] REFUSED: 张量几何与整层堆叠假设不符\n");
+        return 0;
+    }
+    g_ew.is_q8 = is_q8;
+    g_ew.nl = nl; g_ew.ne = ne; g_ew.moe_ffn = me; g_ew.d = d; g_ew.ff = ff;
+    g_ew.layerB = layerB; g_ew.expB = expB;
+    g_ew.g_off = G->offset; g_ew.u_off = U->offset; g_ew.d_off = D->offset;
+    const char *lg = getenv("VLLM_EW_LOG");
+    g_ew.log = (lg && lg[0] == '1');
+    g_ew.mask = (uint8_t *)calloc(1, ((size_t)nl * ne + 7) / 8);
+    if (!g_ew.mask) { fprintf(stderr, "[VQF-EW] OOM mask\n"); return 0; }
+
+    /* 掩码来源：显式文件优先（每行 "l:e1,e2,..."），否则 VLLM_EW=H → rank<H */
+    if (mf && mf[0]) {
+        FILE *f = fopen(mf, "r");
+        if (!f) { fprintf(stderr, "[VQF-EW] mask 文件打不开: %s\n", mf); free(g_ew.mask); g_ew.mask = NULL; return 0; }
+        char line[512]; int nlines = 0;
+        while (fgets(line, sizeof(line), f)) {
+            char *c = strchr(line, '#'); if (c) *c = 0;
+            int l = 0;
+            if (sscanf(line, " %d:", &l) != 1) continue;
+            if (l < 0 || l >= nl) continue;
+            char *p = strchr(line, ':'); if (!p) continue;
+            p++;
+            char *tk = strtok(p, ",; \t\r\n");
+            while (tk) {
+                int e = atoi(tk);
+                if (e >= 0 && e < ne) g_ew.mask[(size_t)l * (ne / 8) + (size_t)e / 8] |= (uint8_t)(1u << (e & 7));
+                tk = strtok(NULL, ",; \t\r\n");
+            }
+            nlines++;
+        }
+        fclose(f);
+        if (nlines == 0) { fprintf(stderr, "[VQF-EW] mask 文件无有效行: %s\n", mf); free(g_ew.mask); g_ew.mask = NULL; return 0; }
+    } else {
+        int H = atoi(env);
+        if (H <= 0 || H > ne) { fprintf(stderr, "[VQF-EW] 非法 H=%d\n", H); free(g_ew.mask); g_ew.mask = NULL; return 0; }
+        for (int l = 0; l < nl; l++)
+            for (int e = 0; e < H; e++) g_ew.mask[(size_t)l * (ne / 8) + (size_t)e / 8] |= (uint8_t)(1u << (e & 7));
+    }
+    g_ew.active = 1;
+    fprintf(stderr, "[VQF-EW] enabled %s nl=%d ne=%d moe_ffn=%d per-layer=%.1fMB "
+                    "exp=%.3fMB(%llu页) data_off g=%llu u=%llu d=%llu\n",
+            is_q8 ? "q8_8x8" : "q4_4x4", nl, ne, me, layerB / 1048576.0,
+            expB / 1048576.0,
+            (unsigned long long)(expB / 4096),
+            (unsigned long long)g_ew.g_off, (unsigned long long)g_ew.u_off,
+            (unsigned long long)g_ew.d_off);
+    return 1;
+}
+
+/* 层入口：驱逐本层全体非热专家页（gate/up 按专家段；down 整层）。幂等。 */
+static void vqf_ew_layer(const STModelWeights *w, int layer) {
+    VQFEW *e = &g_ew;
+    if (layer < 0 || layer >= e->nl) return;
+    const uint8_t *map = (const uint8_t *)w->vqf_map;
+    int ne = e->ne;
+    /* a) gate/up：连续冷段合并驱逐 */
+    for (int t = 0; t < 2; t++) {
+        uint64_t base = (t == 0 ? e->g_off : e->u_off) + (uint64_t)layer * e->layerB;
+        int rs = -1;
+        for (int x = 0; x <= ne; x++) {
+            int hot = (x < ne) ? vqf_ew_hot(e, layer, x) : 1;
+            if (!hot) { if (rs < 0) rs = x; }
+            else if (rs >= 0) {
+                uint64_t off = base + (uint64_t)rs * e->expB;
+                vqf_stream_advise(MADV_DONTNEED, off,
+                                  off + (uint64_t)(x - rs) * e->expB, map);
+                rs = -1;
+            }
+        }
+    }
+    /* b) down：整层（专家列窗碎片化，页共享 → 整层清除） */
+    vqf_stream_advise(MADV_DONTNEED, e->d_off + (uint64_t)layer * e->layerB,
+                      e->d_off + (uint64_t)(layer + 1) * e->layerB, map);
+    /* c) 跨层软流水（可选，VLLM_EW_PREFETCH_LAYER=1，默认关）：层 l 计算期预读
+     * l+1 整层专家页（gate/up/down 共 3×layerB），把 l+1 的缺页与 l 的计算重叠。
+     * 注意：router 未跑、选路未知 → 只能整层过取（= §10.23 down 整层带同判据，
+     * 稀疏窗口下过取有害）；Windows 代理（同步回填）预期负收益，x86 仅作对拍；
+     * 真异步内核读入（Linux madvise WILLNEED）的目标端才可能有益。 */
+    if (layer + 1 < e->nl) {
+        static int pf_layer = -1;
+        if (pf_layer < 0) {
+            const char *pe = getenv("VLLM_EW_PREFETCH_LAYER");
+            pf_layer = (pe && pe[0] == '1') ? 1 : 0;
+        }
+        if (pf_layer) {
+            uint64_t lb1 = (uint64_t)(layer + 1) * e->layerB;
+            vqf_stream_advise(MADV_WILLNEED, e->g_off + lb1,
+                              e->g_off + lb1 + e->layerB, map);
+            vqf_stream_advise(MADV_WILLNEED, e->u_off + lb1,
+                              e->u_off + lb1 + e->layerB, map);
+            vqf_stream_advise(MADV_WILLNEED, e->d_off + lb1,
+                              e->d_off + lb1 + e->layerB, map);
+        }
+    }
+    if (e->log && (layer == 0 || layer % 8 == 0 || layer == e->nl - 1)) {
+        int cnt = 0;
+        for (int x = 0; x < ne; x++) cnt += vqf_ew_hot(e, layer, x);
+        fprintf(stderr, "[VQF-EW] l=%d/%d rss=%ldkB hot=%d\n",
+                layer, e->nl, vqf_stream_rss_kb_impl(), cnt);
+    }
+}
+
+/* ================================================================
+ * 形态 A：decode 只加载/驻留「本 token 激活的专家」（默认关）
+ * 设计：docs/逐层驻留专家级读取方案.md；预注册：docs/PRE_REG_STREAM_SA.txt
+ *
+ *   VLLM_SA=1          主开关；未设 = 逐字节现状（零回归）
+ *   VLLM_SA_DOWN=keep  down 段不做任何 madvise（D2）；默认 whole（D1）= 层入口
+ *                      整层 DONTNEED、不预读 ⇒ RSS 有界
+ *   VLLM_SA_STAT=1     只读计量：每 token 打印 madvise 覆盖页数与 minor fault 增量
+ *                      （= 建页/拆页工作量），**与是否启用 VLLM_SA 无关**，用于
+ *                      设备无关地验证「降低建页成本」的降幅
+ *
+ * 机制（与 vqf_stream_layer_advance 配合）：
+ *   层入口：gate/up 专家段**不再**整层 DONTNEED/WILLNEED（改由下方同步处理）；
+ *           down 按 VLLM_SA_DOWN；非专家段保持现状。
+ *   选路后（top-k 已知，vqf_ffn_prefetch 点）：驱逐 R_l \ A_l（每专家 gate/up
+ *           各 1 次调用，区间 = 该专家段 216 页）→ R_l := A_l → 对 A_l 发
+ *           WILLNEED（0% 过取）。
+ *   ⇒ 专家段的 madvise 区间从「128 专家」量级降到「8 专家」量级。
+ *
+ * 正确性：只调 madvise（页表/页缓存），浮点序零改动 ⇒ A≡C（TOKIDS 位级一致）。
+ *   R_l 只是「我们让它驻留过」的集合；漏记 ⇒ 少驱逐 ⇒ RSS 略高（保守方向）。
+ * ================================================================ */
+
+/* /proc/self/stat 第 10 字段 = minflt（minor fault 累计数）；非 Linux 返回 0。 */
+static long vqf_sa_minflt(void) {
+#ifndef _WIN32
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) return 0;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');       /* 跳过 "pid (comm) " */
+    if (!p) return 0;
+    p++;
+    while (*p == ' ') p++;
+    while (*p && *p != ' ') p++;       /* 跨过 state 字符（非数字，strtol 会原地不动） */
+    long v = 0;
+    for (int i = 0; i < 7; i++) {      /* 其后第 7 个数字字段 = minflt（总第 10 字段） */
+        while (*p == ' ') p++;
+        v = strtol(p, &p, 10);
+    }
+    return v;
+#else
+    return 0;
+#endif
+}
+
+static int vqf_sa_stat_env(void) {
+    static int v = -1;
+    if (v < 0) { const char *s = getenv("VLLM_SA_STAT"); v = (s && s[0] == '1') ? 1 : 0; }
+    return v;
+}
+
+/* 取 /proc/self/status 的 RssAnon/RssFile/RssShmem（kB），非 Linux 全 0。
+ * 只读诊断（无副作用）：用于把 rss 增量定位到 anon（分配器/KV/栈）还是 file（mmap 权重）——
+ * 见 docs/PRE_REG_STREAM_SA.txt §8.6.1 的归因需求。 */
+static void vqf_sa_rss_split(long *anon_kb, long *file_kb, long *shmem_kb) {
+    *anon_kb = 0; *file_kb = 0; *shmem_kb = 0;
+#ifndef _WIN32
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "RssAnon:", 8) == 0)       sscanf(line + 8, "%ld", anon_kb);
+        else if (strncmp(line, "RssFile:", 8) == 0)  sscanf(line + 8, "%ld", file_kb);
+        else if (strncmp(line, "RssShmem:", 9) == 0) sscanf(line + 9, "%ld", shmem_kb);
+    }
+    fclose(f);
+#endif
+}
+
+/* 每 token 一次（层 0）打印上一个 token 的建页量；与是否启用形态 A 无关。 */
+static void vqf_sa_stat_tick(int layer) {
+    if (!g_sa.stat || layer != 0) return;
+    long mf = vqf_sa_minflt();
+    long anon = 0, file = 0, shm = 0;
+    vqf_sa_rss_split(&anon, &file, &shm);
+    if (g_sa.have_base)
+        fprintf(stderr, "[SA-STAT] tok=%d pages_w=%llu pages_d=%llu pages_sum=%llu "
+                        "minflt_delta=%ld rss_anon=%ld rss_file=%ld rss_shmem=%ld\n",
+                g_sa.tok,
+                (unsigned long long)(g_sa.pg_w - g_sa.pg_w0),
+                (unsigned long long)(g_sa.pg_d - g_sa.pg_d0),
+                (unsigned long long)((g_sa.pg_w - g_sa.pg_w0) +
+                                     (g_sa.pg_d - g_sa.pg_d0)),
+                (long)(mf - g_sa.mf0), anon, file, shm);
+    g_sa.mf0 = mf; g_sa.pg_w0 = g_sa.pg_w; g_sa.pg_d0 = g_sa.pg_d;
+    g_sa.have_base = 1;
+    g_sa.tok++;
+}
+
+static void vqf_sa_setup(STModelWeights *w) {
+    memset(&g_sa, 0, sizeof(g_sa));
+    const char *e = getenv("VLLM_SA");
+    if (!(e && e[0] == '1')) return;                        /* 默认关 */
+    if (g_vqf_stream.nseg <= 0 || g_vqf_stream.keep <= 0) {
+        fprintf(stderr, "[VQF-SA] REFUSED: 需 VLLM_VQF_STREAM=1 生效\n"); return;
+    }
+    if (!w || !w->vqf_map || w->vqf_map_len < sizeof(VQFHeader)) return;
+    const VQFHeader *h = (const VQFHeader *)w->vqf_map;
+    if (h->flags & VQF_FLAG_ENC) {
+        fprintf(stderr, "[VQF-SA] REFUSED: encrypted VQF（页为脏 COW，不可驱逐）\n"); return;
+    }
+    if (!(h->flags & VQF_FLAG_Q4_4X4)) {
+        fprintf(stderr, "[VQF-SA] REFUSED: 需 q4_4x4 布局\n"); return;
+    }
+    const VQFArch *a = &h->arch;
+    int nl = (int)a->n_layers, ne = (int)a->n_experts, me = (int)a->moe_ffn;
+    int d = (int)a->dim, ff = (int)a->ffn_dim;
+    if (ne <= 0 || me <= 0 || d <= 0 || ff <= 0 || nl <= 0 ||
+        (uint64_t)ne * (uint64_t)me != (uint64_t)ff) {
+        fprintf(stderr, "[VQF-SA] REFUSED: 非 MoE 或几何不成立\n"); return;
+    }
+    const VQFTensor *G = vqf_ew_find(h, "q4_gate");
+    const VQFTensor *U = vqf_ew_find(h, "q4_up");
+    if (!G || !U) { fprintf(stderr, "[VQF-SA] REFUSED: 无 q4_gate/q4_up\n"); return; }
+    uint64_t layerB = vqf_q4_bytes((uint64_t)ff * (uint64_t)d);
+    uint64_t expB   = vqf_q4_bytes((uint64_t)me * (uint64_t)d);
+    /* 几何 + **页对齐**门控（读者注意：张量 offset 只保 64B 对齐，故必须显式校验） */
+    if ((expB & 4095) != 0 || (uint64_t)G->rows != (uint64_t)nl * ff ||
+        (uint64_t)G->bytes != layerB * nl || (uint64_t)U->bytes != layerB * nl ||
+        ((uint64_t)G->offset & 4095) != 0 || ((uint64_t)U->offset & 4095) != 0) {
+        fprintf(stderr, "[VQF-SA] REFUSED: 几何/页对齐与整层堆叠假设不符\n"); return;
+    }
+    g_sa.nl = nl; g_sa.ne = ne; g_sa.rb = (ne + 7) / 8;
+    g_sa.g_off = G->offset; g_sa.u_off = U->offset;
+    g_sa.layerB = layerB; g_sa.expB = expB;
+    g_sa.res = (uint8_t *)calloc((size_t)nl * (size_t)g_sa.rb, 1);
+    if (!g_sa.res) { fprintf(stderr, "[VQF-SA] OOM res\n"); return; }
+    const char *dk = getenv("VLLM_SA_DOWN");
+    g_sa.down_keep = (dk && (dk[0] == 'k' || dk[0] == 'K')) ? 1 : 0;
+    const char *ev = getenv("VLLM_SA_EVL");
+    g_sa.evl = (ev && ev[0] == '1') ? 1 : 0;
+    g_sa.stat = vqf_sa_stat_env();
+    const char *as = getenv("VLLM_SA_ASYNC");
+#ifndef _WIN32
+    g_sa.async = (as && as[0] == '1') ? vqf_aq_start() : 0;
+#else
+    (void)as; g_sa.async = 0;
+#endif
+    const char *od = getenv("VLLM_SA_ORDER");
+    g_sa.order = (od && od[0] == '1') ? 1 : 0;
+    const char *dp = getenv("VLLM_DN_SAPF");
+    g_sa.dn_sapf = (dp && dp[0] == '1') ? 1 : 0;
+    const char *sp = getenv("VLLM_SA_SELPROBE");
+    g_sa.selprobe = (sp && sp[0] == '1') ? 1 : 0;
+    g_sa.sel_hit = 0; g_sa.sel_total = 0;
+    const char *br = getenv("VLLM_SA_BIGRD");
+    g_sa.bigrd = (br && br[0] == '1') ? 1 : 0;
+    g_sa.pf_gu = 1; g_sa.pf_dn = 1;
+    {
+        const char *pf = getenv("VLLM_SA_PF");
+        if (pf && pf[0]) {
+            if (strcmp(pf, "dn") == 0)       { g_sa.pf_gu = 0; g_sa.pf_dn = 1; }
+            else if (strcmp(pf, "gu") == 0)  { g_sa.pf_gu = 1; g_sa.pf_dn = 0; }
+            else if (strcmp(pf, "none") == 0){ g_sa.pf_gu = 0; g_sa.pf_dn = 0; }
+            else                             { g_sa.pf_gu = 1; g_sa.pf_dn = 1; }
+        }
+    }
+    g_sa.active = 1;
+    fprintf(stderr, "[VQF-SA] enabled down=%s nl=%d ne=%d exp=%.3fMB(%llu页) "
+                    "res=%zuB stat=%d evl=%d async=%d order=%d dnsapf=%d pf=%d%d bigrd=%d\n",
+            g_sa.down_keep ? "keep" : "whole", nl, ne, expB / 1048576.0,
+            (unsigned long long)(expB / 4096), (size_t)nl * (size_t)g_sa.rb, g_sa.stat,
+            g_sa.evl, g_sa.async, g_sa.order, g_sa.dn_sapf, g_sa.pf_gu, g_sa.pf_dn,
+            g_sa.bigrd);
+}
+
+/* 批式/prefill 守卫：置 1 期间不做形态 A 的专家级同步。
+ * 原因：一个 mini-batch 的激活集≈全体专家，逐 token 同步会误驱逐本批随后要读的段。
+ * 同时清 warm ⇒ 层入口恢复「gate/up 整层驱逐」的现状行为（否则 prefill 期间无人驱逐
+ * gate/up，驻留会涨到接近全量：实测 rss_after_prefill 604MB → 7.75GB）。 */
+void vqf_sa_set_batch(int on) {
+    g_sa.in_batch = on ? 1 : 0;
+    if (on) g_sa.warm = 0;
+}
+
+/* GU_LANE sidecar 重定向（VLLM_GU_LANE=1 时由 vllm_safetensors.c 注册；默认未注册）。
+ * 注册后 decode 期 gate/up 实际读 sidecar，形态 A 的专家级 madvise 随之改到 sidecar map。
+ * 独立于 g_sa（vqf_sa_setup 会 memset g_sa）。未注册时 sync/evict 路径与原来逐字节一致。
+ * DN_LANE（VLLM_DN_LANE=1）另有一套 down sidecar：几何与 gate/up 相同（expB/layerB 一致），
+ * 但只有 down 一个区，且与 gu sidecar 是**两个独立 mmap** ⇒ 分开登记。 */
+static struct {
+    const uint8_t *map; uint64_t g_off, u_off;      /* gate/up sidecar */
+    const uint8_t *dmap; uint64_t d_off;            /* down sidecar */
+} g_sa_alt;
+
+void vqf_sa_set_gu_alt(const void *map, uint64_t g_off, uint64_t u_off) {
+    g_sa_alt.map = (const uint8_t *)map;
+    g_sa_alt.g_off = map ? g_off : 0;
+    g_sa_alt.u_off = map ? u_off : 0;
+}
+
+void vqf_sa_set_dn_alt(const void *map, uint64_t d_off) {
+    g_sa_alt.dmap = (const uint8_t *)map;
+    g_sa_alt.d_off = map ? d_off : 0;
+}
+
+/* 选路后同步：驱逐 R_l \ A_l → R_l := A_l → 预取 A_l。仅 decode（非批式）生效。
+ * 由 vllm_safetensors.c 在 top-k 选路点显式调用（**不**搭 vqf_ffn_prefetch 的车：
+ * 后者在 VLLM_EW_PREFETCH 未开时会提前 return，曾导致本同步从未执行）。 */
+void vqf_sa_sync_token(const STModelWeights *w, int layer, const int *sel, int tk) {
+    if (!g_sa.active || g_sa.in_batch) return;
+    if (!w || layer < 0 || layer >= g_sa.nl || !sel || tk <= 0) return;
+    const uint8_t *map = (const uint8_t *)w->vqf_map;
+    if (!map) return;
+    uint64_t go = g_sa.g_off, uo = g_sa.u_off;
+    if (g_sa_alt.map) { map = g_sa_alt.map; go = g_sa_alt.g_off; uo = g_sa_alt.u_off; }
+    uint8_t *R = g_sa.res + (size_t)layer * (size_t)g_sa.rb;
+#define SA_GET(e) ((R[(e) >> 3] >> ((e) & 7)) & 1u)
+#define SA_SET(e) do { R[(e) >> 3] |= (uint8_t)(1u << ((e) & 7)); } while (0)
+#define SA_CLR(e) do { R[(e) >> 3] &= (uint8_t)~(1u << ((e) & 7)); } while (0)
+    /* SELPROBE：进入 sync 时 R 仍是上一 token 的 A_l，可直接算相邻 token 复用率。 */
+    if (g_sa.selprobe) {
+        int hit = 0;
+        for (int j = 0; j < tk; j++) {
+            int e = sel[j];
+            if (e >= 0 && e < g_sa.ne && SA_GET(e)) hit++;
+        }
+        g_sa.sel_hit += hit;
+        g_sa.sel_total += tk;
+        if (layer == g_sa.nl - 1) {
+            fprintf(stderr, "[SA-SELPROBE] tok=%d reuse=%.4f hit=%d total=%d\n",
+                    g_sa.tok, (double)g_sa.sel_hit / (double)g_sa.sel_total,
+                    g_sa.sel_hit, g_sa.sel_total);
+            g_sa.sel_hit = 0; g_sa.sel_total = 0;
+        }
+    }
+    /* order=0（默认）：先驱逐后预取 = 原行为；order=1：先预取（尽早发 IO）后驱逐。
+     * 两序等价：驱逐只碰 R∩¬sel，预取只 SET sel。 */
+    for (int pass = 0; pass < 2; pass++) {
+        int do_pf = g_sa.order ? (pass == 0) : (pass == 1);
+        if (!do_pf) {
+            for (int e = 0; e < g_sa.ne; e++) {         /* 驱逐 R \ A */
+                if (!SA_GET(e)) continue;
+                int keep = 0;
+                for (int j = 0; j < tk; j++) if (sel[j] == e) { keep = 1; break; }
+                if (keep) continue;
+                uint64_t base = (uint64_t)layer * g_sa.layerB + (uint64_t)e * g_sa.expB;
+                vqf_stream_advise_ex(MADV_DONTNEED, go + base,
+                                     go + base + g_sa.expB, map, g_sa.async);
+                vqf_stream_advise_ex(MADV_DONTNEED, uo + base,
+                                     uo + base + g_sa.expB, map, g_sa.async);
+                /* DN_LANE（VLLM_DN_SAPF=1）：down 与 gate/up 共用同一激活集 A_l ⇒ 同一 R 位图。
+                 * lane 布局下每专家 884736B 整页对齐 ⇒ 专家级预取/驱逐 0% 过取
+                 * （行带布局做不到，见 PRE_REG_STREAM_SA §9.2 C6）。 */
+                if (g_sa.dn_sapf && g_sa_alt.dmap && !g_sa.down_keep)
+                    vqf_stream_advise_ex(MADV_DONTNEED, g_sa_alt.d_off + base,
+                                         g_sa_alt.d_off + base + g_sa.expB,
+                                         g_sa_alt.dmap, g_sa.async);
+                SA_CLR(e);
+            }
+        } else {
+            const int pfa = g_sa.bigrd ? VQF_ADV_PF_BIG : MADV_WILLNEED;
+            for (int j = 0; j < tk; j++) {              /* 预取 A（0% 过取） */
+                int e = sel[j];
+                if (e < 0 || e >= g_sa.ne || SA_GET(e)) continue;
+                uint64_t base = (uint64_t)layer * g_sa.layerB + (uint64_t)e * g_sa.expB;
+                if (g_sa.pf_gu) {
+                    vqf_stream_advise_ex(pfa, go + base,
+                                         go + base + g_sa.expB, map, g_sa.async);
+                    vqf_stream_advise_ex(pfa, uo + base,
+                                         uo + base + g_sa.expB, map, g_sa.async);
+                }
+                if (g_sa.pf_dn && g_sa.dn_sapf && g_sa_alt.dmap && !g_sa.down_keep)
+                    vqf_stream_advise_ex(pfa, g_sa_alt.d_off + base,
+                                         g_sa_alt.d_off + base + g_sa.expB,
+                                         g_sa_alt.dmap, g_sa.async);
+                SA_SET(e);
+            }
+        }
+    }
+#undef SA_GET
+#undef SA_SET
+#undef SA_CLR
+    g_sa.warm = 1;   /* 本 token 已同步 ⇒ 后续层入口可跳过 gate/up 的整层驱逐 */
+}
+
+/* 层尾驱逐（VLLM_SA_EVL=1，默认关；见 docs/PRE_REG_STREAM_SA.txt §8）：
+ * 进入 layer l 时，把「上一层已用完的激活集」R_{evict_l} 的 gate/up 段**真正丢掉**
+ * 并清空 R_{evict_l}。目的 = 目标 B「紧致」：把 decode 期驻留从「48 层各自的激活集
+ * 之并（≈648 MiB）」压到「单层瞬时」。代价 = 相邻 token 若选中同一专家不再命中，
+ * 每 token 必然重 fault 全部激活段（内存换带宽）。只改 madvise ⇒ 浮点序零改动、A≡C。 */
+static void vqf_sa_evict_layer(const STModelWeights *w, int layer) {
+    if (!g_sa.active || !g_sa.evl) return;
+    if (!w || layer < 0 || layer >= g_sa.nl) return;
+    const uint8_t *map = (const uint8_t *)w->vqf_map;
+    if (!map) return;
+    uint64_t go = g_sa.g_off, uo = g_sa.u_off;
+    if (g_sa_alt.map) { map = g_sa_alt.map; go = g_sa_alt.g_off; uo = g_sa_alt.u_off; }
+    uint8_t *R = g_sa.res + (size_t)layer * (size_t)g_sa.rb;
+    for (int e = 0; e < g_sa.ne; e++) {
+        if (!((R[e >> 3] >> (e & 7)) & 1u)) continue;
+        uint64_t base = (uint64_t)layer * g_sa.layerB + (uint64_t)e * g_sa.expB;
+        vqf_stream_advise(MADV_DONTNEED, go + base,
+                          go + base + g_sa.expB, map);
+        vqf_stream_advise(MADV_DONTNEED, uo + base,
+                          uo + base + g_sa.expB, map);
+    }
+    memset(R, 0, (size_t)g_sa.rb);
+}
+
+/* 层循环钩子：进入 layer 时调用。
+ *   keep=1：逐出 layer-1 → 任意时刻 ≈ 当前层 + 预读窗；
+ *   keep=N：逐出 layer-N（前 N 层仍常驻）。
+ * 幂等/无副作用：未启用、模型换载、Windows 下直接返回。 */
+void vqf_stream_layer_advance(STModelWeights *w, int layer) {
+    const void *map = g_vqf_stream.map;
+    if (!map) return;
+    if (!w || w->vqf_map != map) { g_vqf_stream.map = NULL; return; }
+    if (g_ew.active) { vqf_ew_layer(w, layer); return; }   /* 专家窗口优先 */
+    int nl = g_vqf_stream.nl, keep = g_vqf_stream.keep, nseg = g_vqf_stream.nseg;
+    if (nl <= 0 || nseg <= 0 || keep <= 0) return;
+
+    /* 方向 E 探针（默认 0 = 逐字节现状）：只改 madvise 的区间与切分。 */
+    int probe = vqf_stream_probe_mode();
+    vqf_stream_probe_attest(probe, nl, nseg);
+
+    /* DN_LANE：源 down 段的每层字节（= layerB）。down sidecar 的驱逐/预读按同一粒度镜像，
+     * 且不依赖 VLLM_SA 是否开启（g_sa.layerB 只在 VLLM_SA=1 时才填）。 */
+    uint64_t dn_segB = 0;
+    if (g_sa_alt.dmap)
+        for (int s = 0; s < nseg; s++)
+            if (g_vqf_stream.seg[s].kind == 2) { dn_segB = g_vqf_stream.seg[s].step; break; }
+
+    int evict_l = layer - keep;
+    if (probe != 2 && evict_l >= 0 && evict_l < nl) {
+        /* 形态 A + 层尾驱逐（VLLM_SA_EVL=1，默认关）：先把上一层用完的激活集真正丢掉，
+         * 再把 R_{evict_l} 清空 ⇒ 层入口对 gate/up 的 continue 不会留下残留。 */
+        if (g_sa.active && g_sa.warm) vqf_sa_evict_layer(w, evict_l);
+        for (int s = 0; s < nseg; s++) {
+            if (probe == 3 && g_vqf_stream.seg[s].is_expert) continue;   /* L3：区间→0 */
+            if (g_sa.active && g_sa.warm) {           /* 形态 A（默认关；prefill 期 warm=0） */
+                int kd = g_vqf_stream.seg[s].kind;
+                if (kd == 1) continue;                /* gate/up：改由选路后按 R_l\A 驱逐 */
+                if (kd == 2 && g_sa.down_keep) continue;   /* D2：down 完全不动 */
+            }
+            uint64_t lo = g_vqf_stream.seg[s].off +
+                          (uint64_t)evict_l * g_vqf_stream.seg[s].step;
+            vqf_stream_advise_gran(probe, MADV_DONTNEED, lo,
+                                   lo + g_vqf_stream.seg[s].step, map);
+        }
+        /* DN_LANE：down 的整层驱逐镜像到 down sidecar（sidecar 页不在源 seg 表里，
+         * 不镜像就会永久驻留 ⇒ 5.06 GiB 常驻，与分层驻留目标相悖）。
+         * 语义与源 down 段保持一致：仅在不配合 down_keep 时驱逐。
+         * VLLM_DN_SAPF=1 时 decode 期改由 vqf_sa_sync_token 按专家级处理（此处跳过）。 */
+        if (dn_segB && !(g_sa.active && g_sa.down_keep)
+            && !(g_sa.active && g_sa.warm && g_sa.dn_sapf)) {
+            uint64_t dlo = g_sa_alt.d_off + (uint64_t)evict_l * dn_segB;
+            vqf_stream_advise(MADV_DONTNEED, dlo, dlo + dn_segB, g_sa_alt.dmap);
+        }
+#ifndef _WIN32
+        /* COLD 档：连带丢弃页缓存（posix_fadvise DONTNEED），使驱逐后的再
+         * 访问必须从 eMMC 真正重读 → 度量"数据来源换盘"的最坏代价。
+         * （探针档不使用 COLD；此处保持原语义。） */
+        if (g_vqf_stream.cold && g_vqf_stream.fd >= 0) {
+            long ps = sysconf(_SC_PAGESIZE);
+            if (ps <= 0) ps = 4096;
+            uintptr_t psz = (uintptr_t)ps;
+            for (int s = 0; s < nseg; s++) {
+                uint64_t lo = g_vqf_stream.seg[s].off +
+                              (uint64_t)evict_l * g_vqf_stream.seg[s].step;
+                uint64_t hi = lo + g_vqf_stream.seg[s].step;
+                uintptr_t a = (uintptr_t)lo / psz * psz;
+                uintptr_t b = ((uintptr_t)hi + psz - 1) / psz * psz;
+                if (b > a)
+                    posix_fadvise(g_vqf_stream.fd, (off_t)a, (off_t)(b - a),
+                                  POSIX_FADV_DONTNEED);
+            }
+        }
+#endif
+    }
+    if (probe != 1 && layer + 1 < nl) {
+        for (int s = 0; s < nseg; s++) {
+            if (probe == 3 && g_vqf_stream.seg[s].is_expert) continue;   /* L3：区间→0 */
+            if (g_sa.active && g_sa.warm && g_vqf_stream.seg[s].kind != 0) continue;  /* 形态 A：专家段不预读 */
+            uint64_t lo = g_vqf_stream.seg[s].off +
+                          (uint64_t)(layer + 1) * g_vqf_stream.seg[s].step;
+            vqf_stream_advise_gran(probe, MADV_WILLNEED, lo,
+                                   lo + g_vqf_stream.seg[s].step, map);
+        }
+        /* DN_LANE：down sidecar 的层预读镜像。规则与源 down 段一致——
+         * 形态 A 同步期（SA active && warm）不预读专家段；探针 L3（区间→0）不预读。 */
+        if (dn_segB && !(g_sa.active && g_sa.warm) && probe != 3) {
+            uint64_t dlo = g_sa_alt.d_off + (uint64_t)(layer + 1) * dn_segB;
+            vqf_stream_advise(MADV_WILLNEED, dlo, dlo + dn_segB, g_sa_alt.dmap);
+        }
+    }
+
+    vqf_sa_stat_tick(layer);   /* 形态 A 诊断（VLLM_SA_STAT=1）：每 token 一次建页量 */
+
+    if (g_vqf_stream.log) {
+        int evict_l = layer - keep;
+        if (layer == 0 || layer == nl - 1 || layer % 4 == 0) {
+            fprintf(stderr, "[VQF-STREAM] l=%d/%d keep=%d evict_l=%d "
+                            "rss=%ldkB per-layer=%.1fMB\n",
+                    layer, nl, keep, evict_l, vqf_stream_rss_kb_impl(),
+                    g_vqf_stream.per_layer / 1048576.0);
+        }
+    }
+}
+
+/* ================================================================
+ * 选路后专家预取（gate-first，VLLM_EW_PREFETCH=1）——仅明文 VQF q4_4x4
+ *
+ * 动机：EW 分层驻留下，本层冷专家页在层入口被 DONTNEED 逐出，FFN 要等
+ * top-k 选路后才确定读哪 8 个专家 → 若等并行 worker 逐页访问再 fault，缺页
+ * 延迟全部落在 gate/up 计算关键路径上（§10.22 结论：gu 已由计算型转为缺页/
+ * 带宽主导）。本钩子在选路（top-k + softmax）完成后立刻对"本层实际选中"的
+ * 页发 WILLNEED，让缺页重驻与下方并行 gu 计算（≈11ms/层）重叠：
+ *   - gate/up：每个选中专家整段（expB 连续、216 页整页对齐）→ 2×tk 次提示；
+ *     预取字节 100% 被 gu 消费（0% 过取，推荐默认档）。
+ *   - down  ：整层列带 1 次提示可选（VLLM_EW_PREFETCH_DOWN=1 才开，默认关）：
+ *     q4 4x4 down 专家沿 4 行组列窗碎片化、页被邻专家共享 → 整层 WILLNEED 约
+ *     3.4× 过取（108MB/层 vs top-8 实际消费 ~30MB），Windows 实测为负收益；
+ *     仅在目标端 async 内核读入（Linux madvise）足够便宜时按需打开。
+ * 原语：Linux = madvise(MADV_WILLNEED)；Windows = PrefetchVirtualMemory（动态
+ * 解析，特权缺失静默降级）。只改页表/页缓存、浮点序零改动 → A≡C 位级一致。
+ * 几何门控同 EW：整层堆叠 + expB 整页对齐；q8 布局 / 加密 VQF 自动拒绝。
+ * ================================================================ */
+typedef struct {
+    const void *map;            /* 已验证的 w->vqf_map（模型换载后失效重解） */
+    const void *tried;          /* 最近一次解析所针对的映射（无论成功与否） */
+    int nl, ne;
+    int log, down;              /* down: 整层 down 带 WILLNEED（默认关） */
+    uint64_t layerB, expB;      /* 每层字节 / 每专家 gate-up 段字节 */
+    uint64_t g_off, u_off, d_off;
+} VQFPF;
+static VQFPF g_pf;
+
+/* 惰性解析几何（首调 / 模型换载后）。失败置空 → 调用侧 no-op。 */
+static void vqf_ffn_prefetch_resolve(const STModelWeights *w) {
+    g_pf.map = NULL;
+    g_pf.tried = w ? w->vqf_map : NULL;   /* 解析结果按映射缓存，避免每次调用重跑 getenv */
+    g_pf.log = 0;
+    g_pf.down = 0;
+    const char *e = getenv("VLLM_EW_PREFETCH");
+    if (!(e && e[0] == '1')) return;              /* 默认关 */
+    const char *lg = getenv("VLLM_EW_PREFETCH_LOG");
+    g_pf.log = (lg && lg[0] == '1');
+    const char *dn = getenv("VLLM_EW_PREFETCH_DOWN");
+    g_pf.down = (dn && dn[0] == '1');             /* 默认仅 gate/up（0 过取） */
+    if (!w || !w->vqf_map || w->vqf_map_len < sizeof(VQFHeader)) return;
+    const VQFHeader *h = (const VQFHeader *)w->vqf_map;
+    if ((h->flags & VQF_FLAG_ENC) || !(h->flags & VQF_FLAG_Q4_4X4)) {
+        if (g_pf.log) fprintf(stderr, "[VQF-PF] REFUSED: 仅明文 q4_4x4 VQF\n");
+        return;
+    }
+    const VQFTensor *G = vqf_ew_find(h, "q4_gate");
+    const VQFTensor *U = vqf_ew_find(h, "q4_up");
+    const VQFTensor *D = vqf_ew_find(h, "q4_down");
+    if (!G || !U || !D) {
+        if (g_pf.log) fprintf(stderr, "[VQF-PF] REFUSED: 无 q4_gate/up/down\n");
+        return;
+    }
+    const VQFArch *a = &h->arch;
+    int nl = (int)a->n_layers, ne = (int)a->n_experts;
+    int me = (int)a->moe_ffn, d = (int)a->dim, ff = (int)a->ffn_dim;
+    uint64_t layerB = vqf_q4_bytes((uint64_t)ff * (uint64_t)d);
+    uint64_t expB   = vqf_q4_bytes((uint64_t)me * (uint64_t)d);
+    if (ne <= 0 || me <= 0 || d <= 0 || ff <= 0 || nl <= 0 ||
+        (uint64_t)ne * me != (uint64_t)ff || (expB & 4095) != 0 ||
+        (uint64_t)G->rows != (uint64_t)nl * ff ||
+        (uint64_t)G->bytes != layerB * nl ||
+        (uint64_t)D->rows != (uint64_t)nl * d) {
+        if (g_pf.log) fprintf(stderr, "[VQF-PF] REFUSED: 几何与整层堆叠假设不符\n");
+        return;
+    }
+    g_pf.map = w->vqf_map; g_pf.nl = nl; g_pf.ne = ne;
+    g_pf.layerB = layerB; g_pf.expB = expB;
+    g_pf.g_off = G->offset; g_pf.u_off = U->offset; g_pf.d_off = D->offset;
+    if (g_pf.log)
+        fprintf(stderr, "[VQF-PF] enabled nl=%d ne=%d exp=%.3fMB(%llu页) "
+                        "down=%d\n",
+                nl, ne, expB / 1048576.0,
+                (unsigned long long)(expB / 4096), g_pf.down);
+}
+
+/* MoE FFN top-k 选路完成后调用（vllm_safetensors.c st_moe_ffn_sparse_q4）。 */
+void vqf_ffn_prefetch(const STModelWeights *w, int layer,
+                      const int *sel, int tk) {
+    if (!w || w->vqf_map != g_pf.tried) vqf_ffn_prefetch_resolve(w);
+    if (!g_pf.map || layer < 0 || layer >= g_pf.nl || !sel || tk <= 0) return;
+    const uint8_t *map = (const uint8_t *)w->vqf_map;
+    const uint64_t lb = (uint64_t)layer * g_pf.layerB;
+    for (int j = 0; j < tk; j++) {
+        int e = sel[j];
+        if (e < 0 || e >= g_pf.ne) continue;
+        const uint64_t eb = (uint64_t)e * g_pf.expB;
+        vqf_stream_advise(MADV_WILLNEED, g_pf.g_off + lb + eb,
+                          g_pf.g_off + lb + eb + g_pf.expB, map);
+        vqf_stream_advise(MADV_WILLNEED, g_pf.u_off + lb + eb,
+                          g_pf.u_off + lb + eb + g_pf.expB, map);
+    }
+    if (g_pf.down)
+        vqf_stream_advise(MADV_WILLNEED, g_pf.d_off + lb,
+                          g_pf.d_off + lb + g_pf.layerB, map);
+    if (g_pf.log && (layer == 0 || layer % 8 == 0 || layer == g_pf.nl - 1)) {
+        fprintf(stderr, "[VQF-PF] l=%d/%d sel0=%d tk=%d rss=%ldkB\n",
+                layer, g_pf.nl, sel[0], tk, vqf_stream_rss_kb_impl());
+    }
+}
+
+/* ================================================================
+ * 运行时驻留控制（serve 内存驻留策略 vllm_res_policy 调用）
+ *
+ * vqf_stream_setup 建好的 seg 表按层覆盖全部可驱逐权重段；本组 API 把
+ * "空闲/内存紧张时从高向低逐层释放、只剩初始层"变成可直接调用的动作：
+ *   1) 只改 PTE（MADV_DONTNEED），页由文件按字节重建 → 推理位级一致不变；
+ *   2) 可逆：升档/再次访问自然缺页回驻，无需显式恢复；
+ *   3) 依赖 setup（明文 VQF + 启动开 VLLM_VQF_STREAM），未启用时为 no-op。
+ * ================================================================ */
+
+int vqf_stream_active(void) {
+    return (g_vqf_stream.map != NULL && g_vqf_stream.nl > 0 &&
+            g_vqf_stream.nseg > 0);
+}
+
+/* 显式释放 layer > keep 的全部权重段物理页（保留 0..keep 层 + embed/lm/
+ * final_norm/vision 等常驻段）。keep=0 即"只剩初始层"，空闲降级的终点档。 */
+void vqf_stream_evict_above(int keep) {
+    const void *map = g_vqf_stream.map;
+    if (!map) return;
+    int nl = g_vqf_stream.nl, nseg = g_vqf_stream.nseg;
+    if (nl <= 0 || nseg <= 0) return;
+    if (keep < 0) keep = 0;
+    if (keep >= nl - 1) return;
+    g_sa.warm = 0;   /* 显式释放后 R_l 记账不再可信 ⇒ 层入口恢复整层驱逐（保守方向） */
+
+    for (int s = 0; s < nseg; s++) {
+        const VQFStreamSeg *sg = &g_vqf_stream.seg[s];
+        for (int l = keep + 1; l < nl; l++) {
+            uint64_t lo = sg->off + (uint64_t)l * sg->step;
+            vqf_stream_advise(MADV_DONTNEED, lo, lo + sg->step, map);
+        }
+    }
+
+    fprintf(stderr, "[VQF-STREAM] runtime evict above layer %d (nl=%d) "
+                    "rss=%ldkB per-layer=%.1fMB\n",
+            keep, nl, vqf_stream_rss_kb_impl(),
+            g_vqf_stream.per_layer / 1048576.0);
+    fflush(stderr);
+}
+
+/* 预读 0..keep 层权重段（MADV_WILLNEED）。升档后的可选加速：缺省不调用
+ * 也可（访问自然缺页回驻，数值不变），供"恢复全驻留"档作为提示性预读。 */
+void vqf_stream_willneed_to(int keep) {
+    const void *map = g_vqf_stream.map;
+    if (!map) return;
+    int nl = g_vqf_stream.nl, nseg = g_vqf_stream.nseg;
+    if (nl <= 0 || nseg <= 0) return;
+    if (keep < 0) keep = 0;
+    if (keep >= nl) keep = nl - 1;
+
+    for (int s = 0; s < nseg; s++) {
+        const VQFStreamSeg *sg = &g_vqf_stream.seg[s];
+        for (int l = 0; l <= keep; l++) {
+            uint64_t lo = sg->off + (uint64_t)l * sg->step;
+            vqf_stream_advise(MADV_WILLNEED, lo, lo + sg->step, map);
+        }
+    }
+
+}
+
+/* ================================================================
+ * EP 专家分片导出（方案 A）—— 稀疏分片，布局与源 VQF 逐字节同构
+ * 方案锚点：资料/分布式专家提取_实施方案.md
+ *
+ * 目标：每个 rank 只需自己那份专家权重（部署/磁盘），并使"专家=可独立分发单元"。
+ *
+ * 关键设计（**引擎零改动**）：分片不是新格式 —— header / directory /
+ * data_offset / file_len / flags / arch 全部照抄源文件，只在数据区**物化本 rank
+ * 拥有的专家字节区间**，其余留空洞：
+ *   - gate/up：每层专家 = `per*me` 连续行 → 字节区间连续，整段搬运；
+ *   - down   ：专家按 32 列块散布在 4 行组内 → 逐行组搬 `cbe*72` 字节；
+ *   - 其余张量（attn/router/embed/lm/norm/vision）整块照抄。
+ * 于是分片是**合法 VQF**：`vqf_load` 与 EP 路径无需任何改动即可加载 —— 它只会读
+ * 到自己 rank 的专家段（已物化），他人的段是空洞（按 rank 过滤，从不被读）。
+ *
+ * 空洞：NTFS 需 FSCTL_SET_SPARSE、ext4 天然稀疏 → 磁盘占用 ≈ 自己的份额。
+ * 传输提示：跨机拷贝须用保留空洞的方式（Linux `cp --sparse=always` / `tar -S`），
+ * `scp` 会把空洞当 0 发送。
+ *
+ * 边界：
+ *   - 仅明文 VQF（加密为 COW 解密语义，拒绝）；
+ *   - 仅处理 q4_gate/q4_up/q4_down（EP 支持的 q4_4x4 轨）；q8_ 与 x8_ 系列若存在
+ *     则整块照抄（分片仍正确，但那部分不省盘）；
+ *   - 源若带 SM2 签名，sig 块照抄但已不对应新内容 → 派生件须自行重签；
+ *   - 尾部 FNV 按分片自身内容重算（与加载器同规则）。
+ * ================================================================ */
+static int shard_seek(FILE *fp, uint64_t off) {
+#ifdef _WIN32
+    return _fseeki64(fp, (long long)off, SEEK_SET);
+#else
+    return fseeko(fp, (off_t)off, SEEK_SET);
+#endif
+}
+
+/* Windows：给输出打稀疏标记，避免"seek 越写越分配"（NTFS 默认非稀疏）。 */
+static int shard_set_sparse(FILE *fp) {
+#ifdef _WIN32
+    intptr_t osf = _get_osfhandle(_fileno(fp));
+    if (osf == -1) return -1;
+    DWORD ret = 0;
+    if (!DeviceIoControl((HANDLE)osf, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &ret, NULL))
+        return -1;
+#else
+    (void)fp;
+#endif
+    return 0;
+}
+
+/* 把 src 的 [src_off, +n) 拷到 out 的 dst_off（分块，避免大缓冲）。 */
+static int shard_copy(FILE *out, uint64_t dst_off, const uint8_t *src,
+                      uint64_t src_off, uint64_t n,
+                      uint8_t *scratch, size_t cap) {
+    uint64_t done = 0;
+    while (done < n) {
+        size_t k = (n - done > (uint64_t)cap) ? cap : (size_t)(n - done);
+        memcpy(scratch, src + src_off + done, k);
+        if (shard_seek(out, dst_off + done) != 0) return -1;
+        if (fwrite(scratch, 1, k, out) != k) return -1;
+        done += k;
+    }
+    return 0;
+}
+
+int vqf_export_ep_shard(const char *src_path, int rank, int nranks, const char *out_path) {
+    printf("[SHARD] 导出 EP 分片: rank=%d/%d\n  src=%s\n  out=%s\n",
+           rank, nranks, src_path, out_path);
+    fflush(stdout);
+
+    st_mmap_t m;
+    if (st_mmap_open(&m, 0, src_path) != 0) {
+        fprintf(stderr, "[SHARD] FAIL: mmap %s\n", src_path);
+        return -1;
+    }
+    const VQFHeader *h = (const VQFHeader *)m.data;
+    FILE *out = NULL;
+    uint8_t *scratch = NULL;
+    int rc = -1;
+    int n_expert_tensors = 0;
+    uint64_t materialized = 0;
+
+    if (m.len < sizeof(VQFHeader) || h->magic != VQF_MAGIC) {
+        fprintf(stderr, "[SHARD] FAIL: 非 VQF（magic 不符）\n"); goto done;
+    }
+    if (h->flags & VQF_FLAG_ENC) {
+        fprintf(stderr, "[SHARD] FAIL: 加密 VQF 不支持分片\n"); goto done;
+    }
+    const VQFArch *a = &h->arch;
+    int ne = (int)a->n_experts, me = (int)a->moe_ffn, d = (int)a->dim;
+    int ff = (int)a->ffn_dim, nl = (int)a->n_layers;
+    if (ne <= 0 || me <= 0 || d <= 0 || ff <= 0 || nl <= 0 ||
+        (uint64_t)ne * (uint64_t)me != (uint64_t)ff) {
+        fprintf(stderr, "[SHARD] FAIL: 非 MoE 或 arch 几何不成立\n"); goto done;
+    }
+    if (nranks < 1 || rank < 0 || rank >= nranks || (ne % nranks) != 0) {
+        fprintf(stderr, "[SHARD] FAIL: rank=%d/nranks=%d 非法（须整除 ne=%d）\n",
+                rank, nranks, ne); goto done;
+    }
+    if ((me & 31) || (d & 31)) {
+        fprintf(stderr, "[SHARD] FAIL: 几何不满足 32 列块对齐\n"); goto done;
+    }
+
+    int per = ne / nranks;
+    uint64_t layerB = (uint64_t)Q4_BYTES((uint64_t)ff * (uint64_t)d);
+    uint64_t expB   = (uint64_t)Q4_BYTES((uint64_t)per * (uint64_t)me * (uint64_t)d);
+    uint64_t gdB    = (uint64_t)(ff >> 5) * 72;               /* down：4 行组跨度 */
+    uint64_t cbeRun = (uint64_t)((per * me) >> 5) * 72;       /* down：本 rank 列块连续长 */
+    uint64_t cb0    = (uint64_t)((rank * per * me) >> 5) * 72;
+    uint64_t expOff = (uint64_t)Q4_BYTES(
+        (uint64_t)rank * (uint64_t)per * (uint64_t)me * (uint64_t)d);
+    size_t dir_off = (sizeof(VQFHeader) + 63) & ~(size_t)63;
+    const VQFTensor *dir = (const VQFTensor *)((const uint8_t *)m.data + dir_off);
+
+    scratch = (uint8_t *)malloc(1u << 20);
+    if (!scratch) { fprintf(stderr, "[SHARD] FAIL: OOM\n"); goto done; }
+    out = st_fopen(out_path, "wb+");
+    if (!out) { fprintf(stderr, "[SHARD] FAIL: 打开输出失败 %s\n", out_path); goto done; }
+    if (shard_set_sparse(out) != 0)
+        fprintf(stderr, "[SHARD] 警告: 稀疏标记失败（磁盘占用可能为全量）\n");
+
+    /* 1) 头 + 目录照抄（保证 data_offset/file_len/flags/arch/version 同构） */
+    if (shard_copy(out, 0, (const uint8_t *)m.data, 0,
+                   (uint64_t)h->data_offset, scratch, 1u << 20) != 0) {
+        fprintf(stderr, "[SHARD] FAIL: 写头部\n"); goto done;
+    }
+    materialized += (uint64_t)h->data_offset;
+
+    /* 2) 逐张量：q4 专家三件只物化本 rank 区间，其余整块照抄 */
+    for (uint32_t i = 0; i < h->n_tensors; i++) {
+        const VQFTensor *t = &dir[i];
+        if ((uint64_t)t->offset + t->bytes > h->file_len) {
+            fprintf(stderr, "[SHARD] FAIL: 张量 %s 越界\n", t->name); goto done;
+        }
+        int is_gate_up = (strcmp(t->name, "q4_gate") == 0 ||
+                          strcmp(t->name, "q4_up") == 0);
+        int is_down    = (strcmp(t->name, "q4_down") == 0);
+        if (is_gate_up) {
+            for (int l = 0; l < nl; l++) {
+                uint64_t off = t->offset + (uint64_t)l * layerB + expOff;
+                if (shard_copy(out, off, (const uint8_t *)m.data, off, expB,
+                               scratch, 1u << 20) != 0) {
+                    fprintf(stderr, "[SHARD] FAIL: 写 %s l=%d\n", t->name, l); goto done;
+                }
+            }
+            materialized += (uint64_t)nl * expB;
+            n_expert_tensors++;
+        } else if (is_down) {
+            for (int l = 0; l < nl; l++) {
+                uint64_t lb = t->offset + (uint64_t)l * layerB;
+                for (int rg = 0; rg < (d >> 2); rg++) {
+                    uint64_t off = lb + (uint64_t)rg * gdB + cb0;
+                    if (shard_copy(out, off, (const uint8_t *)m.data, off, cbeRun,
+                                   scratch, 1u << 20) != 0) {
+                        fprintf(stderr, "[SHARD] FAIL: 写 q4_down l=%d rg=%d\n", l, rg);
+                        goto done;
+                    }
+                }
+            }
+            materialized += (uint64_t)nl * (uint64_t)(d >> 2) * cbeRun;
+            n_expert_tensors++;
+        } else {
+            if (shard_copy(out, t->offset, (const uint8_t *)m.data, t->offset,
+                           t->bytes, scratch, 1u << 20) != 0) {
+                fprintf(stderr, "[SHARD] FAIL: 写 %s\n", t->name); goto done;
+            }
+            materialized += t->bytes;
+        }
+    }
+
+    /* 3) 尾部 FNV-1a（覆盖目录 + 数据区，与加载器同规则）：从分片自身回读，
+     *    空洞读作 0，与引擎 VLLM_VQF_CHECK=1 的校验口径一致。 */
+    {
+        uint64_t fnv = 0xcbf29ce484222325ull;
+        fnv = vqf_fnv_update(fnv, (const uint8_t *)m.data + dir_off,
+                             (size_t)h->n_tensors * sizeof(VQFTensor));
+        uint64_t total = h->file_len - h->data_offset;
+        uint64_t done = 0;
+        while (done < total) {
+            size_t k = (total - done > (uint64_t)(1u << 20)) ? (1u << 20)
+                                                            : (size_t)(total - done);
+            if (shard_seek(out, h->data_offset + done) != 0) {
+                fprintf(stderr, "[SHARD] FAIL: FNV seek\n"); goto done;
+            }
+            if (fread(scratch, 1, k, out) != k) {
+                fprintf(stderr, "[SHARD] FAIL: FNV 回读\n"); goto done;
+            }
+            fnv = vqf_fnv_update(fnv, scratch, k);
+            done += k;
+        }
+        if (shard_seek(out, h->file_len) != 0 ||
+            fwrite(&fnv, 1, sizeof(fnv), out) != sizeof(fnv)) {
+            fprintf(stderr, "[SHARD] FAIL: 写尾部 FNV\n"); goto done;
+        }
+        materialized += sizeof(fnv);
+    }
+
+    printf("[SHARD] OK: 专家张量 %d 个已切片；物化 %.2f GiB / 逻辑 %.2f GiB "
+           "（稀疏空洞 %.2f GiB 不占盘）\n",
+           n_expert_tensors,
+           (double)materialized / 1073741824.0,
+           (double)(h->file_len + 8) / 1073741824.0,
+           (double)(h->file_len + 8 - materialized) / 1073741824.0);
+    printf("[SHARD] 几何: ne=%d per=%d me=%d d=%d nl=%d；expB=%.3f MB，"
+           "down 列带 run=%llu B stride=%llu B\n",
+           ne, per, me, d, nl, (double)expB / 1048576.0,
+           (unsigned long long)cbeRun, (unsigned long long)gdB);
+    fflush(stdout);
+    rc = 0;
+
+done:
+    if (out) fclose(out);
+    free(scratch);
+    st_mmap_close(&m);
+    return rc;
+}
