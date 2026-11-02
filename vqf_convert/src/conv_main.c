@@ -1273,6 +1273,21 @@ fail:
     return 1;
 }
 
+/* 输出头部自检：转换返回 0 但 header 未定稿（file_len=0）说明写出中途失败，
+ * 典型原因是 safetensors 分片缺失/被截断（曾出现 curl 中断导致 4MB 残片）。
+ * 这种文件引擎会以 "header layout undetermined" 拒绝加载，所以在转换期就拦下。 */
+static int verify_vqf_header(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    VQFHeader h;
+    int got = (int)fread(&h, 1, sizeof(h), f);
+    fclose(f);
+    if (got != (int)sizeof(h)) return -1;
+    if (h.magic != VQF_MAGIC) return -2;
+    if (h.file_len == 0) return -3;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL, *out = NULL;
     int stream = 0;
@@ -1311,5 +1326,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: vqf_convert --model <dir> --convert-vqf <out.vqf> [--stream] [--wmode ...]\n");
         return 2;
     }
-    return stream ? run_convert_stream(model_dir, out) : run_convert(model_dir, out);
+    int rc = stream ? run_convert_stream(model_dir, out) : run_convert(model_dir, out);
+    if (rc == 0) {
+        int vr = verify_vqf_header(out);
+        if (vr != 0) {
+            fprintf(stderr, "[conv] ERROR: 输出 VQF 头部校验失败(code=%d) %s；"
+                            "常见原因是 safetensors 分片不完整/被截断。已删除该文件。\n", vr, out);
+            remove(out);
+            return 1;
+        }
+    }
+    return rc;
 }

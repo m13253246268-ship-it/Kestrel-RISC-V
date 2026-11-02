@@ -730,13 +730,33 @@ static int greedy_argmax(const float *logits, int vocab) {
     return bid;
 }
 
+/* byte-level BPE「引擎词表域」→ 真实字节。引擎域只把 <=0x20 的字节转义为
+ * U+0100+b（见 docs/模型适配.md），其余字节（含 ġ/ı/Ł 等 UTF-8 原文）原样，
+ * 所以只还原空白类标记：Ġ(C4 A0)→空格、Ċ(C4 8A)→换行、ĉ(C4 89)→\t。
+ * 其他 C4 xx（如捷克语 č=C4 8D）与真实拉丁扩展字符同码，保留原样不动。
+ * CLI 输出必须做此转换，否则文本里出现字面量 "Ġ"/"Ċ"。 */
+static int detok_markers(const char *src, char *dst, int cap) {
+    const unsigned char *u = (const unsigned char *)src;
+    int n = (int)strlen(src), w = 0;
+    for (int i = 0; i < n && w < cap - 1; i++) {
+        if (u[i] == 0xC4 && i + 1 < n) {
+            unsigned char c = u[i + 1];
+            char r = c == 0xA0 ? ' ' : c == 0x8A ? '\n' : c == 0x89 ? '\t' : 0;
+            if (r) { dst[w++] = r; i++; continue; }
+        }
+        dst[w++] = (char)u[i];
+    }
+    dst[w] = '\0';
+    return w;
+}
+
 static void append_tok_str(char *buf, int *pos, int cap, QwenTokenizer *tok, int id) {
     const char *s = qwen_tokenizer_decode(tok, id);
     if (!s || !s[0]) return;
-    const char *p = ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0xA0) ? s + 2 : s;
-    int len = (int)strlen(p);
+    char piece[256];
+    int len = detok_markers(s, piece, (int)sizeof(piece));
     if (*pos + len < cap - 1) {
-        memcpy(buf + *pos, p, len);
+        memcpy(buf + *pos, piece, len);
         *pos += len;
     }
 }
@@ -796,6 +816,18 @@ static const char *G_JOBS[] = {
  * Averaging over ~14 tokens restores the 1.0645/0.9076 spread to noise. */
 #define REFERENCE_TEXT  "Zara's favorite food is ramen, and her favorite color is teal."
 #define REFERENCE_KEY   "ramen"
+
+/* needle 判定不区分大小写（"Ramen" 句首大写也算命中）；Windows 无 strcasestr。 */
+static int needle_hit(const char *s) {
+    const char *k = REFERENCE_KEY;
+    size_t n = strlen(k);
+    for (; *s; s++) {
+        size_t i = 0;
+        while (i < n && s[i] && (s[i] | 0x20) == k[i]) i++;
+        if (i == n) return 1;
+    }
+    return 0;
+}
 
 /* --longctx-corpus 的 lazy 构建：把指定文件按顺序 tokenize 成一条连续 token 流。
  * 打不开/为空则置 g_corpus_bad，调用方回退模板路径（不静默产出错误结果）。 */
@@ -1618,7 +1650,7 @@ static void test_longctx_quality_ab(STModelWeights *w, const STModelConfig *cfg,
                  * prefill 产出（最后一个 prompt token 的精确注意力），后续才是
                  * decode 自己捞的 —— 两者混在一起会把"prefill 兜住"误判成
                  * "decode 选块对"，必须分开报。 */
-                if (got_at < 0 && strstr(buf_out, REFERENCE_KEY)) got_at = t;
+                if (got_at < 0 && needle_hit(buf_out)) got_at = t;
                 st_qwen_model_forward(&ist, id);
             }
             QueryPerformanceCounter(&t1);
@@ -1658,7 +1690,7 @@ static void test_longctx_quality_ab(STModelWeights *w, const STModelConfig *cfg,
             }
         }
         st_ndl_trace_report();
-        got = strstr(buf_out, REFERENCE_KEY) != NULL;
+        got = needle_hit(buf_out);
         fprintf(stderr, "[STAGE] greedy done\n"); fflush(stderr);
 
         memcpy(ist.cache_len,    saved_cache_len, (size_t)nl * sizeof(int));
@@ -2492,6 +2524,7 @@ static void test_performance_benchmark(void) {
         }
         double decode_sec = (double)(t_end.QuadPart - t_start.QuadPart) / (double)freq.QuadPart;
         output[out_len] = '\0';
+        detok_markers(output, output, 4096);
 
         double tpot = gen_tokens > 0 ? decode_sec / gen_tokens * 1000.0 : 0.0;
         double tok_per_sec = gen_tokens > 0 ? gen_tokens / decode_sec : 0.0;
@@ -4190,6 +4223,7 @@ static int run_stream_test(const char *model_dir, int n_tokens) {
         fflush(stdout);
     }
     output[out_len] = '\0';
+    detok_markers(output, output, 4096);
     printf("\n[STREAM] decoded %d tokens, %.0f ms/tok (%.2f tok/s)\n",
            gen, t_dec_all / (gen > 0 ? gen : 1) * 1000.0,
            gen / (t_dec_all > 0 ? t_dec_all : 1e-9));

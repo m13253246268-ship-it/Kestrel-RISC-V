@@ -94,13 +94,18 @@ typedef struct vllm_tp_worker {
     int slot;    /* 0..nworkers-1 */
     volatile long asleep;   /* 1 while parked on the event (hot-path hint) */
     long last_gen;          /* 最后已执行过的 job_gen（代际不变量防护） */
+    volatile long gen;      /* 本 worker 应执行的 job 代号；只有参与者被推进 */
 } vllm_tp_worker;
 
 typedef struct vllm_tp {
     volatile int running;
     volatile long job_gen;
     volatile long done;              /* workers finished current job */
-    volatile int  kind;              /* 0 idle, 1 parfor, 2 parcall */
+    volatile int  kind;              /* 0 idle, 1 parfor, 2 parcall, 3 parfor_dyn */
+    volatile int  dyn_next;          /* kind 3: next unclaimed index */
+    int dyn_end, dyn_grain;
+    int active;                      /* parfor/parfor_dyn 参与线程上限（含调用者），0=全部 */
+    int np_cur;                      /* 当前 job 参与的 worker 数（slot 0..np_cur-1） */
     void (*body)(void *ctx, int idx);
     void (*pfn)(void *ctx);
     void *ctx;
@@ -176,6 +181,17 @@ static void tp_unbind_caller(void) {
 #endif
 }
 
+/* kind 3: claim `grain` indices at a time until the range is exhausted */
+static void tp_dyn_run(vllm_tp *g) {
+    const int end = g->dyn_end, gr = g->dyn_grain;
+    for (;;) {
+        int lo = __sync_fetch_and_add(&g->dyn_next, gr);
+        if (lo >= end) break;
+        int hi = lo + gr < end ? lo + gr : end;
+        for (int i = lo; i < hi; i++) g->body(g->ctx, i);
+    }
+}
+
 /* ---- worker main ----------------------------------------------------- */
 static void *tp_worker_main(void *arg)
 {
@@ -186,7 +202,7 @@ static void *tp_worker_main(void *arg)
     long last = 0;
     for (;;) {
         long spins = 0;
-        while (g->job_gen == last) {
+        while (w->gen == last) {
             if (++spins > g_spin_iters) {
                 /* Park: publish the asleep flag, re-check the generation, then
                  * wait. The caller only signals workers whose asleep flag is
@@ -202,14 +218,14 @@ static void *tp_worker_main(void *arg)
                  * timeout), it only bounds the worst-case wake latency. */
                 w->asleep = 1;
                 tp_barrier();
-                if (g->job_gen != last) { w->asleep = 0; break; }
+                if (w->gen != last) { w->asleep = 0; break; }
                 if (g->running) return 0;
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_nsec += 50 * 1000000L;
                 if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
                 pthread_mutex_lock(&w->mu);
-                while (g->job_gen == last && !g->running)
+                while (w->gen == last && !g->running)
                     pthread_cond_timedwait(&w->cv, &w->mu, &ts);
                 pthread_mutex_unlock(&w->mu);
                 w->asleep = 0;
@@ -223,7 +239,7 @@ static void *tp_worker_main(void *arg)
             tp_pause();
         }
         if (g->running) return 0;
-        long gen = g->job_gen;
+        long gen = w->gen;
         tp_barrier();                 /* acquire: job descriptor visible */
         int k = g->kind;
         if (gen <= w->last_gen) {
@@ -244,6 +260,8 @@ static void *tp_worker_main(void *arg)
             for (int i = lo; i < hi; i++) g->body(g->ctx, i);
         } else if (k == 2) {
             g->pfn(g->ctx);
+        } else if (k == 3) {
+            tp_dyn_run(g);
         }
         /* Order matters: publish `last = gen` BEFORE signalling done. If the
          * caller finishes its join (done == nworkers), resets done and
@@ -263,7 +281,7 @@ static void *tp_worker_main(void *arg)
 /* ---- wake helper ----------------------------------------------------- */
 static void tp_wake_workers(vllm_tp *g) {
     tp_barrier();                       /* make asleep flags stable */
-    for (int t = 0; t < g->nworkers; t++) {
+    for (int t = 0; t < g->np_cur; t++) {
         /* Only signal parked workers. A spinning worker sees the bumped
          * job_gen itself, and an unconditional SetEvent would leave its
          * auto-reset event signaled: when the worker later spins out and
@@ -279,8 +297,18 @@ static void tp_wake_workers(vllm_tp *g) {
     }
 }
 
+/* 发布一个 job 给 worker 0..np-1：只推进参与者的 w->gen，被排除的 worker
+ * 看不到新代号，继续休眠，也不计入 join。调用前 job 描述字段须已写好。 */
+static void tp_publish(vllm_tp *g, int np) {
+    g->np_cur = np;
+    tp_barrier();                       /* publish fields before gen bump */
+    long gen = ++g->job_gen;            /* 只有调用者写 job_gen */
+    for (int t = 0; t < np; t++) g->w[t].gen = gen;
+    tp_wake_workers(g);
+}
+
 static void tp_join_workers(vllm_tp *g) {
-    long nw = g->nworkers;
+    long nw = g->np_cur;
     long spins = 0, yields = 0, force = 0;
     while (g->done < nw) {
         if (++spins > VLLM_TP_JOIN_SPIN) {
@@ -412,11 +440,15 @@ void vllm_tp_parfor(int start, int end,
         return;
     }
     int nt = g->nthreads;
+    /* active 上限：只把区间分给 worker 0..na-2 + 调用者（slot nt-1），其余 worker 不发布、不唤醒。
+     * 每个 idx 仍由某一线程完整执行，结果与切分方式无关 */
+    int na = (g->active > 0 && g->active < nt) ? g->active : nt;
     int n = end - start;
-    int base = n / nt, rem = n % nt;
+    int base = n / na, rem = n % na;
     int acc = 0;
     for (int t = 0; t < nt; t++) {
-        int len = base + (t < rem);
+        int a = (t < na - 1) ? t : (t == nt - 1 ? na - 1 : -1);
+        int len = a < 0 ? 0 : base + (a < rem);
         g->chunk_lo[t] = start + acc;
         g->chunk_hi[t] = start + acc + len;
         acc += len;
@@ -424,9 +456,7 @@ void vllm_tp_parfor(int start, int end,
     g->body = body;
     g->ctx = ctx;
     g->kind = 1;
-    tp_barrier();                     /* publish fields before gen bump */
-    tp_atomic_inc(&g->job_gen);
-    tp_wake_workers(g);
+    tp_publish(g, na - 1);
     /* caller takes the last chunk (slot nt-1), pinned to its own CPU so the
      * spinning workers cannot starve it */
     int old = t_tid;
@@ -439,6 +469,39 @@ void vllm_tp_parfor(int start, int end,
     t_tid = old;
 }
 
+void vllm_tp_parfor_dyn(int start, int end, int grain,
+                        void (*body)(void *ctx, int idx), void *ctx) {
+    vllm_tp *g = g_tp;
+    if (!g) { vllm_tp_init(0); g = g_tp; }
+    if (!g || g->nthreads <= 1 || end <= start || t_tid >= 0) {
+        if (body) for (int i = start; i < end; i++) body(ctx, i);
+        return;
+    }
+    g->body = body;
+    g->ctx = ctx;
+    g->dyn_next = start;
+    g->dyn_end = end;
+    g->dyn_grain = grain > 0 ? grain : 1;
+    g->kind = 3;
+    tp_publish(g, (g->active > 0 && g->active < g->nthreads) ? g->active - 1 : g->nworkers);
+    int old = t_tid;
+    t_tid = g->nthreads - 1;
+    tp_bind_caller();
+    tp_dyn_run(g);
+    tp_join_workers(g);
+    tp_unbind_caller();
+    t_tid = old;
+}
+
+int vllm_tp_set_active(int n) {
+    vllm_tp *g = g_tp;
+    if (!g) { vllm_tp_init(0); g = g_tp; }
+    if (!g) return 0;
+    int old = g->active;
+    g->active = n > 0 ? n : 0;
+    return old;
+}
+
 void vllm_tp_parcall(void (*fn)(void *ctx), void *ctx) {
     vllm_tp *g = g_tp;
     if (!g) { vllm_tp_init(0); g = g_tp; }
@@ -449,9 +512,7 @@ void vllm_tp_parcall(void (*fn)(void *ctx), void *ctx) {
     g->pfn = fn;
     g->ctx = ctx;
     g->kind = 2;
-    tp_barrier();
-    tp_atomic_inc(&g->job_gen);
-    tp_wake_workers(g);
+    tp_publish(g, g->nworkers);       /* parcall 按 slot 分工，始终全员 */
     int old = t_tid;
     t_tid = g->nthreads - 1;
     tp_bind_caller();
@@ -474,9 +535,7 @@ void vllm_tp_shutdown(void) {
     g->body = NULL;
     g->pfn = NULL;
     g->running = 1;
-    tp_barrier();
-    tp_atomic_inc(&g->job_gen);       /* wake any sleeping worker */
-    tp_wake_workers(g);
+    tp_publish(g, g->nworkers);       /* wake every worker so it sees running */
     for (int t = 0; t < g->nworkers; t++) {
         vllm_tp_worker *w = &g->w[t];
         if (w->th) { pthread_join(w->th, NULL); w->th = 0; }

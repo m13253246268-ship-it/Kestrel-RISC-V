@@ -1,0 +1,43 @@
+set -u
+B=/root/kv/kestrel_vllm_riscv/build-riscv/vllm_kestrel
+M=/root/kv/models
+G=$M/gguf
+O=/tmp/final4; mkdir -p $O
+echo "BIN md5=$(md5sum $B | cut -d' ' -f1)"
+echo "START load=$(cut -d' ' -f1-3 /proc/loadavg)"
+
+ids() { grep -E 'TOKIDS' "$1" | head -1 | sed 's/\[.*TOKIDS: *//' | sed 's/\[.*//' | sed 's/ t=.*//' \
+        | tr -s ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ',' | md5sum | cut -c1-8; }
+steady() { awk '/ t=[0-9]+ ms=/{t=0;ms=0;
+             for(i=1;i<=NF;i++){if($i~/^t=/){t=substr($i,3)+0} if($i~/^ms=/){ms=substr($i,4)+0}}
+             if(t>=2){s+=ms;n++}} END{printf "%.1f", (n?s/n:0)}' "$1"; }
+pf() { grep -oE 'prefill [0-9]+ tokens in [0-9.]+s \([0-9]+ tok/s\)' "$1" | grep -oE '\([0-9]+ tok/s' | tr -dc '0-9'; }
+
+ours() {
+  local X=$1 CTX=$2
+  local F=$O/ours-$X-c$CTX.log
+  taskset -c 0-3 env VLLM_Q4_VMADOT=1 VLLM_THREADS=4 OMP_NUM_THREADS=4 VLLM_Q4_IME=2 \
+    timeout 3600 $B --stream-test --model $M/Qwen3-$X-col --stream-ctx $CTX --stream-n 32 \
+    --threads 4 --warmup > $F 2>&1
+  printf 'OURS %-5s c%-4s load=%s | pp=%s tok/s | dec=%s ms | ids=%s\n' \
+    "$X" "$CTX" "$(cut -d' ' -f1 /proc/loadavg)" "$(pf $F)" "$(steady $F)" "$(ids $F)"
+}
+lb() {
+  local X=$1 F=$O/lb-$X.log
+  taskset -c 0-3 env OMP_NUM_THREADS=4 timeout 3600 \
+    llama-bench -m "$G/Qwen3-$X-Q4_0.gguf" -p 32,128 -n 32 -t 4 -r 3 -o md > $F 2>&1
+  local R=$(grep -E '\| +(pp32|pp128|tg32) +\|' $F | awk -F'|' '{gsub(/ /,"",$7); gsub(/ /,"",$8); sub(/±.*/,"",$8); printf "%s=%s ", $7, $8}')
+  printf 'OFFICIAL %-5s load=%s | %s| tg_ms=%.1f\n' \
+    "$X" "$(cut -d' ' -f1 /proc/loadavg)" "$R" "$(echo "$R" | sed -n 's/.*tg32=\([0-9.]*\).*/1000\/\1/p' | bc -l)"
+}
+
+for R in 1 2 3; do
+  echo "----- round $R -----"
+  for X in 0.6B 1.7B 4B; do
+    if [ $((R % 2)) = 1 ]; then lb $X; ours $X 32; ours $X 128
+    else ours $X 128; ours $X 32; lb $X; fi
+  done
+  echo "  round $R load=$(cut -d' ' -f1-3 /proc/loadavg)"
+done
+echo "END load=$(cut -d' ' -f1-3 /proc/loadavg)"
+echo FINAL4_END

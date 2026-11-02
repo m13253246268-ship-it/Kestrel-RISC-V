@@ -49,6 +49,16 @@ void vllm_tp_parfor(int start, int end,
 /* Run fn(ctx) on every worker AND the caller (manual per-thread splitting). */
 void vllm_tp_parcall(void (*fn)(void *ctx), void *ctx);
 
+/* Dynamic parfor: threads claim `grain` indices at a time from a shared
+ * atomic counter (tolerates a preempted thread). Only for bodies whose
+ * result per index does not depend on which thread runs it. */
+void vllm_tp_parfor_dyn(int start, int end, int grain,
+                        void (*body)(void *ctx, int idx), void *ctx);
+
+/* Cap the threads (incl. caller) that parfor / parfor_dyn hand work to;
+ * n <= 0 means all. parcall is unaffected. Returns the previous cap. */
+int vllm_tp_set_active(int n);
+
 /* Pool id of the calling thread: workers 0..nworkers-1, caller = nthreads-1
  * inside a parcall/parfor, -1 outside. */
 int vllm_tp_worker_id(void);

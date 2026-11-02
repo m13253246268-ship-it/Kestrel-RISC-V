@@ -1751,6 +1751,8 @@ static void rv_q8_bt4_worker(void *c_, int gi) {
  * ================================================================ */
 /* 线程池线程数：头里只声明了 parfor，这里补上（q4 RVV 内核用） */
 int vllm_tp_threads(void);
+void vllm_tp_parfor_dyn(int start, int end, int grain,
+                        void (*body)(void *ctx, int idx), void *ctx);
 
 /* ================================================================
  * Q4_0（mode1 = 4x4 布局，72B/4 行组）RISC-V RVV 行点积。
@@ -2575,10 +2577,11 @@ static void rv_q4_lane_bt4_worker(void *c_, int ci) {
  * int8 域 MAC 是 vwmacc（int8×int8→int16，16-lane 偶/奇两组），ALU 吞吐 ~2x f32。
  * 数值口径：激活整数量化 → 与 f32 直算非位级等价（T4-1 独立数值路径，PPL 验收）。 */
 
+/* r10：默认开（仅作用于 mode3 列主序模型；lane 模型不经此路径）。VLLM_Q4_INT=0 关闭回标量。 */
 static int rv_q4_int_on(void) {
     const char *e = getenv("VLLM_Q4_INT");
     static int v = -1;
-    if (v < 0) v = (e && e[0] == '1') ? 1 : 0;
+    if (v < 0) v = (e && e[0] == '0') ? 0 : 1;
     return v;
 }
 
@@ -2647,8 +2650,31 @@ static void rv_q4_col_worker(void *c_, int ci) {
                    c->resid ? c->resid + (size_t)ci * 32 : NULL, c->nblk);
 }
 
+/* L-DEC-001 Phase 2：decode M=1 vmadot 开关（VLLM_Q4_VMADOT=1 开；默认关）。
+ * 开启时同样进入 rv_q4_dec_rows（与 VLLM_Q4_DEC=1 同一入口范围：全部单 token mode3 Q4 matvec），
+ * hart0-3 上绑核确认的线程跑 vmadot 单元，其余线程跑 rv_q4_dec_tile；两种单元均与 rv_q4_col_tile 位级一致。
+ * VMADOT=0/未设时 rv_q4_dec_on() 与原实现同值。 */
+static int rv_q4_vm_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_VMADOT"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+/* D1：decode 单 token 新内核开关（VLLM_Q4_DEC=1 开；默认关）。实现见 rv_q4_dec_rows。 */
+static int rv_q4_dec_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_DEC"); v = (e && e[0] == '1') ? 1 : 0; v |= rv_q4_vm_on(); }
+    return v;
+}
+typedef struct { const uint8_t *w; float *out; const float *resid; int rows; } rv_q4_dec_mat;
+static void rv_q4_dec_rows(const rv_q4_dec_mat *m, int nm, const float *x, int n_blocks);
+
 static void rv_q4_col_rows_par(const uint8_t *w, const float *x, float *out,
                                const float *resid, int rows, int n_blocks) {
+    if (rv_q4_dec_on()) {
+        rv_q4_dec_mat m = { w, out, resid, rows };
+        rv_q4_dec_rows(&m, 1, x, n_blocks);
+        return;
+    }
     int ntiles = rows / 32;
     int cols = n_blocks * 32;
     int8_t *xq = (int8_t *)xq_alloc_canary((size_t)cols);
@@ -2663,15 +2689,1000 @@ static void rv_q4_col_rows_par(const uint8_t *w, const float *x, float *out,
     xq_free_canary(xd, (size_t)n_blocks * sizeof(float), "q4c:xd");
 }
 
+/* ---- L-IME-001 A-1：mode3 token 分块内核（r10 起默认开，VLLM_Q4_INTB=0 关闭）----
+ * r10 端到端 A/B（3 轮取 min）：prefill ctx32/128/512 = 1.28x/1.34x/1.33x vs lane；
+ * 质量门放宽至 +4%（r8 Answer PPL +3.7%，needle 5/5）。
+ * 与 rv_q4_col_tile 同数值口径、目标位级一致（VLLM_Q4CHK=1 对拍）：
+ *   - 激活每 token 量化一次（与原逐 token 调用相同的 quantize_row_q8_0_act）；
+ *   - 一个工作项 = 1 个 32 行 tile × 8 个 token：每列权重解包一次，喂 8 个 token；
+ *   - 偶/奇 nibble 用 vslideup 拼成一条 vl=32 的 int8 向量，vwmacc 用满 VLEN=256；
+ *   - 块 scale 每工作项每块只转换一次（原为每 token 一次）。
+ * 浮点运算顺序与 rv_q4_col_tile 逐元素相同：acc += (s*d)*xd，最后 + resid。 */
+#define RV_Q4CB_T 8
+
+static int rv_q4_intb_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_INTB"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+
+typedef struct {
+    const uint8_t *w; const int8_t *xq; const float *xd;
+    float *ob; const float *rb;
+    int rows, nblk, nb, ngrp, scv;
+} rv_q4_colbt_ctx;
+
+/* P3 开关（位级等价，默认开，=0 逃生舱）：QPAR 激活量化按 token 并行；SCV 行 scale 用 vfwcvt 向量转换。
+ * 默认开为用户批准的公理例外：位级 0 失配 + 四组全领先 24~29%，共享主机负载 7~9 下极差无法 <1%。 */
+static int rv_q4_env01(const char *n, int *v) {
+    if (*v < 0) { const char *e = getenv(n); *v = (e && e[0] == '0') ? 0 : 1; }
+    return *v;
+}
+static int rv_q4_qpar_on(void) { static int v = -1; return rv_q4_env01("VLLM_Q4_QPAR", &v); }
+static int rv_q4_scv_on(void)  { static int v = -1; return rv_q4_env01("VLLM_Q4_SCV", &v); }
+
+typedef struct { const float *x; int8_t *q; float *d; int cols, nblk; } rv_q4_qpar_ctx;
+static void rv_q4_qpar_worker(void *c_, int t) {
+    const rv_q4_qpar_ctx *c = (const rv_q4_qpar_ctx *)c_;
+    quantize_row_q8_0_act(c->x + (size_t)t * c->cols, c->q + (size_t)t * c->cols,
+                          c->d + (size_t)t * c->nblk, c->cols);
+}
+
+static void rv_q4_colbt_worker(void *c_, int it) {
+    rv_q4_colbt_ctx *c = (rv_q4_colbt_ctx *)c_;
+    const int ti = it / c->ngrp, g = it % c->ngrp;
+    const int t0 = g * RV_Q4CB_T;
+    const int nt = (c->nb - t0 < RV_Q4CB_T) ? (c->nb - t0) : RV_Q4CB_T;
+    const int cols = c->nblk * 32;
+    const uint8_t *tile = c->w + (size_t)ti * (size_t)c->nblk * 576;
+    const size_t vl = 32, vh = 16;
+    const int8_t *xq[RV_Q4CB_T];
+    const float *xd[RV_Q4CB_T];
+    for (int i = 0; i < RV_Q4CB_T; i++) {
+        int t = t0 + (i < nt ? i : nt - 1);          /* 尾组用最后一个 token 填充，不写回 */
+        xq[i] = c->xq + (size_t)t * cols;
+        xd[i] = c->xd + (size_t)t * c->nblk;
+    }
+    float facc[RV_Q4CB_T][32];
+    vfloat32m4_t fz = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+    for (int i = 0; i < RV_Q4CB_T; i++) __riscv_vse32_v_f32m4(facc[i], fz, vl);
+    const int scv = c->scv;
+
+    for (int b = 0; b < c->nblk; b++) {
+        const uint8_t *sc = tile + (size_t)b * 576;
+        const uint8_t *dt = sc + 64;
+        float s[32];                                  /* lane k<16: 行 2k；lane 16+k: 行 2k+1 */
+        if (scv) {
+            /* zvfhmin vfwcvt.f.f.v（SEW=16）：全部非 NaN f16 与 f16_to_f32_bits 逐位一致（板端 65536 穷举） */
+            __asm__ volatile(
+                ".option push                        \n\t"
+                ".option arch, +zvfhmin              \n\t"
+                "vsetivli zero, 16, e16, m1, ta, ma \n\t"
+                "vlse16.v v8, (%[p]), %[st]          \n\t"
+                "vlse16.v v9, (%[q]), %[st]          \n\t"
+                "vfwcvt.f.f.v v10, v8                \n\t"
+                "vfwcvt.f.f.v v12, v9                \n\t"
+                "vsetivli zero, 16, e32, m2, ta, ma \n\t"
+                "vse32.v v10, (%[o0])                \n\t"
+                "vse32.v v12, (%[o1])                \n\t"
+                ".option pop                         \n\t"
+                :: [p] "r"(sc), [q] "r"(sc + 2), [st] "r"(4L), [o0] "r"(s), [o1] "r"(s + 16)
+                : "memory", "vl", "vtype", "v8", "v9", "v10", "v11", "v12", "v13");
+        } else {
+            for (int k = 0; k < 16; k++) {
+                s[k]      = st_f16scale(sc + (size_t)(2 * k)     * 2);
+                s[16 + k] = st_f16scale(sc + (size_t)(2 * k + 1) * 2);
+            }
+        }
+        vfloat32m4_t vs = __riscv_vle32_v_f32m4(s, vl);
+        vint16m2_t a0 = __riscv_vmv_v_x_i16m2(0, vl), a1 = a0, a2 = a0, a3 = a0,
+                   a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        const size_t xo = (size_t)b * 32;
+        for (int cc = 0; cc < 32; cc++) {
+            vuint8m1_t col = __riscv_vle8_v_u8m1(dt + (size_t)cc * 16, vh);
+            vuint8m1_t lo  = __riscv_vand_vx_u8m1(col, 0x0F, vh);
+            vuint8m1_t hi  = __riscv_vsrl_vx_u8m1(col, 4, vh);
+            vuint8m1_t wv  = __riscv_vslideup_vx_u8m1(lo, hi, 16, vl);
+            vint8m1_t ws   = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vsub_vx_u8m1(wv, 8, vl));
+            a0 = __riscv_vwmacc_vx_i16m2(a0, xq[0][xo + cc], ws, vl);
+            a1 = __riscv_vwmacc_vx_i16m2(a1, xq[1][xo + cc], ws, vl);
+            a2 = __riscv_vwmacc_vx_i16m2(a2, xq[2][xo + cc], ws, vl);
+            a3 = __riscv_vwmacc_vx_i16m2(a3, xq[3][xo + cc], ws, vl);
+            a4 = __riscv_vwmacc_vx_i16m2(a4, xq[4][xo + cc], ws, vl);
+            a5 = __riscv_vwmacc_vx_i16m2(a5, xq[5][xo + cc], ws, vl);
+            a6 = __riscv_vwmacc_vx_i16m2(a6, xq[6][xo + cc], ws, vl);
+            a7 = __riscv_vwmacc_vx_i16m2(a7, xq[7][xo + cc], ws, vl);
+        }
+#define RV_Q4CB_EPI(I, A) do { \
+            vfloat32m4_t d_ = __riscv_vfwcvt_f_x_v_f32m4((A), vl); \
+            vfloat32m4_t f_ = __riscv_vle32_v_f32m4(facc[I], vl); \
+            f_ = __riscv_vfadd_vv_f32m4(f_, __riscv_vfmul_vf_f32m4( \
+                     __riscv_vfmul_vv_f32m4(vs, d_, vl), xd[I][b], vl), vl); \
+            __riscv_vse32_v_f32m4(facc[I], f_, vl); } while (0)
+        RV_Q4CB_EPI(0, a0); RV_Q4CB_EPI(1, a1); RV_Q4CB_EPI(2, a2); RV_Q4CB_EPI(3, a3);
+        RV_Q4CB_EPI(4, a4); RV_Q4CB_EPI(5, a5); RV_Q4CB_EPI(6, a6); RV_Q4CB_EPI(7, a7);
+#undef RV_Q4CB_EPI
+    }
+    for (int i = 0; i < nt; i++) {
+        const size_t t = (size_t)(t0 + i);
+        float *o = c->ob + t * (size_t)c->rows + (size_t)ti * 32;
+        const float *r = c->rb ? c->rb + t * (size_t)c->rows + (size_t)ti * 32 : NULL;
+        for (int k = 0; k < 16; k++) {
+            float e = facc[i][k], od = facc[i][16 + k];
+            if (r) { e = e + r[2 * k]; od = od + r[2 * k + 1]; }
+            o[2 * k] = e; o[2 * k + 1] = od;
+        }
+    }
+}
+
+/* ---- P2：IME vmadot 混合内核（VLLM_Q4_IME=1 混合；=2 仅 IME；默认关）----
+ * K1 的 vmadot 仅 hart0-3 可执行（hart4-7 SIGILL）。工作单元 = 32 行 tile × 8 token（与 colbt 相同），
+ * 全体线程从同一原子计数器动态取单元：slot0-3 绑 hart0-3 走 IME（单元拆成 2×16 行 × 2×4 token），
+ * 其余 slot 走 rv_q4_colbt_worker。绑核后 sched_getcpu()>=4 则该线程退回 colbt。
+ * 权重：mode3 576B/32 行 → IME 288B/16 行，首次使用时重排并按权重指针缓存（4B 约 +2.3GB）。
+ * 浮点顺序与 colbt 相同：F=+0；每块 F = F + ((s*d)*xd)；最后 + resid。块内整数和精确（P1 24 形状 0 失配）。 */
+#include <sched.h>
+static int rv_q4_ime_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_IME"); v = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0; }
+    return v;
+}
+
+#define RV_YS(x) #x
+#define RV_VMADOT(vd, vs1, vs2) \
+    ".insn 4, " RV_YS(0x2b | ((vd) << 7) | (3 << 12) | ((vs1) << 15) | ((vs2) << 20) | (0x71 << 25)) "\n\t"
+static const uint16_t RV_IME_IDX[64] = {
+    0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,  4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,
+    8,8,8,8,9,9,9,9,10,10,10,10,11,11,11,11, 12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15 };
+
+/* 16 行 × 4 token：out[g*16 + r*4 + t] = 行 g*4+r、token t（bench_ime_q4.c ime_q4_tile 原样移植） */
+__attribute__((noinline))
+static void rv_ime_q4_tile(const uint8_t *w, const int8_t *x, const float *xe, int nblk, float *out) {
+    long k = nblk;
+    __asm__ volatile(
+        ".option push                          \n\t"
+        ".option arch, +zvfhmin                \n\t"
+        "vsetivli    zero, 16, e16, m1, ta, ma \n\t"
+        "vle16.v     v0, (%[idx])              \n\t"
+        "addi        t0, %[idx], 32            \n\t"
+        "vle16.v     v1, (t0)                  \n\t"
+        "addi        t0, %[idx], 64            \n\t"
+        "vle16.v     v2, (t0)                  \n\t"
+        "addi        t0, %[idx], 96            \n\t"
+        "vle16.v     v3, (t0)                  \n\t"
+        "vsetvli     t0, zero, e32, m8, ta, ma \n\t"
+        "vle32.v     v24, (%[o])               \n\t"   /* 累加器从 out 续接（K 分块；调用方首段置 +0） */
+        "1:                                    \n\t"
+        "vsetvli     t0, zero, e32, m8, ta, ma \n\t"
+        "vmv.v.i     v16, 0                    \n\t"
+        "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
+        "vle8.v      v4, (%[x])                \n\t"
+        "addi        t1, %[w], 32              \n\t"
+        "vle8.v      v12, (t1)                 \n\t"
+        "vsrl.vi     v8, v12, 4                \n\t"
+        "vand.vi     v12, v12, 15              \n\t"
+        "vsetvli     t0, zero, e8, m8, ta, ma  \n\t"
+        "vadd.vi     v8, v8, -8                \n\t"
+        "vsetvli     t0, zero, e8, m1, ta, ma  \n\t"
+        RV_VMADOT(16, 12, 4) RV_VMADOT(18, 13, 4) RV_VMADOT(20, 14, 4) RV_VMADOT(22, 15, 4)
+        RV_VMADOT(16, 8, 5)  RV_VMADOT(18, 9, 5)  RV_VMADOT(20, 10, 5) RV_VMADOT(22, 11, 5)
+        "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
+        "addi        t1, %[w], 160             \n\t"
+        "vle8.v      v12, (t1)                 \n\t"
+        "vsrl.vi     v8, v12, 4                \n\t"
+        "vand.vi     v12, v12, 15              \n\t"
+        "vsetvli     t0, zero, e8, m8, ta, ma  \n\t"
+        "vadd.vi     v8, v8, -8                \n\t"
+        "vsetvli     t0, zero, e8, m1, ta, ma  \n\t"
+        RV_VMADOT(16, 12, 6) RV_VMADOT(18, 13, 6) RV_VMADOT(20, 14, 6) RV_VMADOT(22, 15, 6)
+        RV_VMADOT(16, 8, 7)  RV_VMADOT(18, 9, 7)  RV_VMADOT(20, 10, 7) RV_VMADOT(22, 11, 7)
+        "vsetivli    zero, 16, e16, m1, ta, ma \n\t"
+        "vle16.v     v9, (%[w])                \n\t"
+        "vfwcvt.f.f.v v10, v9                  \n\t"
+        "vsetivli    zero, 16, e32, m2, ta, ma \n\t"
+        "vle32.v     v12, (%[xe])              \n\t"
+#define RV_IME_EPI(G, A, F) \
+        "vrgatherei16.vv v14, v10, v" #G " \n\t" \
+        "vfcvt.f.x.v v8, v" #A "           \n\t" \
+        "vfmul.vv    v8, v14, v8           \n\t" \
+        "vfmul.vv    v8, v8, v12           \n\t" \
+        "vfadd.vv    v" #F ", v" #F ", v8  \n\t"
+        RV_IME_EPI(0, 16, 24) RV_IME_EPI(1, 18, 26) RV_IME_EPI(2, 20, 28) RV_IME_EPI(3, 22, 30)
+#undef RV_IME_EPI
+        "addi        %[w], %[w], 288           \n\t"
+        "addi        %[x], %[x], 128           \n\t"
+        "addi        %[xe], %[xe], 64          \n\t"
+        "addi        %[k], %[k], -1            \n\t"
+        "bnez        %[k], 1b                  \n\t"
+        "vsetvli     t0, zero, e32, m8, ta, ma \n\t"
+        "vse32.v     v24, (%[o])               \n\t"
+        ".option pop                           \n\t"
+        : [w] "+r"(w), [x] "+r"(x), [xe] "+r"(xe), [k] "+r"(k)
+        : [idx] "r"(RV_IME_IDX), [o] "r"(out)
+        : "t0", "t1", "memory", "vl", "vtype",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+          "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+/* 权重重排缓存：key = mode3 权重指针 */
+#define RV_IME_CACHE 1024
+static struct { const uint8_t *src; uint8_t *dst; } g_rv_ime_cache[RV_IME_CACHE];
+static int g_rv_ime_n = 0, g_rv_ime_lock = 0;
+static size_t g_rv_ime_bytes = 0;
+static double g_rv_ime_sec = 0.0;
+
+typedef struct { const uint8_t *src; uint8_t *dst; int nblk; } rv_ime_rp_ctx;
+/* mode3 tile ti（32 行）→ IME tile 2ti、2ti+1（各 16 行）。
+ * mode3：scale 行 r 在 sc+2r；行 r 列 c 的 nibble 在 dt[c*16 + r/2]，r 偶低/奇高。
+ * IME：scale 行 r 在 s+2r；字节 32+h*128+g*32+rr*8+kk 低 = 行 g*4+rr 列 h*16+kk，高 = 同行列 +8。 */
+static void rv_ime_rp_worker(void *c_, int ti) {
+    const rv_ime_rp_ctx *c = (const rv_ime_rp_ctx *)c_;
+    for (int b = 0; b < c->nblk; b++) {
+        const uint8_t *sc = c->src + ((size_t)ti * c->nblk + b) * 576, *dt = sc + 64;
+        for (int half = 0; half < 2; half++) {
+            uint8_t *s = c->dst + (((size_t)(2 * ti + half)) * c->nblk + b) * 288;
+            memcpy(s, sc + half * 32, 32);
+            for (int h = 0; h < 2; h++)
+                for (int g = 0; g < 4; g++)
+                    for (int rr = 0; rr < 4; rr++) {
+                        const int r = half * 16 + g * 4 + rr, sh = (r & 1) * 4;
+                        for (int kk = 0; kk < 8; kk++) {
+                            const int col = h * 16 + kk;
+                            const uint8_t lo = (dt[col * 16 + r / 2] >> sh) & 15;
+                            const uint8_t hi = (dt[(col + 8) * 16 + r / 2] >> sh) & 15;
+                            s[32 + h * 128 + g * 32 + rr * 8 + kk] = (uint8_t)(lo | (hi << 4));
+                        }
+                    }
+        }
+    }
+}
+
+static const uint8_t *rv_ime_get(const uint8_t *w, int rows, int nblk) {
+    for (int i = 0; i < g_rv_ime_n; i++) if (g_rv_ime_cache[i].src == w) return g_rv_ime_cache[i].dst;
+    while (__atomic_exchange_n(&g_rv_ime_lock, 1, __ATOMIC_ACQUIRE)) { }
+    const uint8_t *res = NULL;
+    for (int i = 0; i < g_rv_ime_n; i++) if (g_rv_ime_cache[i].src == w) res = g_rv_ime_cache[i].dst;
+    if (!res && g_rv_ime_n < RV_IME_CACHE) {
+        const size_t sz = (size_t)rows * nblk * 18;          /* 288B / 16 行 */
+        uint8_t *d = (uint8_t *)aligned_alloc(64, (sz + 63) & ~(size_t)63);
+        if (d) {
+            struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            rv_ime_rp_ctx c = { w, d, nblk };
+            vllm_tp_parfor(0, rows / 32, rv_ime_rp_worker, &c);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            g_rv_ime_sec += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+            g_rv_ime_bytes += sz;
+            g_rv_ime_cache[g_rv_ime_n].src = w;
+            g_rv_ime_cache[g_rv_ime_n].dst = d;
+            __atomic_store_n(&g_rv_ime_n, g_rv_ime_n + 1, __ATOMIC_RELEASE);
+            res = d;
+            if ((g_rv_ime_n & 31) == 0)
+                fprintf(stderr, "[Q4IME] repack mats=%d bytes=%.1fMB time=%.3fs\n",
+                        g_rv_ime_n, g_rv_ime_bytes / 1048576.0, g_rv_ime_sec);
+        }
+    }
+    __atomic_store_n(&g_rv_ime_lock, 0, __ATOMIC_RELEASE);
+    return res;
+}
+
+/* 激活打包（4 token 组 g）：xp[(g*nblk+b)*128 + j*32 + t*8 + kk]，xe[(g*nblk+b)*16 + e] = xd[t=e&3][b] */
+typedef struct { const int8_t *xq; const float *xd; int8_t *xp; float *xe; int nblk, nb; } rv_ime_px_ctx;
+static void rv_ime_px_worker(void *c_, int g) {
+    const rv_ime_px_ctx *c = (const rv_ime_px_ctx *)c_;
+    const int nblk = c->nblk, cols = nblk * 32;
+    int tt[4];
+    for (int t = 0; t < 4; t++) { int v = g * 4 + t; tt[t] = v < c->nb ? v : c->nb - 1; }
+    for (int b = 0; b < nblk; b++) {
+        int8_t *d = c->xp + ((size_t)g * nblk + b) * 128;
+        for (int j = 0; j < 4; j++)
+            for (int t = 0; t < 4; t++)
+                memcpy(d + j * 32 + t * 8, c->xq + (size_t)tt[t] * cols + b * 32 + j * 8, 8);
+        float *e = c->xe + ((size_t)g * nblk + b) * 16;
+        for (int i = 0; i < 16; i++) e[i] = c->xd[(size_t)tt[i & 3] * nblk + b];
+    }
+}
+
+typedef struct {
+    rv_q4_colbt_ctx *cb; const uint8_t *wi; const int8_t *xp; const float *xe;
+    int ng4, nunit, mode; int next; long n_ime, n_cb; int kb;
+} rv_ime_mix_ctx;
+
+/* VLLM_Q4_IME_KB=n（n>0）：IME 单元内按 n 块切 K，块序不变（F 逐块续接），仅改访存局部性；默认 0 = 不切 */
+static int rv_q4_ime_kb(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_IME_KB"); v = e ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+
+/* IME 处理一个单元（32 行 tile ti × 8 token 组 g8）：2 个 16 行子 tile × 2 个 4 token 子组 */
+static void rv_ime_unit(const rv_ime_mix_ctx *m, int ti, int g8) {
+    const rv_q4_colbt_ctx *c = m->cb;
+    const int nblk = c->nblk, rows = c->rows;
+    float acc[4][64] __attribute__((aligned(64)));
+    memset(acc, 0, sizeof acc);                          /* +0.0f，与 vmv.v.i 0 同位 */
+    const int kb = (m->kb > 0 && m->kb < nblk) ? m->kb : nblk;
+    for (int b0 = 0; b0 < nblk; b0 += kb) {
+        const int nk = (nblk - b0 < kb) ? (nblk - b0) : kb;
+        for (int half = 0; half < 2; half++) {
+            const int t16 = 2 * ti + half;
+            for (int sg = 0; sg < 2; sg++) {
+                const int g4 = 2 * g8 + sg;
+                if (g4 >= m->ng4) break;
+                rv_ime_q4_tile(m->wi + ((size_t)t16 * nblk + b0) * 288,
+                               m->xp + ((size_t)g4 * nblk + b0) * 128,
+                               m->xe + ((size_t)g4 * nblk + b0) * 16, nk, acc[half * 2 + sg]);
+            }
+        }
+    }
+    for (int half = 0; half < 2; half++) {
+        const int t16 = 2 * ti + half;
+        for (int sg = 0; sg < 2; sg++) {
+            const int g4 = 2 * g8 + sg;
+            if (g4 >= m->ng4) break;
+            const float *tmp = acc[half * 2 + sg];
+            for (int t = 0; t < 4 && g4 * 4 + t < c->nb; t++) {
+                const size_t tok = (size_t)(g4 * 4 + t);
+                float *o = c->ob + tok * rows + (size_t)t16 * 16;
+                const float *r = c->rb ? c->rb + tok * rows + (size_t)t16 * 16 : NULL;
+                for (int gg = 0; gg < 4; gg++)
+                    for (int rr = 0; rr < 4; rr++) {
+                        float v = tmp[gg * 16 + rr * 4 + t];
+                        if (r) v = v + r[gg * 4 + rr];
+                        o[gg * 4 + rr] = v;
+                    }
+            }
+        }
+    }
+}
+
+/* decode 每线程绑核缓存（rv_q4_dec_worker 使用）：本次调用（gen）是否已在 IME hart 上绑核确认。
+ * 任何临时改动本线程亲和性的路径（如 rv_ime_mix_worker）恢复后必须清空缓存。 */
+static __thread long t_vm_gen = -1;
+static __thread int t_vm_ok = 0;
+static __thread int t_vm_cpu = -1;    /* 上次 rv_vm_pin 成功的 cpu；-1 = 需重新 pin */
+
+static void rv_ime_mix_worker(void *c_, int slot) {
+    rv_ime_mix_ctx *m = (rv_ime_mix_ctx *)c_;
+    int ime = 0; cpu_set_t old; int ho = 0;
+    if (slot < 4) {
+        ho = sched_getaffinity(0, sizeof(old), &old) == 0;
+        cpu_set_t s; CPU_ZERO(&s); CPU_SET(slot, &s);
+        if (sched_setaffinity(0, sizeof(s), &s) == 0) { int cpu = sched_getcpu(); ime = cpu >= 0 && cpu < 4; }
+    }
+    if (ime || m->mode != 2) {
+        long ni = 0, nc = 0;
+        for (;;) {
+            const int u = __atomic_fetch_add(&m->next, 1, __ATOMIC_RELAXED);
+            if (u >= m->nunit) break;
+            if (ime) { rv_ime_unit(m, u / m->cb->ngrp, u % m->cb->ngrp); ni++; }
+            else     { rv_q4_colbt_worker(m->cb, u); nc++; }
+        }
+        __atomic_fetch_add(&m->n_ime, ni, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&m->n_cb, nc, __ATOMIC_RELAXED);
+    }
+    if (ho) sched_setaffinity(0, sizeof(old), &old);
+    if (slot < 4) { t_vm_cpu = -1; t_vm_gen = -1; }    /* 亲和性已被改动：decode 快路径须重新 pin */
+}
+
+/* 返回 1 = 已由 IME 混合路径完成；0 = 调用方走 colbt */
+static int rv_ime_run(rv_q4_colbt_ctx *c) {
+    const int mode = rv_q4_ime_mode();
+    if (!mode || (c->rows % 32) != 0) return 0;
+    const uint8_t *wi = rv_ime_get(c->w, c->rows, c->nblk);
+    if (!wi) return 0;
+    const int ng4 = (c->nb + 3) / 4;
+    const size_t xps = (size_t)ng4 * c->nblk * 128, xes = (size_t)ng4 * c->nblk * 64;
+    int8_t *xp = (int8_t *)aligned_alloc(64, (xps + 63) & ~(size_t)63);
+    float *xe = (float *)aligned_alloc(64, (xes + 63) & ~(size_t)63);
+    if (!xp || !xe) { free(xp); free(xe); return 0; }
+    rv_ime_px_ctx pc = { c->xq, c->xd, xp, xe, c->nblk, c->nb };
+    vllm_tp_parfor(0, ng4, rv_ime_px_worker, &pc);
+    const int nt = vllm_tp_threads() > 0 ? vllm_tp_threads() : 1;
+    rv_ime_mix_ctx m = { c, wi, xp, xe, ng4, (c->rows / 32) * c->ngrp, mode, 0, 0, 0, rv_q4_ime_kb() };
+    vllm_tp_parfor(0, nt, rv_ime_mix_worker, &m);
+    int ok = m.next >= m.nunit;
+    if (!ok) {                                           /* mode2 且无线程落在 hart0-3：调用者串行 colbt 补完 */
+        for (int u = m.next; u < m.nunit; u++) rv_q4_colbt_worker(c, u);
+        m.n_cb += m.nunit - m.next;
+    }
+    { static int chk = -1, cnt = 0;
+      if (chk < 0) { const char *e = getenv("VLLM_Q4CHK"); chk = (e && e[0] == '1') ? 1 : 0; }
+      if (chk && cnt < 8) {
+          cnt++;
+          /* IME 自身对拍：tile 0、末 tile 的全部 token 用 IME 单元重算，与 rv_q4_col_tile 逐位比较（不含 resid） */
+          int nbad = 0, ncmp = 0; float mx = 0.0f;
+          float *sv = (float *)malloc((size_t)c->nb * c->rows * sizeof(float));
+          cpu_set_t old, s0; int ho = sched_getaffinity(0, sizeof(old), &old) == 0;
+          CPU_ZERO(&s0); CPU_SET(0, &s0);
+          const int pin_ok = sched_setaffinity(0, sizeof(s0), &s0) == 0 && sched_getcpu() == 0;
+          if (!pin_ok) { free(sv); sv = NULL; nbad = -1; }   /* 不能保证在 hart0 上：跳过对拍 */
+          if (sv) {
+              memcpy(sv, c->ob, (size_t)c->nb * c->rows * sizeof(float));
+              rv_q4_colbt_ctx c2 = *c; c2.rb = NULL; c2.ob = sv;
+              rv_ime_mix_ctx m2 = m; m2.cb = &c2;
+              const int nti = c->rows / 32, tis[2] = { 0, nti - 1 };
+              for (int q = 0; q < 2; q++) for (int g8 = 0; g8 < c->ngrp; g8++) rv_ime_unit(&m2, tis[q], g8);
+              float ref[32];
+              for (int q = 0; q < 2; q++)
+                  for (int t = 0; t < c->nb; t++) {
+                      rv_q4_col_tile(c->w + (size_t)tis[q] * c->nblk * 576, c->xq + (size_t)t * c->nblk * 32,
+                                     c->xd + (size_t)t * c->nblk, ref, NULL, c->nblk);
+                      const float *o = sv + (size_t)t * c->rows + (size_t)tis[q] * 32;
+                      for (int k = 0; k < 32; k++) {
+                          ncmp++;
+                          if (memcmp(&o[k], &ref[k], sizeof(float)) != 0) nbad++;
+                          float d = o[k] - ref[k]; if (d < 0) d = -d; if (d > mx) mx = d;
+                      }
+                  }
+              free(sv);
+          }
+          if (ho) sched_setaffinity(0, sizeof(old), &old);
+          fprintf(stderr, "[Q4CHK-ime] rows=%d cols=%d nb=%d mode=%d units ime=%ld colbt=%ld cmp=%d bitmismatch=%d max|d|=%.9g\n",
+                  c->rows, c->nblk * 32, c->nb, mode, m.n_ime, m.n_cb, ncmp, nbad, (double)mx);
+      } }
+    free(xp); free(xe);
+    return 1;
+}
+
+static void rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
+                                 const float *rb, int rows, int cols,
+                                 int n_blocks, int nb) {
+    const int ntiles = rows / 32;
+    const int ngrp = (nb + RV_Q4CB_T - 1) / RV_Q4CB_T;
+    const size_t qb = (size_t)nb * cols, db = (size_t)nb * n_blocks * sizeof(float);
+    int8_t *xq = (int8_t *)xq_alloc_canary(qb);
+    float *xd = (float *)xq_alloc_canary(db);
+    if (!xq || !xd) { xq_free_canary(xq, qb, "q4cb:xq"); xq_free_canary(xd, db, "q4cb:xd"); return; }
+    if (rv_q4_qpar_on() && vllm_tp_threads() > 1) {
+        rv_q4_qpar_ctx qc = { xb, xq, xd, cols, n_blocks };
+        vllm_tp_parfor(0, nb, rv_q4_qpar_worker, &qc);
+        { static int qchk = -1, qcnt = 0;          /* VLLM_Q4CHK=1：并行量化对串行逐字节比对 */
+          if (qchk < 0) { const char *e = getenv("VLLM_Q4CHK"); qchk = (e && e[0] == '1') ? 1 : 0; }
+          if (qchk && qcnt < 8) {
+              qcnt++;
+              int8_t *q2 = (int8_t *)malloc(qb); float *d2 = (float *)malloc(db);
+              if (q2 && d2) {
+                  for (int t = 0; t < nb; t++)
+                      quantize_row_q8_0_act(xb + (size_t)t * cols, q2 + (size_t)t * cols,
+                                            d2 + (size_t)t * n_blocks, cols);
+                  fprintf(stderr, "[Q4CHK-qpar] nb=%d cols=%d q_mismatch=%d d_mismatch=%d\n", nb, cols,
+                          memcmp(q2, xq, qb) != 0, memcmp(d2, xd, db) != 0);
+              }
+              free(q2); free(d2);
+          } }
+    } else {
+        for (int t = 0; t < nb; t++)
+            quantize_row_q8_0_act(xb + (size_t)t * cols, xq + (size_t)t * cols,
+                                  xd + (size_t)t * n_blocks, cols);
+    }
+    rv_q4_colbt_ctx c = { w, xq, xd, ob, rb, rows, n_blocks, nb, ngrp, rv_q4_scv_on() };
+    const int nit = ntiles * ngrp;
+    if (rv_ime_run(&c)) { }
+    else if (vllm_tp_threads() > 1 && nit >= 2) vllm_tp_parfor(0, nit, rv_q4_colbt_worker, &c);
+    else for (int i = 0; i < nit; i++) rv_q4_colbt_worker(&c, i);
+    /* 自检（VLLM_Q4CHK=1，仅 resid==NULL 的调用，前 8 次）：首/末 token 全部 tile
+     * 对原逐 token 内核 rv_q4_col_tile 逐元素比位，须 0 失配 */
+    { static int chk = -1, cnt = 0;
+      if (chk < 0) { const char *e = getenv("VLLM_Q4CHK"); chk = (e && e[0] == '1') ? 1 : 0; }
+      if (chk && !rb && cnt < 8) {
+          cnt++;
+          float ref[32]; int nbad = 0; float mx = 0.0f;
+          const int ts[2] = { 0, nb - 1 };
+          for (int q = 0; q < 2; q++) {
+              const int t = ts[q];
+              for (int ti = 0; ti < ntiles; ti++) {
+                  rv_q4_col_tile(w + (size_t)ti * n_blocks * 576, xq + (size_t)t * cols,
+                                 xd + (size_t)t * n_blocks, ref, NULL, n_blocks);
+                  const float *o = ob + (size_t)t * rows + (size_t)ti * 32;
+                  for (int k = 0; k < 32; k++) {
+                      if (memcmp(&o[k], &ref[k], sizeof(float)) != 0) nbad++;
+                      float d = o[k] - ref[k]; if (d < 0) d = -d; if (d > mx) mx = d;
+                  }
+              }
+          }
+          fprintf(stderr, "[Q4CHK-colbt] rows=%d cols=%d nb=%d bitmismatch=%d max|d|=%.9g\n",
+                  rows, cols, nb, nbad, (double)mx);
+      }
+    }
+    xq_free_canary(xq, qb, "q4cb:xq");
+    xq_free_canary(xd, db, "q4cb:xd");
+}
+
 /* mode3 批版本：权重驻留 × 多 token。col tile 每次处理一个 token 的全部
  * 32 行 tile（内部按 tile 并行），批维度顺序串行（与 lane bt4 的 token 分组
- * 不同，但同数值口径：每 token 独立量化激活）。n_batch=1 即单 token 兜底。 */
+ * 不同，但同数值口径：每 token 独立量化激活）。n_batch=1 即单 token 兜底。
+ * VLLM_Q4_INTB=1 且 nb>=2 时改走上面的 token 分块内核。 */
 static void rv_q4_col_rows_par_bt(const uint8_t *w, const float *xb, float *ob,
                                   const float *rb, int rows, int cols,
                                   int n_blocks, int nb) {
+    if (rv_q4_intb_on() && nb >= 2) {
+        rv_q4_colbt_rows_par(w, xb, ob, rb, rows, cols, n_blocks, nb);
+        return;
+    }
     for (int t = 0; t < nb; t++)
         rv_q4_col_rows_par(w, xb + (size_t)t * cols, ob + (size_t)t * rows,
                            rb ? rb + (size_t)t * rows : NULL, rows, n_blocks);
+}
+
+/* ---- D1：decode 单 token 内核（VLLM_Q4_DEC=1，默认关）----
+ * 与 rv_q4_col_tile 位级一致（VLLM_Q4CHK=1 对拍）：
+ *   - 一条 vl=32 取两列（列 c 占 lane 0-15，列 c+1 占 lane 16-31），vl 用满 VLEN=256；
+ *   - 权重用无偏 nibble n（0..15）做 vwmacc，块末减 8*sum(xq)：sum((n-8)x) = sum(nx) - 8*sum(x)，
+ *     整数精确（|x|<=127：半边累加 16*15*127=30480 不溢出 int16；合并后进 int32），
+ *     转 f32 后与原 int16 累加值相同（|值|<2^24）；
+ *   - 行 scale 用 SCV（VLLM_Q4_SCV，已穷举证明与 st_f16scale 逐位一致）；
+ *   - 浮点顺序同原内核：acc = acc + ((s*d)*xd)，块循环后 + resid。
+ * 调度：同一激活的多个矩阵（QKV / gate+up）共享一次量化，所有 tile 合并为一次 parfor。 */
+static void rv_q4_dec_tile(const uint8_t *tile, const int8_t *xq, const float *xd,
+                           const int32_t *sx, float *out, const float *resid,
+                           int nblk, int scv) {
+    const size_t vl = 32, vh = 16;
+    vbool8_t hi = __riscv_vmsgeu_vx_u8m1_b8(__riscv_vid_v_u8m1(vl), 16, vl);
+    vfloat32m2_t eacc = __riscv_vfmv_v_f_f32m2(0.0f, vh), oacc = eacc;
+    for (int b = 0; b < nblk; b++) {
+        const uint8_t *sc = tile + (size_t)b * 576;
+        const uint8_t *dt = sc + 64;
+        float s[32];                                   /* s[k]=行 2k，s[16+k]=行 2k+1 */
+        if (scv) {
+            __asm__ volatile(
+                ".option push                        \n\t"
+                ".option arch, +zvfhmin              \n\t"
+                "vsetivli zero, 16, e16, m1, ta, ma \n\t"
+                "vlse16.v v8, (%[p]), %[st]          \n\t"
+                "vlse16.v v9, (%[q]), %[st]          \n\t"
+                "vfwcvt.f.f.v v10, v8                \n\t"
+                "vfwcvt.f.f.v v12, v9                \n\t"
+                "vsetivli zero, 16, e32, m2, ta, ma \n\t"
+                "vse32.v v10, (%[o0])                \n\t"
+                "vse32.v v12, (%[o1])                \n\t"
+                ".option pop                         \n\t"
+                :: [p] "r"(sc), [q] "r"(sc + 2), [st] "r"(4L), [o0] "r"(s), [o1] "r"(s + 16)
+                : "memory", "vl", "vtype", "v8", "v9", "v10", "v11", "v12", "v13");
+        } else {
+            for (int k = 0; k < 16; k++) {
+                s[k]      = st_f16scale(sc + (size_t)(2 * k)     * 2);
+                s[16 + k] = st_f16scale(sc + (size_t)(2 * k + 1) * 2);
+            }
+        }
+        const int8_t *xb = xq + (size_t)b * 32;
+        vint16m2_t aE = __riscv_vmv_v_x_i16m2(0, vl), aO = aE;
+        for (int c = 0; c < 32; c += 2) {
+            vuint8m1_t col = __riscv_vle8_v_u8m1(dt + (size_t)c * 16, vl);
+            vint8m1_t nE = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vand_vx_u8m1(col, 0x0F, vl));
+            vint8m1_t nO = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vsrl_vx_u8m1(col, 4, vl));
+            vint8m1_t xv = __riscv_vmerge_vxm_i8m1(__riscv_vmv_v_x_i8m1(xb[c], vl), xb[c + 1], hi, vl);
+            aE = __riscv_vwmacc_vv_i16m2(aE, xv, nE, vl);
+            aO = __riscv_vwmacc_vv_i16m2(aO, xv, nO, vl);
+        }
+        const int32_t corr = 8 * sx[b];
+        vint32m2_t iE = __riscv_vsub_vx_i32m2(__riscv_vwadd_vv_i32m2(
+                            __riscv_vget_v_i16m2_i16m1(aE, 0), __riscv_vget_v_i16m2_i16m1(aE, 1), vh), corr, vh);
+        vint32m2_t iO = __riscv_vsub_vx_i32m2(__riscv_vwadd_vv_i32m2(
+                            __riscv_vget_v_i16m2_i16m1(aO, 0), __riscv_vget_v_i16m2_i16m1(aO, 1), vh), corr, vh);
+        vfloat32m2_t ve = __riscv_vle32_v_f32m2(s, vh), vo = __riscv_vle32_v_f32m2(s + 16, vh);
+        const float xd_b = xd[b];
+        eacc = __riscv_vfadd_vv_f32m2(eacc, __riscv_vfmul_vf_f32m2(
+                   __riscv_vfmul_vv_f32m2(ve, __riscv_vfcvt_f_x_v_f32m2(iE, vh), vh), xd_b, vh), vh);
+        oacc = __riscv_vfadd_vv_f32m2(oacc, __riscv_vfmul_vf_f32m2(
+                   __riscv_vfmul_vv_f32m2(vo, __riscv_vfcvt_f_x_v_f32m2(iO, vh), vh), xd_b, vh), vh);
+    }
+    if (resid) {
+        eacc = __riscv_vfadd_vv_f32m2(eacc, __riscv_vlse32_v_f32m2(resid + 0, 8, vh), vh);
+        oacc = __riscv_vfadd_vv_f32m2(oacc, __riscv_vlse32_v_f32m2(resid + 1, 8, vh), vh);
+    }
+    __riscv_vsse32_v_f32m2(out + 0, 8, eacc, vh);
+    __riscv_vsse32_v_f32m2(out + 1, 8, oacc, vh);
+}
+
+/* ---- L-DEC-001 Phase 2：M=1 vmadot 单元（VLLM_Q4_VMADOT=1）----
+ * 16 行 IME tile（rv_ime_get 的 288B 布局），out[l] = 行 l（自然序），不含 resid。
+ * 激活直接用 32B/块的 xq（不再预展开）：块内 vrgather.vv 按 rv_vm_xidx 展开成
+ * 128B（xr 布局：xr[q*32+r*8+i] = xq[8q+i]），数值与展开后逐位相同。
+ * 这样每 tile 的激活足迹从 nblk×128B 降到 nblk×32B（down 38KB→9.5KB），
+ * 不再超出单核 L1，权重流带宽提升（§12.12）。
+ * corr[b] = 8·Σxq_b；权重用无偏 nibble。
+ * 4 路 vd（v16/18/20/22 = 行组 g0..g3 的 4×4 外积，单行 r 槽相同 → 取 lane g*4..g*4+3）
+ * 以 tu 模式 vmv 合并到 v22 得自然行序；浮点顺序同 rv_q4_col_tile：acc=+0；acc=acc+((s·f32(i))·xd)。
+ * Phase 1（bench_dec_vmadot.c）板端对 rv_q4_col_tile 位级 0 失配。只能在 hart0-3 上执行。 */
+/* vrgather 索引：idx[i] = 8*(i/32) + (i%8)，即 8 个元素重复 4 遍，共 4 组 */
+static const uint8_t rv_vm_xidx[128] = {
+    0, 1, 2, 3, 4, 5, 6, 7,  0, 1, 2, 3, 4, 5, 6, 7,
+    0, 1, 2, 3, 4, 5, 6, 7,  0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9,10,11,12,13,14,15,  8, 9,10,11,12,13,14,15,
+    8, 9,10,11,12,13,14,15,  8, 9,10,11,12,13,14,15,
+   16,17,18,19,20,21,22,23, 16,17,18,19,20,21,22,23,
+   16,17,18,19,20,21,22,23, 16,17,18,19,20,21,22,23,
+   24,25,26,27,28,29,30,31, 24,25,26,27,28,29,30,31,
+   24,25,26,27,28,29,30,31, 24,25,26,27,28,29,30,31,
+};
+__attribute__((noinline))
+static void rv_vm_tile16(const uint8_t *w, const int8_t *xq, const float *xd, const int32_t *corr,
+                         int nblk, float *out) {
+    long k = nblk;
+    __asm__ volatile(
+        ".option push                          \n\t"
+        ".option arch, +zvfhmin                \n\t"
+        "vsetivli    zero, 16, e32, m2, ta, ma \n\t"
+        "vmv.v.i     v24, 0                    \n\t"
+        "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
+        "vle8.v      v0, (%[ix])               \n\t"   /* 128B 展开索引 */
+        "1:                                    \n\t"
+        "vsetvli     t0, zero, e32, m8, ta, ma \n\t"
+        "vmv.v.i     v16, 0                    \n\t"
+        "li          t0, 32                    \n\t"
+        "vsetvli     t0, t0, e8, m1, ta, ma    \n\t"
+        "vle8.v      v28, (%[x])               \n\t"   /* 32B 紧凑激活 */
+        "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
+        "vrgather.vv v4, v28, v0               \n\t"   /* → v4..v7（与 xr 布局同） */
+        "addi        t1, %[w], 32              \n\t"
+        "vle8.v      v12, (t1)                 \n\t"
+        "vsrl.vi     v8, v12, 4                \n\t"
+        "vand.vi     v12, v12, 15              \n\t"
+        "vsetvli     t0, zero, e8, m1, ta, ma  \n\t"
+        RV_VMADOT(16, 4, 12) RV_VMADOT(18, 4, 13) RV_VMADOT(20, 4, 14) RV_VMADOT(22, 4, 15)
+        RV_VMADOT(16, 5, 8)  RV_VMADOT(18, 5, 9)  RV_VMADOT(20, 5, 10) RV_VMADOT(22, 5, 11)
+        "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
+        "addi        t1, %[w], 160             \n\t"
+        "vle8.v      v12, (t1)                 \n\t"
+        "vsrl.vi     v8, v12, 4                \n\t"
+        "vand.vi     v12, v12, 15              \n\t"
+        "vsetvli     t0, zero, e8, m1, ta, ma  \n\t"
+        RV_VMADOT(16, 6, 12) RV_VMADOT(18, 6, 13) RV_VMADOT(20, 6, 14) RV_VMADOT(22, 6, 15)
+        RV_VMADOT(16, 7, 8)  RV_VMADOT(18, 7, 9)  RV_VMADOT(20, 7, 10) RV_VMADOT(22, 7, 11)
+        "vsetivli    zero, 12, e32, m2, tu, ma \n\t"
+        "vmv.v.v     v22, v20                  \n\t"
+        "vsetivli    zero, 8, e32, m2, tu, ma  \n\t"
+        "vmv.v.v     v22, v18                  \n\t"
+        "vsetivli    zero, 4, e32, m2, tu, ma  \n\t"
+        "vmv.v.v     v22, v16                  \n\t"
+        "vsetivli    zero, 16, e32, m2, ta, ma \n\t"
+        "lw          t2, 0(%[c])               \n\t"
+        "vsub.vx     v22, v22, t2              \n\t"
+        "vfcvt.f.x.v v22, v22                  \n\t"
+        "vsetivli    zero, 16, e16, m1, ta, ma \n\t"
+        "vle16.v     v26, (%[w])               \n\t"
+        "vfwcvt.f.f.v v28, v26                 \n\t"
+        "vsetivli    zero, 16, e32, m2, ta, ma \n\t"
+        "flw         ft0, 0(%[d])              \n\t"
+        "vfmul.vv    v28, v28, v22             \n\t"
+        "vfmul.vf    v28, v28, ft0             \n\t"
+        "vfadd.vv    v24, v24, v28             \n\t"
+        "addi        %[w], %[w], 288           \n\t"
+        "addi        %[x], %[x], 32            \n\t"
+        "addi        %[d], %[d], 4             \n\t"
+        "addi        %[c], %[c], 4             \n\t"
+        "addi        %[k], %[k], -1            \n\t"
+        "bnez        %[k], 1b                  \n\t"
+        "vse32.v     v24, (%[o])               \n\t"
+        ".option pop                           \n\t"
+        : [w] "+r"(w), [x] "+r"(xq), [d] "+r"(xd), [c] "+r"(corr), [k] "+r"(k)
+        : [o] "r"(out), [ix] "r"(rv_vm_xidx)
+        : "t0", "t1", "t2", "ft0", "memory", "vl", "vtype",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+          "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+/* 32 行 tile ti 的 vmadot 单元：两个 16 行半 tile 先写栈上 tmp（out 可能与 resid 同址），
+ * 再 out = tmp + resid（与锚同为块循环后单次 IEEE 加法）。
+ * 布局：源 576B/块 = 32 行 × (2B fp16 d + 16B nibble)；IME 288B/块 = 16 行 × 18B
+ * （[0,32) 16×fp16 d，[32,288) 256B nibble），故一个 32 行 tile = 2 个 16 行组。 */
+_Static_assert(576 == 32 * (2 + 16), "q4 col tile src layout");
+_Static_assert(288 == 16 * (2 + 16) && 288 == 32 + 256, "q4 ime 16-row group layout");
+static void rv_vm_tile32(const uint8_t *wi, int ti, const int8_t *xq, const float *xd,
+                         const int32_t *corr, int nblk, float *out, const float *resid) {
+    float tmp[32];
+    rv_vm_tile16(wi + (size_t)(2 * ti) * nblk * 288, xq, xd, corr, nblk, tmp);
+    rv_vm_tile16(wi + (size_t)(2 * ti + 1) * nblk * 288, xq, xd, corr, nblk, tmp + 16);
+    if (resid) for (int k = 0; k < 32; k++) out[k] = tmp[k] + resid[k];
+    else memcpy(out, tmp, sizeof tmp);
+}
+
+/* 绑当前线程到单核 cpu（∈0..3，IME hart），并以亲和性掩码 + sched_getcpu 双重确认。
+ * 掩码 == {cpu} 时内核不会把线程迁出该核，故确认后在该核上执行 vmadot 不会 SIGILL。 */
+static int rv_vm_pin(int cpu) {
+    if (cpu < 0 || cpu >= 4) return 0;
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s);
+    if (sched_setaffinity(0, sizeof(s), &s) != 0) return 0;
+    cpu_set_t g; CPU_ZERO(&g);
+    if (sched_getaffinity(0, sizeof(g), &g) != 0) return 0;
+    if (CPU_COUNT(&g) != 1 || !CPU_ISSET(cpu, &g)) return 0;
+    if (sched_getcpu() != cpu) return 0;
+    static int logged = 0;
+    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[Q4VM] pin ok: slot->cpu map = identity (cpu0-3 = IME harts), first pin cpu=%d\n", cpu);
+    return 1;
+}
+
+#define RV_Q4_DEC_MAXM 4
+typedef struct {
+    rv_q4_dec_mat m[RV_Q4_DEC_MAXM];
+    int t0[RV_Q4_DEC_MAXM + 1];                       /* 第 i 个矩阵的 tile 起点 */
+    int nm, nblk, scv;
+    const int8_t *xq; const float *xd; const int32_t *sx;
+    /* VMADOT：wi[i] = 第 i 个矩阵的 288B 重排权重（NULL = 该矩阵走 dec_tile） */
+    int vm; long gen;
+    const uint8_t *wi[RV_Q4_DEC_MAXM];
+    const int32_t *corr;                               /* 激活直接用 ctx.xq（32B/块） */
+    long n_vm, n_rvv;                                  /* 仅 Q4CHK 时计数 */
+    int cnt_on;
+    int tp;                                            /* VLLM_Q4_TPROF 形状槽，-1 = 不计时 */
+} rv_q4_dec_ctx;
+
+/* 诊断（VLLM_Q4_TPROF=1，默认关）：dec_rows 按 (cols, tiles) 形状分段计时，进程退出时打印：
+ * pre=量化+sx+corr+ime_get，par=并行区间墙钟，post=亲和性恢复+Q4CHK，
+ * busy=各线程 tile 计算时间之和，pin=各线程绑核系统调用时间之和。仅计时，不改数值路径。 */
+#define RV_TP_NS 16
+static struct { int cols, nit; long n; double pre, par, post; long busy_ns, pin_ns; } g_tp[RV_TP_NS];
+static int g_tp_n = 0;
+static int rv_q4_tprof_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_Q4_TPROF"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+static long rv_tp_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000000000L + t.tv_nsec;
+}
+static void rv_tp_dump(void) {
+    for (int i = 0; i < g_tp_n; i++) {
+        const double n = g_tp[i].n ? (double)g_tp[i].n : 1.0;
+        fprintf(stderr, "[Q4TPROF] cols=%d tiles=%d calls=%ld us/call: pre=%.1f par=%.1f post=%.1f busy=%.1f pin=%.1f\n",
+                g_tp[i].cols, g_tp[i].nit, g_tp[i].n, g_tp[i].pre * 1e6 / n, g_tp[i].par * 1e6 / n,
+                g_tp[i].post * 1e6 / n, g_tp[i].busy_ns * 1e-3 / n, g_tp[i].pin_ns * 1e-3 / n);
+    }
+}
+static int rv_tp_slot(int cols, int nit) {
+    for (int i = 0; i < g_tp_n; i++) if (g_tp[i].cols == cols && g_tp[i].nit == nit) return i;
+    if (g_tp_n >= RV_TP_NS) return -1;
+    if (g_tp_n == 0) atexit(rv_tp_dump);
+    g_tp[g_tp_n].cols = cols; g_tp[g_tp_n].nit = nit;
+    return g_tp_n++;
+}
+
+static void rv_q4_dec_worker(void *c_, int it) {
+    rv_q4_dec_ctx *c = (rv_q4_dec_ctx *)c_;
+    int i = 0;
+    while (it >= c->t0[i + 1]) i++;
+    const int ti = it - c->t0[i];
+    const rv_q4_dec_mat *m = &c->m[i];
+    const long tp0 = c->tp >= 0 ? rv_tp_ns() : 0;
+    if (c->vm) {
+        if (t_vm_gen != c->gen) {
+            t_vm_gen = c->gen;
+            const int tid = vllm_tp_worker_id();
+            const int slot = tid < 0 ? 0 : tid;        /* 串行路径：调用者按 slot 0 */
+            /* 池 worker（slot < nthreads-1）的亲和性只会被 prefill IME 路径（rv_ime_mix_worker）临时改动，
+             * 该路径恢复后清空 t_vm_cpu；故上次 rv_vm_pin 成功后仅用 sched_getcpu（vDSO）复核，免去每调用的 setaffinity/getaffinity；
+             * 调用者（slot == nthreads-1）区间后恢复原亲和性，必须每次重新 pin。 */
+            const int is_worker = tid >= 0 && tid < vllm_tp_threads() - 1;
+            if (is_worker && t_vm_cpu == slot && sched_getcpu() == slot) {
+                t_vm_ok = 1;
+            } else {
+                t_vm_ok = rv_vm_pin(slot);
+                t_vm_cpu = t_vm_ok ? slot : -1;
+            }
+            if (c->tp >= 0) __atomic_fetch_add(&g_tp[c->tp].pin_ns, rv_tp_ns() - tp0, __ATOMIC_RELAXED);
+            if (!t_vm_ok && getenv("VLLM_Q4VM_DIAG")) {
+                static int seen[16]; int s = slot & 15;
+                if (!__atomic_exchange_n(&seen[s], 1, __ATOMIC_RELAXED))
+                    fprintf(stderr, "[Q4VM-DIAG] pin fail slot=%d wid=%d nt=%d getcpu=%d\n",
+                            slot, vllm_tp_worker_id(), vllm_tp_threads(), sched_getcpu());
+            }
+        }
+        if (t_vm_ok && c->wi[i]) {
+            rv_vm_tile32(c->wi[i], ti, c->xq, c->xd, c->corr, c->nblk, m->out + (size_t)ti * 32,
+                         m->resid ? m->resid + (size_t)ti * 32 : NULL);
+            if (c->cnt_on) __atomic_fetch_add(&c->n_vm, 1, __ATOMIC_RELAXED);
+            if (c->tp >= 0) __atomic_fetch_add(&g_tp[c->tp].busy_ns, rv_tp_ns() - tp0, __ATOMIC_RELAXED);
+            return;
+        }
+        if (c->cnt_on) __atomic_fetch_add(&c->n_rvv, 1, __ATOMIC_RELAXED);
+    }
+    rv_q4_dec_tile(m->w + (size_t)ti * (size_t)c->nblk * 576, c->xq, c->xd, c->sx,
+                   m->out + (size_t)ti * 32, m->resid ? m->resid + (size_t)ti * 32 : NULL,
+                   c->nblk, c->scv);
+    if (c->tp >= 0) __atomic_fetch_add(&g_tp[c->tp].busy_ns, rv_tp_ns() - tp0, __ATOMIC_RELAXED);
+}
+
+/* VLLM_Q4_PREV（默认开，性能优先；=0 关闭回退标量）：dec_rows 串行段（激活量化 + sx + corr）的 RVV 版本。
+ * 与标量逐位一致：max|·| 归约无舍入（初值 1e-10）；scale=max/127 标量算；每元素 vfdiv（IEEE 正确舍入，
+ * 与标量 fdiv 同）→ vfadd 0.5 → vfcvt_rtz（=(int) 截断）→ clamp ±127；sx 为 int 精确和。
+ * 激活不再展开成 128B/块（vmadot 内核改为块内 vrgather），省掉一次 4× 字节搬运。
+ * Q4CHK=1 时与标量逐字节对拍（[Q4CHK-pre]）。 */
+static int rv_q4_prev_on(void) { static int v=-1; if (v<0){const char*e=getenv("VLLM_Q4_PREV"); v=(e&&e[0]=='0')?0:1;} return v; }
+static void rv_q4_pre_rvv(const float *x, int8_t *xq, float *xd, int32_t *sx,
+                          int32_t *corr, int n_blocks) {
+    const size_t vl = 32;
+    for (int b = 0; b < n_blocks; b++) {
+        const float *xb = x + (size_t)b * 32;
+        vfloat32m8_t v = __riscv_vle32_v_f32m8(xb, vl);
+        vfloat32m1_t m0 = __riscv_vfmv_s_f_f32m1(1e-10f, 1);
+        float max_abs = __riscv_vfmv_f_s_f32m1_f32(
+            __riscv_vfredmax_vs_f32m8_f32m1(__riscv_vfabs_v_f32m8(v, vl), m0, vl));
+        const float scale = max_abs / 127.0f;
+        xd[b] = scale;
+        vfloat32m8_t t = __riscv_vfadd_vf_f32m8(__riscv_vfdiv_vf_f32m8(v, scale, vl), 0.5f, vl);
+        vint32m8_t qi = __riscv_vfcvt_rtz_x_f_v_i32m8(t, vl);
+        qi = __riscv_vmin_vx_i32m8(__riscv_vmax_vx_i32m8(qi, -127, vl), 127, vl);
+        vint8m2_t q8 = __riscv_vncvt_x_x_w_i8m2(__riscv_vncvt_x_x_w_i16m4(qi, vl), vl);
+        __riscv_vse8_v_i8m2(xq + (size_t)b * 32, q8, vl);
+        vint32m1_t z = __riscv_vmv_s_x_i32m1(0, 1);
+        const int32_t s = __riscv_vmv_x_s_i32m1_i32(__riscv_vredsum_vs_i32m8_i32m1(qi, z, vl));
+        sx[b] = s;
+        if (corr) corr[b] = 8 * s;
+    }
+}
+
+static void rv_q4_dec_rows(const rv_q4_dec_mat *m, int nm, const float *x, int n_blocks) {
+    static __thread int8_t *xq = NULL; static __thread float *xd = NULL;
+    static __thread int32_t *sx = NULL; static __thread int cap = 0;
+    const int cols = n_blocks * 32;
+    const int tpon = rv_q4_tprof_on();
+    const long tpa = tpon ? rv_tp_ns() : 0;
+    const int tp_ime0 = g_rv_ime_n;                   /* 本次发生权重重排（一次性）则不计入 TPROF */
+    if (cap < n_blocks) {
+        int8_t *q = (int8_t *)realloc(xq, (size_t)cols);
+        if (q) xq = q;
+        float *d = (float *)realloc(xd, (size_t)n_blocks * sizeof(float));
+        if (d) xd = d;
+        int32_t *s = (int32_t *)realloc(sx, (size_t)n_blocks * sizeof(int32_t));
+        if (s) sx = s;
+        if (!q || !d || !s) { fprintf(stderr, "[Q4DEC] scratch alloc failed\n"); abort(); }
+        cap = n_blocks;
+    }
+    static __thread int32_t *corr = NULL; static __thread int vcap = 0;
+    const int vmon = rv_q4_vm_on();
+    if (vmon && vcap < n_blocks) {
+        int32_t *k = (int32_t *)realloc(corr, (size_t)n_blocks * sizeof(int32_t));
+        if (k) corr = k;
+        if (!k) { fprintf(stderr, "[Q4VM] scratch alloc failed\n"); abort(); }
+        vcap = n_blocks;
+    }
+    const int prev = rv_q4_prev_on();
+    if (prev) rv_q4_pre_rvv(x, xq, xd, sx, vmon ? corr : NULL, n_blocks);
+    else {
+        quantize_row_q8_0_act(x, xq, xd, cols);
+        for (int b = 0; b < n_blocks; b++) {
+            int32_t s = 0;
+            for (int k = 0; k < 32; k++) s += xq[b * 32 + k];
+            sx[b] = s;
+        }
+        if (vmon) for (int b = 0; b < n_blocks; b++) corr[b] = 8 * sx[b];
+    }
+    /* Q4CHK-pre：PREV 开时前 N 次对标量串行段逐字节对拍 */
+    static int pchk = -1, pcnt = 0, pchk_n = 32;
+    if (pchk < 0) {
+        const char *e = getenv("VLLM_Q4CHK"); pchk = (e && e[0] == '1') ? 1 : 0;
+        const char *n = getenv("VLLM_Q4CHK_N"); if (n) { int v = atoi(n); if (v >= 1) pchk_n = v; }
+    }
+    if (prev && pchk && pcnt < pchk_n) {
+        pcnt++;
+        int8_t *q2 = (int8_t *)malloc((size_t)cols); float *d2 = (float *)malloc((size_t)n_blocks * sizeof(float));
+        if (!q2 || !d2) { fprintf(stderr, "[Q4CHK-pre] alloc failed\n"); abort(); }
+        quantize_row_q8_0_act(x, q2, d2, cols);
+        int bq = memcmp(q2, xq, (size_t)cols) != 0, bd = memcmp(d2, xd, (size_t)n_blocks * sizeof(float)) != 0, bs = 0, br = 0;
+        for (int b = 0; b < n_blocks; b++) {
+            int32_t s = 0; for (int k = 0; k < 32; k++) s += q2[b * 32 + k];
+            if (s != sx[b]) bs++;
+            if (vmon && corr[b] != 8 * s) br++;
+        }
+        fprintf(stderr, "[Q4CHK-pre] cols=%d xq_bad=%d xd_bad=%d sx_bad=%d corr_bad=%d\n", cols, bq, bd, bs, br);
+        free(q2); free(d2);
+    }
+    rv_q4_dec_ctx c;
+    memset(&c, 0, sizeof c);
+    c.nm = nm; c.nblk = n_blocks; c.scv = rv_q4_scv_on();
+    c.xq = xq; c.xd = xd; c.sx = sx;
+    c.t0[0] = 0;
+    for (int i = 0; i < nm; i++) { c.m[i] = m[i]; c.t0[i + 1] = c.t0[i] + m[i].rows / 32; }
+    const int nit = c.t0[nm];
+    /* VMADOT：权重 288B 重排（调用者线程、parfor 之前；缓存命中后为查表）+ 激活 corr（调用者 TLS，
+     * 整个 parfor 期间只读）；激活本身用 c.xq（32B/块） */
+    static long g_vm_gen = 0;
+    if (vmon) {
+        for (int i = 0; i < nm; i++)
+            c.wi[i] = (m[i].rows % 32) == 0 ? rv_ime_get(m[i].w, m[i].rows, n_blocks) : NULL;
+        c.vm = 1; c.corr = corr;
+        c.gen = __atomic_add_fetch(&g_vm_gen, 1, __ATOMIC_RELAXED);
+    }
+    /* 自检（VLLM_Q4CHK=1，前 N 次，N=VLLM_Q4CHK_N，默认 32）：全部矩阵全部 tile 对 rv_q4_col_tile 逐元素比位；
+     * 带 resid 的矩阵先快照 resid（out 可能与 resid 同址） */
+    static int chk = -1, cnt = 0, chk_n = 32;
+    if (chk < 0) {
+        const char *e = getenv("VLLM_Q4CHK"); chk = (e && e[0] == '1') ? 1 : 0;
+        const char *n = getenv("VLLM_Q4CHK_N"); if (n) { int v = atoi(n); if (v >= 1) chk_n = v; }
+    }
+    const int do_chk = chk && cnt < chk_n;
+    c.cnt_on = do_chk;
+    float *rsnap[RV_Q4_DEC_MAXM] = { 0 };
+    if (do_chk) {
+        for (int i = 0; i < nm; i++) if (m[i].resid) {
+            rsnap[i] = (float *)malloc((size_t)m[i].rows * sizeof(float));
+            if (!rsnap[i]) { fprintf(stderr, "[Q4DEC] chk alloc failed\n"); abort(); }
+            memcpy(rsnap[i], m[i].resid, (size_t)m[i].rows * sizeof(float));
+        }
+    }
+    /* VLLM_Q4_DYN（默认开，=0 回退静态切分）：tile 原子领取的动态调度，消除共享主机上静态切分的拖尾；
+     * 每个 tile 独立计算，执行线程无关 → 位级一致（D6：Q4CHK bad=0、NLL/md5 一致；t8 4B -10%）。
+     * VLLM_Q4_DYN_GRAIN 每次领取 tile 数（默认 2；=1 在 0.6B t8 实测 +35% 变慢） */
+    static int dyn = -1, dyn_gr = 2;
+    if (dyn < 0) {
+        const char *e = getenv("VLLM_Q4_DYN"); dyn = (e && e[0] == '0') ? 0 : 1;
+        const char *g = getenv("VLLM_Q4_DYN_GRAIN");
+        if (g) { int v = atoi(g); if (v >= 1 && v <= 64) dyn_gr = v; }
+    }
+    /* VMADOT：调用者在本次调用内可能被绑到 IME hart，区间结束后恢复其原亲和性
+     * （主线程的串行段与其后创建的线程不得继承单核掩码）；池 worker 绑核持久，每次调用重新确认。 */
+    cpu_set_t caller_old; int caller_ho = 0;
+    if (c.vm) caller_ho = sched_getaffinity(0, sizeof(caller_old), &caller_old) == 0;
+    c.tp = (tpon && !do_chk && g_rv_ime_n == tp_ime0) ? rv_tp_slot(cols, nit) : -1;
+    const long tpb = c.tp >= 0 ? rv_tp_ns() : 0;
+    if (vllm_tp_threads() > 1 && nit >= 2) {
+        if (dyn) vllm_tp_parfor_dyn(0, nit, dyn_gr, rv_q4_dec_worker, &c);
+        else vllm_tp_parfor(0, nit, rv_q4_dec_worker, &c);
+    }
+    else for (int i = 0; i < nit; i++) rv_q4_dec_worker(&c, i);
+    const long tpc = c.tp >= 0 ? rv_tp_ns() : 0;
+    if (c.vm && vllm_tp_worker_id() < 0) {             /* 调用者不在并行区内：恢复并作废其本线程绑核记录 */
+        if (caller_ho) sched_setaffinity(0, sizeof(caller_old), &caller_old);
+        t_vm_gen = -1; t_vm_ok = 0; t_vm_cpu = -1;
+    }
+    if (c.tp >= 0) {
+        const long tpd = rv_tp_ns();
+        g_tp[c.tp].n++;
+        g_tp[c.tp].pre += (tpb - tpa) * 1e-9;
+        g_tp[c.tp].par += (tpc - tpb) * 1e-9;
+        g_tp[c.tp].post += (tpd - tpc) * 1e-9;
+    }
+    /* Q4CHK-vm：调用者绑 hart0 并确认后，全部矩阵全部 tile 强制走 vmadot 单元（写临时缓冲），
+     * 对 rv_q4_col_tile（含 resid 快照）逐位比较；绑核失败 bitmismatch=-1（跳过对拍）。 */
+    if (do_chk && c.vm) {
+        int nbad = 0, ntile = 0; float mx = 0.0f;
+        cpu_set_t old; const int ho = sched_getaffinity(0, sizeof(old), &old) == 0;
+        if (!rv_vm_pin(0)) nbad = -1;
+        else {
+            float o[32], ref[32];
+            for (int i = 0; i < nm; i++) {
+                if (!c.wi[i]) continue;
+                for (int ti = 0; ti < m[i].rows / 32; ti++, ntile++) {
+                    const float *rs = rsnap[i] ? rsnap[i] + (size_t)ti * 32 : NULL;
+                    rv_vm_tile32(c.wi[i], ti, xq, xd, corr, n_blocks, o, rs);
+                    rv_q4_col_tile(m[i].w + (size_t)ti * n_blocks * 576, xq, xd, ref, rs, n_blocks);
+                    for (int k = 0; k < 32; k++) {
+                        if (memcmp(&o[k], &ref[k], sizeof(float)) != 0) nbad++;
+                        float d = o[k] - ref[k]; if (d < 0) d = -d; if (d > mx) mx = d;
+                    }
+                }
+            }
+        }
+        if (ho) sched_setaffinity(0, sizeof(old), &old);
+        if (vllm_tp_worker_id() < 0) { t_vm_gen = -1; t_vm_ok = 0; t_vm_cpu = -1; }
+        int nwi = 0; for (int i = 0; i < nm; i++) nwi += c.wi[i] != NULL;
+        fprintf(stderr, "[Q4CHK-vm] nm=%d wi=%d cols=%d tiles=%d units vm=%ld rvv=%ld bitmismatch=%d max|d|=%.9g\n",
+                nm, nwi, cols, ntile, c.n_vm, c.n_rvv, nbad, (double)mx);
+    }
+    { if (do_chk) {
+          cnt++;
+          float ref[32]; int nbad = 0, ntile = 0, nres = 0; float mx = 0.0f;
+          for (int i = 0; i < nm; i++) {
+              if (rsnap[i]) nres++;
+              for (int ti = 0; ti < m[i].rows / 32; ti++, ntile++) {
+                  rv_q4_col_tile(m[i].w + (size_t)ti * n_blocks * 576, xq, xd, ref,
+                                 rsnap[i] ? rsnap[i] + (size_t)ti * 32 : NULL, n_blocks);
+                  const float *o = m[i].out + (size_t)ti * 32;
+                  for (int k = 0; k < 32; k++) {
+                      if (memcmp(&o[k], &ref[k], sizeof(float)) != 0) nbad++;
+                      float d = o[k] - ref[k]; if (d < 0) d = -d; if (d > mx) mx = d;
+                  }
+              }
+          }
+          fprintf(stderr, "[Q4CHK-dec] nm=%d resid=%d cols=%d tiles=%d bitmismatch=%d max|d|=%.9g\n",
+                  nm, nres, cols, ntile, nbad, (double)mx);
+          for (int i = 0; i < nm; i++) free(rsnap[i]);
+      }
+    }
 }
 
 static void rv_q4_lane_rows_par_bt(const uint8_t *w, const float *xb, float *ob,
@@ -3185,6 +4196,12 @@ static void dyn_matvec_q4_q8_fused_qkv_batched_neon(
     }
     if (mode == 3 && (q_rows & 31) == 0 && (kv_rows & 31) == 0 &&
         rv_q4_lanes() >= 8 && rv_q4_int_on()) {
+        if (n_batch == 1 && rv_q4_dec_on()) {
+            rv_q4_dec_mat m3[3] = { { q4_q, q_out, NULL, q_rows }, { q4_k, k_out, NULL, kv_rows },
+                                    { q4_v, v_out, NULL, kv_rows } };
+            rv_q4_dec_rows(m3, 3, x_batch, n_blocks);
+            return;
+        }
         rv_q4_col_rows_par_bt(q4_q, x_batch, q_out, NULL, q_rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_k, x_batch, k_out, NULL, kv_rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_v, x_batch, v_out, NULL, kv_rows, cols, n_blocks, n_batch);
@@ -3326,6 +4343,11 @@ static void dyn_matvec_q4_q8_fused_gate_up_batched_neon(
         return;
     }
     if (mode == 3 && (rows & 31) == 0 && rv_q4_lanes() >= 8 && rv_q4_int_on()) {
+        if (n_batch == 1 && rv_q4_dec_on()) {
+            rv_q4_dec_mat m2[2] = { { q4_gate, gate_out, NULL, rows }, { q4_up, up_out, NULL, rows } };
+            rv_q4_dec_rows(m2, 2, x_batch, n_blocks);
+            return;
+        }
         rv_q4_col_rows_par_bt(q4_gate, x_batch, gate_out, NULL, rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_up,   x_batch, up_out,   NULL, rows, cols, n_blocks, n_batch);
         return;
@@ -3430,6 +4452,21 @@ static float st_attn_qk_scalar(const float *restrict q, const float *restrict kp
     return mx;
 }
 /* softmax（sc[0..n) 原位变权重）+ VKQ 加权累加到 o[]。 */
+#if ST_HAVE_RVV
+/* r10 d4：RISC-V attention 显式 RVV（VLLM_ATTN_RVV=0 关闭回标量）。
+ * 位级等价：QK 把 8 个位置铺到 e32m1 的 8 个 lane（每 lane 仍 i 升序 mul+add）；
+ * VKQ 沿 i 铺 lane（每个 o[i] 仍 s 升序 mul+add）；exp/sum/max 保持标量原式。
+ * 要求 VLMAX(e32m1) >= 8（VLEN>=256），否则退回标量。 */
+static int st_attn_rvv_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_ATTN_RVV");
+        v = (e && e[0] == '0') ? 0 : (__riscv_vsetvlmax_e32m1() >= 8);
+    }
+    return v;
+}
+#endif
+
 static void st_attn_softmax_vkq_scalar(float *restrict sc, const float *restrict vp_head,
                                        float *restrict o, int n, int hd, float mx,
                                        float *restrict imp_row) {
@@ -3439,6 +4476,24 @@ static void st_attn_softmax_vkq_scalar(float *restrict sc, const float *restrict
         sum_exp += sc[s];
     }
     float inv_sum = 1.0f / sum_exp;
+#if ST_HAVE_RVV
+    if (st_attn_rvv_on()) {
+        if (imp_row) for (int s = 0; s < n; s++) imp_row[s] += sc[s] * inv_sum;
+        for (int i0 = 0; i0 < hd; ) {
+            size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+            vfloat32m8_t acc = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+            const float *vp = vp_head + i0;
+            for (int s = 0; s < n; s++, vp += hd) {
+                float wgt = sc[s] * inv_sum;
+                acc = __riscv_vfadd_vv_f32m8(acc,
+                        __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(vp, vl), wgt, vl), vl);
+            }
+            __riscv_vse32_v_f32m8(o + i0, acc, vl);
+            i0 += (int)vl;
+        }
+        return;
+    }
+#endif
     for (int i = 0; i < hd; i++) o[i] = 0.0f;
     for (int s = 0; s < n; s++) {
         float wgt = sc[s] * inv_sum;
@@ -3502,9 +4557,38 @@ static void st_attn_k_block8(const float *restrict k_pack, float *restrict kb,
 static float st_attn_qk_block8(const float *restrict q, const float *restrict kb_head,
                                float *restrict sc, int n, int hd, float scale) {
 #if ST_ARCH_RISCV
-    /* RISC-V：无 AVX2，走标量同形实现。块 8 重排布局下逐通道 i 升序做
-     * mul+add（-ffp-contract=off 阻断 FMA 收缩），与下方标量尾分支同一链序，
-     * 因此与 x86 参考核（mul+add 物化后逐位同）一致。 */
+    /* RISC-V：块 8 重排布局下逐通道 i 升序做 mul+add（-ffp-contract=off 阻断 FMA
+     * 收缩），与下方标量尾分支同一链序，因此与 x86 参考核逐位一致。
+     * r10 d4：RVV 版把 8 个位置铺到 e32m1 的 8 lane，两块并行两条独立链；
+     * 每 lane 运算序列与标量逐字同形（vfmul 后 vfadd，显式 intrinsic 不融合）。 */
+#if ST_HAVE_RVV
+    if (st_attn_rvv_on()) {
+        int s = 0, b = 0;
+        for (; s + 16 <= n; s += 16, b += 2) {
+            const float *k0 = kb_head + (size_t)b * (size_t)hd * 8;
+            const float *k1 = k0 + (size_t)hd * 8;
+            vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, 8);
+            vfloat32m1_t a1 = __riscv_vfmv_v_f_f32m1(0.0f, 8);
+            for (int i = 0; i < hd; i++) {
+                a0 = __riscv_vfadd_vv_f32m1(a0,
+                        __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(k0 + (size_t)i * 8, 8), q[i], 8), 8);
+                a1 = __riscv_vfadd_vv_f32m1(a1,
+                        __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(k1 + (size_t)i * 8, 8), q[i], 8), 8);
+            }
+            __riscv_vse32_v_f32m1(sc + s, __riscv_vfmul_vf_f32m1(a0, scale, 8), 8);
+            __riscv_vse32_v_f32m1(sc + s + 8, __riscv_vfmul_vf_f32m1(a1, scale, 8), 8);
+        }
+        for (; s < n; s += 8, b++) {   /* 末块：vl=剩余位置数（补 0 列不写回） */
+            size_t vl = (size_t)(n - s < 8 ? n - s : 8);
+            const float *k0 = kb_head + (size_t)b * (size_t)hd * 8;
+            vfloat32m1_t a0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            for (int i = 0; i < hd; i++)
+                a0 = __riscv_vfadd_vv_f32m1(a0,
+                        __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(k0 + (size_t)i * 8, vl), q[i], vl), vl);
+            __riscv_vse32_v_f32m1(sc + s, __riscv_vfmul_vf_f32m1(a0, scale, vl), vl);
+        }
+    } else
+#endif
     for (int s = 0; s < n; s++) {
         const float *kb = kb_head + (size_t)(s >> 3) * (size_t)hd * 8 + (s & 7);
         float dot = 0.0f;
@@ -3675,21 +4759,212 @@ static void st_attn_batched_packed_neon(
     }
 }
 
-static void flash_attn_single_q_q8_neon(
-    float *restrict attn_out,           /* [hd] 归一化输出 */
-    const float *restrict q,            /* [hd] query 激活 */
-    int8_t *const *k_cache_q8,          /* 每层 INT8 K 块数组 */
-    int8_t *const *v_cache_q8,
-    const float *restrict kscale,       /* k_scale[l] + kh */
-    const float *restrict vscale,
-    int seq_len, int kv_dim, int kv_bs, int nkv,
-    int kh_off, int hd, float scale)
+static void fa_q8_core_scalar(
+    float *restrict attn_out, const int8_t *restrict qi, const float *restrict qsc,
+    int8_t *const *k_cache_q8, int8_t *const *v_cache_q8,
+    const float *restrict kscale, const float *restrict vscale,
+    int seq_len, int kv_dim, int kv_bs, int nkv, int kh_off, int hd, float scale);
+
+#if ST_HAVE_RVV
+static long g_dattn_bad, g_dattn_calls;
+/* decode INT8-KV attention 显式 RVV（VLLM_DATTN_RVV=0 关闭回标量）。
+ * 位级等价：dot32 为精确整数；s 仍按 b 升序标量累加；softmax/expf 标量原式；
+ * rescale 与 V 累加沿 i 铺 lane，逐元素 mul 再 add（不用 fmacc，对齐 -ffp-contract=off）。
+ * 要求 VLMAX(e8m2) >= 32（一次装下一个 32 元素块）。 */
+static int st_dattn_rvv_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_DATTN_RVV");
+        v = (e && e[0] == '0') ? 0 : (__riscv_vsetvlmax_e8m2() >= 32);
+    }
+    return v;
+}
+/* VLLM_DATTN_CHK=1：每次调用同时跑标量参考并 memcmp（诊断用，默认关）。 */
+static int st_dattn_chk_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_DATTN_CHK");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+static void fa_q8_core_rvv(
+    float *restrict attn_out, const int8_t *restrict qi, const float *restrict qsc,
+    int8_t *const *k_cache_q8, int8_t *const *v_cache_q8,
+    const float *restrict kscale, const float *restrict vscale,
+    int seq_len, int kv_dim, int kv_bs, int nkv, int kh_off, int hd, float scale)
 {
     const int nblk = hd / 32;
     const float KVQ_INV = 1.0f / 127.0f;
-    float qsc[8];
-    int8_t qi[256];
+    for (int i = 0; i < hd; i++) attn_out[i] = 0.0f;
+    float M = -1e9f, S = 0.0f;
 
+    const size_t vlb = __riscv_vsetvl_e8m2(32);
+    const vint32m1_t z32 = __riscv_vmv_v_x_i32m1(0, 1);
+
+    for (int t = 0; t < seq_len; t++) {
+        const int8_t *kt = k_cache_q8[t / kv_bs] + (size_t)(t % kv_bs) * kv_dim + kh_off;
+        const int8_t *vt = v_cache_q8[t / kv_bs] + (size_t)(t % kv_bs) * kv_dim + kh_off;
+        float ks = kscale[(size_t)t * nkv] * KVQ_INV;
+        float vs = vscale[(size_t)t * nkv] * KVQ_INV;
+
+        float s = 0.0f;
+        for (int b = 0; b < nblk; b++) {
+            vint8m2_t kv = __riscv_vle8_v_i8m2(kt + b * 32, vlb);
+            vint8m2_t qb = __riscv_vle8_v_i8m2(qi + b * 32, vlb);
+            vint16m4_t p = __riscv_vwmul_vv_i16m4(qb, kv, vlb);
+            vint32m1_t r = __riscv_vwredsum_vs_i16m4_i32m1(p, z32, vlb);
+            int32_t dot32 = __riscv_vmv_x_s_i32m1_i32(r);
+            s += (float)dot32 * qsc[b];
+        }
+        s = s * ks * scale;
+
+        float vsf;
+        if (s > M) {
+            float ms = expf(M - s);
+            M = s;
+            S *= ms;
+            for (int i0 = 0; i0 < hd; ) {
+                size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+                vfloat32m8_t o = __riscv_vle32_v_f32m8(attn_out + i0, vl);
+                __riscv_vse32_v_f32m8(attn_out + i0, __riscv_vfmul_vf_f32m8(o, ms, vl), vl);
+                i0 += (int)vl;
+            }
+            vsf = 1.0f;
+        } else {
+            vsf = expf(s - M);
+        }
+        S += vsf;
+
+        float wv = vsf * vs;
+        for (int i0 = 0; i0 < hd; ) {
+            /* 顺序勿动：GCC 13.2 vsetvl pass 会把 e32m8 并入同 ratio 的 e8m2，
+             * 若 vle8 先发则 vsext.vf4 落在 SEW=8 下 → SIGILL；先 vle32 可规避。 */
+            size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+            vfloat32m8_t o = __riscv_vle32_v_f32m8(attn_out + i0, vl);
+            vint8m2_t v8 = __riscv_vle8_v_i8m2(vt + i0, vl);
+            vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(__riscv_vsext_vf4_i32m8(v8, vl), vl);
+            o = __riscv_vfadd_vv_f32m8(o, __riscv_vfmul_vf_f32m8(vf, wv, vl), vl);
+            __riscv_vse32_v_f32m8(attn_out + i0, o, vl);
+            i0 += (int)vl;
+        }
+    }
+    float inv = (S > 0.0f) ? 1.0f / S : 0.0f;
+    for (int i0 = 0; i0 < hd; ) {
+        size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+        vfloat32m8_t o = __riscv_vle32_v_f32m8(attn_out + i0, vl);
+        __riscv_vse32_v_f32m8(attn_out + i0, __riscv_vfmul_vf_f32m8(o, inv, vl), vl);
+        i0 += (int)vl;
+    }
+}
+
+/* GQA 分组版：同一 kv head 的 G 个 q head 共享 K 行装载与 V 的 int8→f32 转换。
+ * 每个 q head 的浮点步序与 fa_q8_core_rvv 逐条相同（s 按 b 升序、先 rescale 后 V 累加、
+ * 逐元素 mul 再 add），故输出逐位一致。
+ * 默认关（VLLM_DATTN_GQA=1 开启）：4B/N≤128 实测无收益（§12.9）：每层 INT8 K+V 约 0.28MB，可驻留 L2，重复扫描不是瓶颈。 */
+#define ST_DATTN_GMAX 8
+static int st_dattn_gqa_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("VLLM_DATTN_GQA");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+static void fa_q8_core_rvv_g(
+    float *restrict out,                /* [G * hd]，q head 连续 */
+    const int8_t *restrict qi,          /* [G * 256] */
+    const float *restrict qsc,          /* [G * 8] */
+    int G,
+    int8_t *const *k_cache_q8, int8_t *const *v_cache_q8,
+    const float *restrict kscale, const float *restrict vscale,
+    int seq_len, int kv_dim, int kv_bs, int nkv, int kh_off, int hd, float scale)
+{
+    const int nblk = hd / 32;
+    const float KVQ_INV = 1.0f / 127.0f;
+    float M[ST_DATTN_GMAX], S[ST_DATTN_GMAX], s[ST_DATTN_GMAX], wv[ST_DATTN_GMAX];
+    for (int i = 0; i < G * hd; i++) out[i] = 0.0f;
+    for (int g = 0; g < G; g++) { M[g] = -1e9f; S[g] = 0.0f; }
+
+    const size_t vlb = __riscv_vsetvl_e8m2(32);
+    const vint32m1_t z32 = __riscv_vmv_v_x_i32m1(0, 1);
+
+    for (int t = 0; t < seq_len; t++) {
+        const int8_t *kt = k_cache_q8[t / kv_bs] + (size_t)(t % kv_bs) * kv_dim + kh_off;
+        const int8_t *vt = v_cache_q8[t / kv_bs] + (size_t)(t % kv_bs) * kv_dim + kh_off;
+        float ks = kscale[(size_t)t * nkv] * KVQ_INV;
+        float vs = vscale[(size_t)t * nkv] * KVQ_INV;
+
+        for (int g = 0; g < G; g++) s[g] = 0.0f;
+        for (int b = 0; b < nblk; b++) {
+            vint8m2_t kv = __riscv_vle8_v_i8m2(kt + b * 32, vlb);
+            for (int g = 0; g < G; g++) {
+                vint8m2_t qb = __riscv_vle8_v_i8m2(qi + g * 256 + b * 32, vlb);
+                vint16m4_t p = __riscv_vwmul_vv_i16m4(qb, kv, vlb);
+                vint32m1_t r = __riscv_vwredsum_vs_i16m4_i32m1(p, z32, vlb);
+                s[g] += (float)__riscv_vmv_x_s_i32m1_i32(r) * qsc[g * 8 + b];
+            }
+        }
+
+        for (int g = 0; g < G; g++) {
+            float sg = s[g] * ks * scale;
+            float vsf;
+            if (sg > M[g]) {
+                float ms = expf(M[g] - sg);
+                M[g] = sg;
+                S[g] *= ms;
+                float *og = out + (size_t)g * hd;
+                for (int i0 = 0; i0 < hd; ) {
+                    size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+                    vfloat32m8_t o = __riscv_vle32_v_f32m8(og + i0, vl);
+                    __riscv_vse32_v_f32m8(og + i0, __riscv_vfmul_vf_f32m8(o, ms, vl), vl);
+                    i0 += (int)vl;
+                }
+                vsf = 1.0f;
+            } else {
+                vsf = expf(sg - M[g]);
+            }
+            S[g] += vsf;
+            wv[g] = vsf * vs;
+        }
+
+        for (int i0 = 0; i0 < hd; ) {
+            /* 顺序勿动：先 vle32 再 vle8（GCC 13.2 vsetvl bug，见 fa_q8_core_rvv）。 */
+            size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+            vfloat32m8_t o = __riscv_vle32_v_f32m8(out + i0, vl);
+            vint8m2_t v8 = __riscv_vle8_v_i8m2(vt + i0, vl);
+            vfloat32m8_t vf = __riscv_vfcvt_f_x_v_f32m8(__riscv_vsext_vf4_i32m8(v8, vl), vl);
+            __riscv_vse32_v_f32m8(out + i0,
+                __riscv_vfadd_vv_f32m8(o, __riscv_vfmul_vf_f32m8(vf, wv[0], vl), vl), vl);
+            for (int g = 1; g < G; g++) {
+                float *og = out + (size_t)g * hd + i0;
+                vfloat32m8_t og_v = __riscv_vle32_v_f32m8(og, vl);
+                __riscv_vse32_v_f32m8(og,
+                    __riscv_vfadd_vv_f32m8(og_v, __riscv_vfmul_vf_f32m8(vf, wv[g], vl), vl), vl);
+            }
+            i0 += (int)vl;
+        }
+    }
+    for (int g = 0; g < G; g++) {
+        float inv = (S[g] > 0.0f) ? 1.0f / S[g] : 0.0f;
+        float *og = out + (size_t)g * hd;
+        for (int i0 = 0; i0 < hd; ) {
+            size_t vl = __riscv_vsetvl_e32m8((size_t)(hd - i0));
+            vfloat32m8_t o = __riscv_vle32_v_f32m8(og + i0, vl);
+            __riscv_vse32_v_f32m8(og + i0, __riscv_vfmul_vf_f32m8(o, inv, vl), vl);
+            i0 += (int)vl;
+        }
+    }
+}
+#endif
+
+/* Q → INT8（每 32 元素 1 max-abs scale，Q8_0 同构）。 */
+static void fa_q8_quant_q(const float *restrict q, int hd, int8_t *restrict qi, float *restrict qsc)
+{
+    const int nblk = hd / 32;
+    const float KVQ_INV = 1.0f / 127.0f;
     for (int b = 0; b < nblk; b++) {
         float qm = 0.0f;
         const float *qb = q + b * 32;
@@ -3706,6 +4981,52 @@ static void flash_attn_single_q_q8_neon(
             qi[b * 32 + i] = (int8_t)((iv > 127) ? 127 : ((iv < -128) ? -128 : iv));
         }
     }
+}
+
+static void flash_attn_single_q_q8_neon(
+    float *restrict attn_out,           /* [hd] 归一化输出 */
+    const float *restrict q,            /* [hd] query 激活 */
+    int8_t *const *k_cache_q8,          /* 每层 INT8 K 块数组 */
+    int8_t *const *v_cache_q8,
+    const float *restrict kscale,       /* k_scale[l] + kh */
+    const float *restrict vscale,
+    int seq_len, int kv_dim, int kv_bs, int nkv,
+    int kh_off, int hd, float scale)
+{
+    float qsc[8];
+    int8_t qi[256];
+
+    fa_q8_quant_q(q, hd, qi, qsc);
+#if ST_HAVE_RVV
+    if (st_dattn_rvv_on()) {
+        fa_q8_core_rvv(attn_out, qi, qsc, k_cache_q8, v_cache_q8, kscale, vscale,
+                       seq_len, kv_dim, kv_bs, nkv, kh_off, hd, scale);
+        if (st_dattn_chk_on()) {
+            float ref[256];
+            fa_q8_core_scalar(ref, qi, qsc, k_cache_q8, v_cache_q8, kscale, vscale,
+                              seq_len, kv_dim, kv_bs, nkv, kh_off, hd, scale);
+            const long bad = memcmp(ref, attn_out, sizeof(float) * (size_t)hd) != 0;
+            const long nb = __atomic_add_fetch(&g_dattn_bad, bad, __ATOMIC_RELAXED);
+            const long nc = __atomic_add_fetch(&g_dattn_calls, 1, __ATOMIC_RELAXED);
+            if ((nc & 16383) == 0 || (bad && nb <= 3))
+                fprintf(stderr, "[DATTN-CHK] calls=%ld bitmismatch=%ld seq=%d\n", nc, nb, seq_len);
+        }
+        return;
+    }
+#endif
+    fa_q8_core_scalar(attn_out, qi, qsc, k_cache_q8, v_cache_q8, kscale, vscale,
+                      seq_len, kv_dim, kv_bs, nkv, kh_off, hd, scale);
+}
+
+/* decode INT8-KV 注意力主循环（标量参考）：online softmax + 逐 token QK/V 累加。 */
+static void fa_q8_core_scalar(
+    float *restrict attn_out, const int8_t *restrict qi, const float *restrict qsc,
+    int8_t *const *k_cache_q8, int8_t *const *v_cache_q8,
+    const float *restrict kscale, const float *restrict vscale,
+    int seq_len, int kv_dim, int kv_bs, int nkv, int kh_off, int hd, float scale)
+{
+    const int nblk = hd / 32;
+    const float KVQ_INV = 1.0f / 127.0f;
     for (int i = 0; i < hd; i++) attn_out[i] = 0.0f;
     float M = -1e9f, S = 0.0f;
 
@@ -9846,6 +11167,26 @@ static void dyn_matvec_q4_q8_fused_down_residual_batched(
 
 /* ---- end Q4_0 functions ---- */
 
+/* E2：decode 小算子（单 token RMSNorm 缩放 / q·k head norm）串行执行开关
+ * （VLLM_DEC_SERNRM=1 开；默认关）。各元素/各 head 独立、表达式不变 ⇒ 与 parfor 位级一致；
+ * 目的：消除每层 4 次 fork/join（工作量仅数 µs）。 */
+static int dec_sernrm_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_DEC_SERNRM"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+static void dec_small_parfor(int n, void (*fn)(void *, int), void *ctx) {
+    if (dec_sernrm_on()) { for (int i = 0; i < n; i++) fn(ctx, i); return; }
+    vllm_tp_parfor(0, n, fn, ctx);
+}
+/* d4: single-token silu*up serial (VLLM_DEC_SERSILU=1); bit-identical (elementwise) */
+static void dec_silu_parfor(int n, void (*fn)(void *, int), void *ctx) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VLLM_DEC_SERSILU"); v = (e && e[0] == '1') ? 1 : 0; }
+    if (v) { for (int i = 0; i < n; i++) fn(ctx, i); return; }
+    vllm_tp_parfor(0, n, fn, ctx);
+}
+
 typedef struct {
     float *out; const float *x; const float *w;
     int d8; float rms;
@@ -9881,7 +11222,7 @@ static void dyn_rms_norm(float *out, const float *x, const float *w,
     for (i = d8; i < d; i++) ss += x[i] * x[i];
     float rms = 1.0f / sqrtf(ss / (float)d + eps);
     vllm_rms_scale_ctx vc = { out, x, w, d8, rms };
-    vllm_tp_parfor(0, (d8 + 7) / 8, vllm_rms_scale_worker, &vc);
+    dec_small_parfor((d8 + 7) / 8, vllm_rms_scale_worker, &vc);
     for (i = d8; i < d; i++) out[i] = x[i] * rms * w[i];
 }
 
@@ -11791,6 +13132,49 @@ typedef struct {
     /* P2: 层内预计算的块级 prefill 重要性（与 head 无关），各 head 只读共享 */
     const float *imp_sum;
 } vllm_attn_head_ctx;
+
+/* GQA 分组 decode attention：按 kv head 并行，组内 G 个 q head 共享 KV 扫描。
+ * 仅在 INT8-KV + RVV + 非 sparse 时启用；否则调用方走 per-head worker。 */
+#if ST_HAVE_RVV
+static int vllm_attn_gqa_ok(const vllm_attn_head_ctx *c) {
+    const STQwenInferenceState *st = c->st;
+    if (!c->use_q8 || !st_dattn_rvv_on() || !st_dattn_gqa_on()) return 0;
+    if (c->nkv <= 0 || c->nh % c->nkv != 0 || c->nh / c->nkv > ST_DATTN_GMAX) return 0;
+    if (c->hd > 256 || (c->hd & 31)) return 0;
+    if (g_sparse_attn && !st->use_kv_q4 &&
+        c->seq_len >= g_sparse_min_ctx && c->seq_len > g_sparse_block * 2) return 0;
+    return 1;
+}
+
+static void vllm_attn_kvgrp_worker(void *ctx_, int kh) {
+    vllm_attn_head_ctx *c = ctx_;
+    STQwenInferenceState *st = c->st;
+    const int G = c->nh / c->nkv, hd = c->hd;
+    int8_t qi[ST_DATTN_GMAX * 256];
+    float qsc[ST_DATTN_GMAX * 8];
+    const int h0 = kh * G;
+    for (int g = 0; g < G; g++)
+        fa_q8_quant_q(st->q_buf + (size_t)(h0 + g) * hd, hd, qi + g * 256, qsc + g * 8);
+    float *out = st->attn_buf + (size_t)h0 * hd;
+    fa_q8_core_rvv_g(out, qi, qsc, G, st->k_cache_q8[c->l], st->v_cache_q8[c->l],
+                     st->k_scale[c->l] + kh, st->v_scale[c->l] + kh,
+                     c->seq_len, c->kv_dim, st->kv_bs, c->nkv, kh * hd, hd, c->scale);
+    if (st_dattn_chk_on()) {
+        for (int g = 0; g < G; g++) {
+            float ref[256];
+            fa_q8_core_scalar(ref, qi + g * 256, qsc + g * 8,
+                              st->k_cache_q8[c->l], st->v_cache_q8[c->l],
+                              st->k_scale[c->l] + kh, st->v_scale[c->l] + kh,
+                              c->seq_len, c->kv_dim, st->kv_bs, c->nkv, kh * hd, hd, c->scale);
+            const long bad = memcmp(ref, out + (size_t)g * hd, sizeof(float) * (size_t)hd) != 0;
+            const long nb = __atomic_add_fetch(&g_dattn_bad, bad, __ATOMIC_RELAXED);
+            const long nc = __atomic_add_fetch(&g_dattn_calls, 1, __ATOMIC_RELAXED);
+            if ((nc & 16383) == 0 || (bad && nb <= 3))
+                fprintf(stderr, "[DATTN-CHK] gqa calls=%ld bitmismatch=%ld seq=%d\n", nc, nb, c->seq_len);
+        }
+    }
+}
+#endif
 
 static void vllm_attn_head_worker(void *ctx_, int h) {
     vllm_attn_head_ctx *c = ctx_;
@@ -18252,7 +19636,24 @@ static void spec_l1_logits(STQwenInferenceState *st, int pos) {
     fclose(f);
 }
 
+static void st_qwen_model_forward_impl(STQwenInferenceState *st, int token_id);
+
+/* VLLM_DEC_THREADS（默认 0=不限制）：单 token decode 期间 parfor/parfor_dyn 参与线程上限。
+ * tile 独立计算，参与线程数不影响位级结果；prefill 不受影响。
+ * D7/D7b 实测 pool8 内限 6 比真 6 线程池慢（4B 532-541 vs 481-488 ms/tok），故默认关。 */
 void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
+    static int dnt = -1;
+    if (dnt < 0) {
+        const char *e = getenv("VLLM_DEC_THREADS");
+        dnt = e ? atoi(e) : 0;
+        if (dnt < 0) dnt = 0;
+    }
+    int old = dnt > 0 ? vllm_tp_set_active(dnt) : -1;
+    st_qwen_model_forward_impl(st, token_id);
+    if (old >= 0) vllm_tp_set_active(old);
+}
+
+static void st_qwen_model_forward_impl(STQwenInferenceState *st, int token_id) {
     STModelWeights *w = &st->weights;
     int d  = st->cfg.dim;
     int nl = w->n_layers_allocated;
@@ -18370,12 +19771,12 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
         if (w->q_norm) {
             const float *qw = w->q_norm + l * hd;
             vllm_qk_norm_q_ctx vq = { st->q_buf, qw, hd, nh };
-            vllm_tp_parfor(0, nh, vllm_qk_norm_q_worker, &vq);
+            dec_small_parfor(nh, vllm_qk_norm_q_worker, &vq);
         }
         if (w->k_norm) {
             const float *kw = w->k_norm + l * hd;
             vllm_qk_norm_k_ctx vk = { st->k_buf, kw, hd, nkv };
-            vllm_tp_parfor(0, nkv, vllm_qk_norm_k_worker, &vk);
+            dec_small_parfor(nkv, vllm_qk_norm_k_worker, &vk);
         }
         if (prof) t_nrm += st_now_sec() - tw;
 
@@ -18498,6 +19899,11 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
                 }
                 vllm_attn_head_ctx vh = { st, nh, nkv, hd, l, seq_len, kv_dim, use_q8,
                                           scale, imp_layer };
+#if ST_HAVE_RVV
+                if (vllm_attn_gqa_ok(&vh))
+                    vllm_tp_parfor(0, nkv, vllm_attn_kvgrp_worker, &vh);
+                else
+#endif
                 vllm_tp_parfor(0, nh, vllm_attn_head_worker, &vh);
             }
         if (prof) t_attn += st_now_sec() - t0;
@@ -18637,7 +20043,7 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
             if (prof) t_gu += st_now_sec() - t0;
             vllm_silu_mul_ctx vg = { st->q_buf, st->k_buf, ff };
             if (prof) tw = st_now_sec();
-            vllm_tp_parfor(0, (ff + 15) / 16, vllm_silu_mul_worker, &vg);
+            dec_silu_parfor((ff + 15) / 16, vllm_silu_mul_worker, &vg);
             if (prof) t_silu += st_now_sec() - tw;
             /* P4: fused down projection + FFN residual — writes directly to x */
             if (prof) t0 = st_now_sec();
@@ -18661,7 +20067,7 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
             if (prof) t_gu += st_now_sec() - t0;
             vllm_silu_mul_ctx vg = { st->q_buf, st->k_buf, ff };
             if (prof) tw = st_now_sec();
-            vllm_tp_parfor(0, (ff + 15) / 16, vllm_silu_mul_worker, &vg);
+            dec_silu_parfor((ff + 15) / 16, vllm_silu_mul_worker, &vg);
             if (prof) t_silu += st_now_sec() - tw;
             /* P4: fused down projection + FFN residual — writes directly to x */
             if (prof) t0 = st_now_sec();
@@ -18682,7 +20088,7 @@ void st_qwen_model_forward(STQwenInferenceState *st, int token_id) {
             if (prof) t_gu += st_now_sec() - t0;
             vllm_silu_mul_ctx vg = { st->q_buf, st->k_buf, ff };
             if (prof) tw = st_now_sec();
-            vllm_tp_parfor(0, (ff + 15) / 16, vllm_silu_mul_worker, &vg);
+            dec_silu_parfor((ff + 15) / 16, vllm_silu_mul_worker, &vg);
             if (prof) t_silu += st_now_sec() - tw;
             /* P4: fused down projection + FFN residual — writes directly to x */
             if (prof) t0 = st_now_sec();
@@ -19809,6 +21215,11 @@ static void spec_verify_attention(STQwenInferenceState *st, int l,
         } else {
             vllm_attn_head_ctx vh = { st, nh, nkv, hd, l, sl, kv_dim,
                                       st->use_kv_q8, scale, NULL };
+#if ST_HAVE_RVV
+            if (vllm_attn_gqa_ok(&vh))
+                vllm_tp_parfor(0, nkv, vllm_attn_kvgrp_worker, &vh);
+            else
+#endif
             vllm_tp_parfor(0, nh, vllm_attn_head_worker, &vh);
         }
     }
@@ -19833,6 +21244,101 @@ static float *g_embed_out = NULL;
 static int    g_embed_dim = 0;
 
 void st_embed_request(float *out, int dim) { g_embed_out = out; g_embed_dim = dim; }
+
+/* ================================================================
+ * prefill 的「逐 token」段（MRoPE + KV 落盘）：按 token 并行。
+ *
+ * 动机（4 线程、VLLM_DEC_PROF 子桶，2026-11-02）：这一段原本是纯串行 for(t)，
+ * 其余 3 个线程在 KV 落盘和 Q8 量化期间全部空转。0.6B ctx32 实测它占 OTHER 的
+ * 67%（rope 16.7 + kv 94.4 = 111.1 / 165.4 ms），占 prefill 总量 17.7%。
+ *
+ * 位级口径（perf_axiom_order_preserving_reorder_v1）：只重排「哪个线程写哪个
+ * token」，不重排任何元素级运算——每个 token 的 q/k 行、KV 行、k/v scale 行都
+ * 只由它自己的线程写（cl = cl0 + t，行间不重叠），dyn_mrope 与 kv_quantize_per_head
+ * 在每个 token 内的循环序完全不变。因此与串行段逐字节等价。
+ * `st->cache_len[l]` 改为在并行区之后一次性 +nb（原为每 token 自增，终值相同）。
+ * ================================================================ */
+typedef struct {
+    STQwenInferenceState *st;
+    float *qb, *kb, *vb;
+    int l, nb, tok_offset, q_rows, kv_dim, hd, nh, nkv, cl0;
+    float theta;
+    int have_f32, do_q8, do_q4, q8cache;
+} vllm_pf_kv_ctx;
+
+static void vllm_pf_kv_worker(void *c_, int t) {
+    vllm_pf_kv_ctx *c = (vllm_pf_kv_ctx *)c_;
+    STQwenInferenceState *st = c->st;
+    const int l = c->l;
+    /* Speculative-verify mode positions the draft with the same base the decode
+     * step uses, so the draft KV rotation matches normal decode. */
+    int pos = (g_verify_logits && g_verify_pos >= 0)
+              ? g_verify_pos + c->tok_offset + t
+              : st->seq_len + c->tok_offset + t;
+    float *qt = c->qb + (size_t)t * c->q_rows;
+    float *kt = c->kb + (size_t)t * c->kv_dim;
+    float *vt = c->vb + (size_t)t * c->kv_dim;
+
+    /* RoPE：统一 dyn_mrope（半分裂配对；文本-only 退化为标准 RoPE） */
+    dyn_mrope(qt, kt, c->hd, c->nh, c->nkv, st->cfg.head_dim_full, pos, c->theta);
+
+    int cl = c->cl0 + t;
+    if (l == 0 && c->tok_offset == 0 && t == 0)
+        pf_b2("kt0", kt, (size_t)c->kv_dim * 4);
+    if (cl >= st->kv_n_blocks * st->kv_bs) {
+        fprintf(stderr, "[KV-OOB] prefill cl=%d cap=%d l=%d tok=%d\n", cl,
+                st->kv_n_blocks * st->kv_bs, l, c->tok_offset + t);
+        return;                                          /* 越界：不写 KV，避免踩坏相邻块 */
+    }
+    if (c->have_f32) {
+        memcpy(kv_row_f32(st->k_cache[l], cl, c->kv_dim, st->kv_bs), kt, c->kv_dim * sizeof(float));
+        memcpy(kv_row_f32(st->v_cache[l], cl, c->kv_dim, st->kv_bs), vt, c->kv_dim * sizeof(float));
+    }
+    if (KV_GUARD && !g_kv_lazy && c->have_f32) {
+        static int _g1 = 0;
+        if (!_g1) {
+            int _blk = cl / st->kv_bs;
+            const uint8_t *_bg = (const uint8_t *)st->k_cache[l][_blk]
+                + (size_t)st->kv_bs * c->kv_dim * sizeof(float);
+            for (int _i = 0; _i < KV_GUARD; _i += 64)
+                if (_bg[_i] != 0xA5) {
+                    fprintf(stderr, "[GUARD] prefill-k-back l=%d cl=%d blk=%d off=%d\n",
+                            l, cl, _blk, _i); fflush(stderr); _g1 = 1; break;
+                }
+            if (!_g1 && _blk + 1 < st->kv_n_blocks) {
+                const uint8_t *_fg = (const uint8_t *)st->k_cache[l][_blk + 1] - KV_GUARD;
+                for (int _i = 0; _i < KV_GUARD; _i += 64)
+                    if (_fg[_i] != 0xA5) {
+                        fprintf(stderr, "[GUARD] prefill-k-front l=%d cl=%d blk=%d off=%d\n",
+                                l, cl, _blk, _i); fflush(stderr); _g1 = 1; break;
+                    }
+            }
+        }
+    }
+    if (c->do_q8) {
+        int8_t *kdst = kv_row_i8(st->k_cache_q8[l], cl, c->kv_dim, st->kv_bs);
+        int8_t *vdst = kv_row_i8(st->v_cache_q8[l], cl, c->kv_dim, st->kv_bs);
+        kv_quantize_per_head(kdst, vdst,
+                             st->k_scale[l] + (size_t)cl * c->nkv,
+                             st->v_scale[l] + (size_t)cl * c->nkv,
+                             kt, vt, c->nkv, c->hd);
+        /* P0 原型：f32 正典行改存 q8 反量化值（质量门测量用）。 */
+        if (c->q8cache && c->have_f32) {
+            kv_dequant_roundtrip(kdst, vdst,
+                                 st->k_scale[l] + (size_t)cl * c->nkv,
+                                 st->v_scale[l] + (size_t)cl * c->nkv,
+                                 kt, vt, c->nkv, c->hd);
+            memcpy(kv_row_f32(st->k_cache[l], cl, c->kv_dim, st->kv_bs), kt,
+                   c->kv_dim * sizeof(float));
+            memcpy(kv_row_f32(st->v_cache[l], cl, c->kv_dim, st->kv_bs), vt,
+                   c->kv_dim * sizeof(float));
+        }
+    } else if (c->do_q4) {
+        q4_pack_token(q4_k_row(st->k_cache_q4[l], cl, 0, c->hd, st->kv_bs, c->nkv),
+                      q4_v_row(st->v_cache_q4[l], cl, 0, c->hd, st->kv_bs, c->nkv),
+                      kt, vt, c->nkv, c->hd);
+    }
+}
 
 int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                   const int *token_ids, int n_tokens)
@@ -19864,6 +21370,10 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
      * attn = attention, other = norms/MRoPE/KV-store/SiLU. */
     double t_gemm = 0.0, t_attn = 0.0, t_other = 0.0;
     double t_qkv = 0.0, t_o = 0.0, t_gu = 0.0, t_down = 0.0;
+    /* OTHER 的子桶（仅 VLLM_DEC_PROF 下有值，与 decode 的 t_nrm/t_rope/t_kv/t_silu 对称）：
+     * pnrm=2×RMSNorm · pqkn=QK-norm 批 · pkv=MRoPE+KV 落盘+q8 量化（按 token 并行） · psilu=SiLU */
+    double t_pnrm = 0.0, t_pqkn = 0.0, t_pkv = 0.0, t_psilu = 0.0;
+    int pf_prof = getenv("VLLM_DEC_PROF") != NULL;
     double t0;
     double t_pf0 = st_now_sec();   /* prefill profile base (VLLM_DEC_PROF) */
 
@@ -20116,7 +21626,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
             t0 = st_now_sec();
             /* --- Step 1: batched RMSNorm (ONE omp region, was nb x 2 regions) --- */
             dyn_rms_norm_batch(nrm, h_buf, w->attn_norm + (size_t)l * d, nb, d, eps);
-            t_other += st_now_sec() - t0;
+            { double dt_ = st_now_sec() - t0; t_other += dt_; t_pnrm += dt_; }
             if (l == 0 && tok_offset == 0) pf_b2("nrm0", nrm, (size_t)d * 4);
 
             t0 = st_now_sec();
@@ -20166,6 +21676,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
              * fork-joins, 2 regions per token). Each (t,head) task runs the
              * identical math as before, so results stay bit-identical. */
             {
+                double tq_ = pf_prof ? st_now_sec() : 0.0;
                 const float *qw = w->q_norm ? w->q_norm + (size_t)l * hd : NULL;
                 const float *kw = w->k_norm ? w->k_norm + (size_t)l * hd : NULL;
                 int nq = w->q_norm ? nh : 0;
@@ -20173,85 +21684,29 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                 int total = nb * (nq + nk);
                 vllm_qk_norm_batch_ctx vc = { qb, kb, qw, kw, nq, nk, hd, q_rows, kv_dim };
                 vllm_tp_parfor(0, total, vllm_qk_norm_batch_worker, &vc);
+                if (pf_prof) t_pqkn += st_now_sec() - tq_;
             }
-            for (int t = 0; t < nb; t++) {
-                /* Speculative-verify mode positions the draft with the same
-                 * base the decode step uses (mrope_pos for multimodal, seq_len
-                 * for text-only) so the draft KV rotation matches what the
-                 * accepted tokens would have produced in normal decode. */
-                int pos = (g_verify_logits && g_verify_pos >= 0)
-                          ? g_verify_pos + tok_offset + t
-                          : st->seq_len + tok_offset + t;
-                float *qt = qb + (size_t)t * q_rows;
-                float *kt = kb + (size_t)t * kv_dim;
-                float *vt = vb + (size_t)t * kv_dim;
-                float *at = att + (size_t)t * q_rows;
-
-                t0 = st_now_sec();
-
-                /* RoPE：统一 dyn_mrope（半分裂配对；文本-only 退化为标准 RoPE） */
-                dyn_mrope(qt, kt, hd, nh, nkv, st->cfg.head_dim_full, pos, theta);
-
-                /* KV-cache store (float + compressed payload for attention) */
-                int cl = st->cache_len[l];
-                int have_f32 = st->k_cache[l] != NULL;   /* P3: nof32 档无 f32 正典行 */
-                if (l == 0 && tok_offset == 0 && t == 0)
-                    pf_b2("kt0", kt, (size_t)kv_dim * 4);
-                if (cl >= st->kv_n_blocks * st->kv_bs)
-                    fprintf(stderr, "[KV-OOB] prefill cl=%d cap=%d l=%d tok=%d\n", cl,
-                            st->kv_n_blocks * st->kv_bs, l, tok_offset + t);
-                if (have_f32) {
-                    memcpy(kv_row_f32(st->k_cache[l], cl, kv_dim, st->kv_bs), kt, kv_dim * sizeof(float));
-                    memcpy(kv_row_f32(st->v_cache[l], cl, kv_dim, st->kv_bs), vt, kv_dim * sizeof(float));
-                }
-                if (KV_GUARD && !g_kv_lazy && have_f32) {
-                    static int _g1 = 0;
-                    if (!_g1) {
-                        int _blk = cl / st->kv_bs;
-                        const uint8_t *_bg = (const uint8_t *)st->k_cache[l][_blk]
-                            + (size_t)st->kv_bs * kv_dim * sizeof(float);
-                        for (int _i = 0; _i < KV_GUARD; _i += 64)
-                            if (_bg[_i] != 0xA5) {
-                                fprintf(stderr, "[GUARD] prefill-k-back l=%d cl=%d blk=%d off=%d\n",
-                                        l, cl, _blk, _i); fflush(stderr); _g1 = 1; break;
-                            }
-                        if (!_g1 && _blk + 1 < st->kv_n_blocks) {
-                            const uint8_t *_fg = (const uint8_t *)st->k_cache[l][_blk + 1] - KV_GUARD;
-                            for (int _i = 0; _i < KV_GUARD; _i += 64)
-                                if (_fg[_i] != 0xA5) {
-                                    fprintf(stderr, "[GUARD] prefill-k-front l=%d cl=%d blk=%d off=%d\n",
-                                            l, cl, _blk, _i); fflush(stderr); _g1 = 1; break;
-                                }
-                        }
-                    }
-                }
-                if (st->use_kv_q8 && !emb_skip_kvq8) {
-                    int8_t *kdst = kv_row_i8(st->k_cache_q8[l], cl, kv_dim, st->kv_bs);
-                    int8_t *vdst = kv_row_i8(st->v_cache_q8[l], cl, kv_dim, st->kv_bs);
-                    kv_quantize_per_head(kdst, vdst,
-                                         st->k_scale[l] + (size_t)cl * nkv,
-                                         st->v_scale[l] + (size_t)cl * nkv,
-                                         kt, vt, nkv, hd);
-                    /* P0 原型：f32 正典行改存 q8 反量化值（模拟"只存 q8"后
-                     * prefill 历史段注意力将看到的值；质量门测量用）。 */
-                    if (vllm_pf_q8cache_env() && have_f32) {
-                        kv_dequant_roundtrip(kdst, vdst,
-                                             st->k_scale[l] + (size_t)cl * nkv,
-                                             st->v_scale[l] + (size_t)cl * nkv,
-                                             kt, vt, nkv, hd);
-                        memcpy(kv_row_f32(st->k_cache[l], cl, kv_dim, st->kv_bs), kt,
-                               kv_dim * sizeof(float));
-                        memcpy(kv_row_f32(st->v_cache[l], cl, kv_dim, st->kv_bs), vt,
-                               kv_dim * sizeof(float));
-                    }
-                } else if (st->use_kv_q4) {
-                    q4_pack_token(q4_k_row(st->k_cache_q4[l], cl, 0, hd, st->kv_bs, nkv),
-                                  q4_v_row(st->v_cache_q4[l], cl, 0, hd, st->kv_bs, nkv),
-                                  kt, vt, nkv, hd);
-                }
-                st->cache_len[l]++;
-
-                t_other += st_now_sec() - t0;
+            /* 逐 token 的 MRoPE + KV 落盘：按 token 并行（见 vllm_pf_kv_worker 的位级口径）。
+             * 原为纯串行 for(t)，是 OTHER 里最大的一块（0.6B ctx32 占 OTHER 67%）。 */
+            {
+                vllm_pf_kv_ctx kc;
+                kc.st = st; kc.l = l; kc.nb = nb; kc.tok_offset = tok_offset;
+                kc.qb = qb; kc.kb = kb; kc.vb = vb;
+                kc.q_rows = q_rows; kc.kv_dim = kv_dim; kc.hd = hd;
+                kc.nh = nh; kc.nkv = nkv; kc.theta = theta;
+                kc.cl0 = st->cache_len[l];
+                kc.have_f32 = st->k_cache[l] != NULL;   /* P3: nof32 档无 f32 正典行 */
+                kc.do_q8 = st->use_kv_q8 && !emb_skip_kvq8;
+                kc.do_q4 = st->use_kv_q4;
+                kc.q8cache = vllm_pf_q8cache_env();
+                /* 预热 MRoPE 频率表：它是懒建的全局缓存（g_rope_freq），若多个
+                 * worker 同时首次进来会并发 realloc。先在本线程建好，worker 只读。
+                 * 表值与由谁建立无关（同 (half, theta) 同一组 powf），故位级不变。 */
+                (void)rope_freq_table(hd / 2, theta);
+                const double tk_ = st_now_sec();
+                vllm_tp_parfor(0, nb, vllm_pf_kv_worker, &kc);
+                { double dt_ = st_now_sec() - tk_; t_other += dt_; if (pf_prof) t_pkv += dt_; }
+                st->cache_len[l] = kc.cl0 + nb;
             }
             HCK("kvstore");
 
@@ -20404,7 +21859,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
             t0 = st_now_sec();
             /* --- Step 8: batched RMSNorm (FFN) --- */
             dyn_rms_norm_batch(nrm, h_buf, w->ffn_norm + (size_t)l * d, nb, d, eps);
-            t_other += st_now_sec() - t0;
+            { double dt_ = st_now_sec() - t0; t_other += dt_; t_pnrm += dt_; }
 
             t0 = st_now_sec();
             if (w->cfg.is_moe) {
@@ -20472,7 +21927,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
             /* --- Step 10: batched SiLU (ONE pool region over nb*ff) --- */
             vllm_silu_mul_ctx vg = { qb, kb, nb * ff };
             vllm_tp_parfor(0, (nb * ff + 15) / 16, vllm_silu_mul_worker, &vg);
-            t_other += st_now_sec() - t0;
+            { double dt_ = st_now_sec() - t0; t_other += dt_; t_psilu += dt_; }
 
             if (getenv("VLLM_PFDBG") && l == 6) {
                 float am = 0.0f; int ai = 0; float nm = 0.0f; int ni = 0;
@@ -20799,6 +22254,14 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                     t_o   * 1e3, 100.0 * t_o   / t_gemm,
                     t_gu  * 1e3, 100.0 * t_gu  / t_gemm,
                     t_down* 1e3, 100.0 * t_down/ t_gemm);
+                fflush(stderr);
+            }
+            if (pf_prof) {
+                fprintf(stderr,
+                    "[PF-SUB] nrm=%.1fms qkn=%.1fms ropekv=%.1fms silu=%.1fms "
+                    "| 覆盖 OTHER %.1f/%.1fms（qkn 不在 OTHER 内；余差为未计时项）\n",
+                    t_pnrm * 1e3, t_pqkn * 1e3, t_pkv * 1e3, t_psilu * 1e3,
+                    (t_pnrm + t_pqkn + t_pkv + t_psilu) * 1e3, t_other * 1e3);
                 fflush(stderr);
             }
             fflush(stderr);

@@ -420,8 +420,8 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
     printf("[ST] Config: dim=%d layers=%d heads=%d kv_heads=%d hd=%d ffn=%d vocab=%d\n",
            cfg->dim, cfg->n_layers, cfg->n_heads, cfg->n_kv_heads,
            cfg->head_dim, cfg->ffn_dim, cfg->vocab_size);
-    printf("[ST]   rope_theta=%.1f norm_eps=%.1e q_norm=%d mrope=%d\n",
-           cfg->rope_theta, cfg->norm_eps, cfg->has_q_norm, cfg->has_mrope);
+    printf("[ST]   rope_theta=%.1f norm_eps=%.1e (q_norm/mrope 见 after-tensor-scan)\n",
+           cfg->rope_theta, cfg->norm_eps);
 
     /* --- Parse safetensors index --- */
     char path_idx[1024];
@@ -501,6 +501,7 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
         }
 
         size_t hdr_size = strlen(header);
+        int64_t max_end = 0;   /* 本分片 data_offsets 的最大结束位置（截断检测用） */
 
         /* Parse header JSON: {"weight1": {"dtype":"BF16","shape":[4096,4096],"data_offsets":[0,33554432]}, ...} */
         const char *hp = header;
@@ -578,6 +579,7 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
             }
 
             ti->n_bytes = ti->file_offsets[1] - ti->file_offsets[0];
+            if (ti->file_offsets[1] > max_end) max_end = ti->file_offsets[1];
 
             /* Store which file this tensor is in */
             /* We encode file index in the upper bits of file_offsets[0] */
@@ -601,6 +603,23 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
         }
 
         free(header);
+
+        /* 分片完整性：8 + header_size + max(data_offsets end) 必须 <= 文件长度。
+         * 被截断的分片（如 curl 中断）若不拦下，后续 mmap 读越界会 SIGSEGV。 */
+        FILE *fh = st_fopen(cfg->file_paths[fi], "rb");
+        uint64_t hsz = 0;
+        int64_t fsz = -1;
+        if (fh) {
+            if (fread(&hsz, 8, 1, fh) == 1 && ST_FSEEK(fh, 0, SEEK_END) == 0)
+                fsz = (int64_t)ST_FTELL(fh);
+            fclose(fh);
+        }
+        int64_t need = 8 + (int64_t)hsz + max_end;
+        if (fsz < need) {
+            fprintf(stderr, "[ST] ERROR: shard truncated: %s size=%lld need=%lld\n",
+                    cfg->file_paths[fi], (long long)fsz, (long long)need);
+            return -1;
+        }
     }
 
     cfg->n_tensors = n_tensors_total;
@@ -611,6 +630,9 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
         if (strstr(cfg->tensors[i].name, "q_norm")) cfg->has_q_norm = 1;
         if (strstr(cfg->tensors[i].name, "mrope")) cfg->has_mrope = 1;
     }
+    /* config.json 里没有 "q_norm" 字样，上面那行旧打印恒为 0；扫描后重印真实值 */
+    fprintf(stderr, "[ST]   after-tensor-scan: has_q_norm=%d has_mrope=%d\n",
+            cfg->has_q_norm, cfg->has_mrope);
 
     return 0;
 }
