@@ -6,8 +6,10 @@ O=/tmp/final4; mkdir -p $O
 echo "BIN md5=$(md5sum $B | cut -d' ' -f1)"
 echo "START load=$(cut -d' ' -f1-3 /proc/loadavg)"
 
-ids() { grep -E 'TOKIDS' "$1" | head -1 | sed 's/\[.*TOKIDS: *//' | sed 's/\[.*//' | sed 's/ t=.*//' \
-        | tr -s ' ' '\n' | grep -E '^[0-9]+$' | tr '\n' ',' | md5sum | cut -c1-8; }
+# TOKIDS 是多行块，必须把整段 id 序列一起哈希（只取首行会退化成所有模型同值）。
+ids() { grep -E 'TOKIDS|^ *[0-9]+ t=' "$1" \
+        | sed -E 's/.*TOKIDS: *//; s/ t=.*//' \
+        | tr -s ' \n' '\n' | grep -E '^[0-9]+$' | tr '\n' ',' | md5sum | cut -c1-8; }
 steady() { awk '/ t=[0-9]+ ms=/{t=0;ms=0;
              for(i=1;i<=NF;i++){if($i~/^t=/){t=substr($i,3)+0} if($i~/^ms=/){ms=substr($i,4)+0}}
              if(t>=2){s+=ms;n++}} END{printf "%.1f", (n?s/n:0)}' "$1"; }
@@ -22,8 +24,9 @@ ours() {
   printf 'OURS %-5s c%-4s load=%s | pp=%s tok/s | dec=%s ms | ids=%s\n' \
     "$X" "$CTX" "$(cut -d' ' -f1 /proc/loadavg)" "$(pf $F)" "$(steady $F)" "$(ids $F)"
 }
-lb() {
-  local X=$1 F=$O/lb-$X.log
+lb() { # X
+  local X=$1
+  local F=$O/lb-$X.log
   taskset -c 0-3 env OMP_NUM_THREADS=4 timeout 3600 \
     llama-bench -m "$G/Qwen3-$X-Q4_0.gguf" -p 32,128 -n 32 -t 4 -r 3 -o md > $F 2>&1
   local R=$(grep -E '\| +(pp32|pp128|tg32) +\|' $F | awk -F'|' '{gsub(/ /,"",$7); gsub(/ /,"",$8); sub(/±.*/,"",$8); printf "%s=%s ", $7, $8}')
