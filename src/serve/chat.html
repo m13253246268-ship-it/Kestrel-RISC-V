@@ -271,6 +271,11 @@ let metricHistory = [];
 try { metricHistory = JSON.parse(localStorage.getItem(PERF_KEY) || "[]"); } catch (e) { metricHistory = []; }
 if (!Array.isArray(metricHistory)) metricHistory = [];
 let lastMet = null;      /* 最近一次指标，用于切换语言时重绘指标条 */
+let apiModel = "";       /* /v1/models 返回的 id：跟随实际加载的模型，前端不写死 */
+fetch("/v1/models").then(r => r.json()).then(d => {
+  const m = d && d.data && d.data[0];
+  if (m && m.id) apiModel = m.id;
+}).catch(() => {});
 
 function statusTxt(st){
   return ({
@@ -514,7 +519,7 @@ async function send(){
   }
   history.push({role:"user", content: apiParts});
   const bodyObj = {
-    model: "qwen3-vl-8b",
+    model: apiModel || "kestrel",
     messages: history,
     context_mode: $("p_ctx").value,
     max_tokens: parseInt($("p_max").value, 10) || 256,

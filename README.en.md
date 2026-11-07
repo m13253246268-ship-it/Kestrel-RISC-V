@@ -128,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File tools\build\build_x64.ps1 `
 powershell -ExecutionPolicy Bypass -File tools\build\check_x64.ps1
 ```
 
-Expected: `--test-l3 16 PASS / 0 FAIL`, `--test-sparse 9/9`, exit code 0.
+Expected: exit code 0, FAIL = 0, and PASS+SKIP equal to the case total (`--test-l3` 17, `--test-sparse` 10). One case per suite is `[SKIP]` depending on ISA: the NEON comparison (no NEON build) and the RVV Q8 PV comparison (no RVV build). Measured: x86-64 L3 16 PASS + 1 SKIP, Sparse 9 PASS + 1 SKIP; rv64gcv L3 16 PASS + 1 SKIP, Sparse 10 PASS + 0 SKIP.
 
 ### 4.2 RISC-V 64 (Linux)
 
@@ -195,7 +195,7 @@ On startup the server prints its entry points:
 | Flag | Description |
 |---|---|
 | `--model <dir\|.vqf>` | Model directory or single VQF file |
-| `--model-id <id>` | Model identifier (default `qwen3-vl-8b`) |
+| `--model-id <id>` | Advertised model id (default: the model directory basename, e.g. `Qwen3-0.6B-q4`) |
 | `--port <N>` | Explicit port |
 | `--threads <N>` | Worker threads |
 | `--wmode <m>` | `dual`/`q4`/`q4i`/`q8`/`q2mix`/`g256` |
@@ -211,8 +211,8 @@ On startup the server prints its entry points:
 ### 5.3 Offline / self-test modes (no model needed)
 
 ```bash
-vllm_kestrel --test-l3        # L3 Q4 kernel + disk eviction self-test (expect 16 PASS)
-vllm_kestrel --test-sparse    # Sparse attention self-test (expect 9 PASS)
+vllm_kestrel --test-l3        # L3 Q4 kernel + disk eviction self-test (16 PASS + 1 SKIP)
+vllm_kestrel --test-sparse    # Sparse attention self-test (9 PASS + 1 SKIP on x86, 10 PASS on RVV)
 ```
 
 Running with no arguments executes the axiom self-test suite and then enters the server

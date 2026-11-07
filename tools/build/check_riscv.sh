@@ -3,8 +3,13 @@
 # check_riscv.sh - RISC-V 回归闸门：构建 + L3/Sparse 自检计数
 #
 # 目的：把「RISC-V 上能编译、且数值自检与 x86/ARM 同源」固化成一条命令。
-#   期望：--test-l3 16 PASS / 0 FAIL、--test-sparse 9 PASS / 0 FAIL。
-#   无 NEON 构建下 (1b)「P2 restore NEON vs scalar bitwise」打 [SKIP]，不计 PASS。
+#   判据：进程退出码 0、FAIL 为 0、且 PASS+SKIP 等于用例总数（L3 17、Sparse 10）。
+#   用「总数」而非「固定 PASS 数」判，是因为同一套用例里有 1 条会随构建 ISA 打
+#   [SKIP]：L3 的 (1b)「P2 restore NEON vs scalar bitwise」在无 NEON 构建跳过；
+#   Sparse 的「RVV Q8 PV candidate comparisons」在无 RVV 构建跳过。
+#   实测分布：rv64gcv L3 16 PASS+1 SKIP、Sparse 10 PASS+0 SKIP；
+#             x86-64  L3 16 PASS+1 SKIP、Sparse  9 PASS+1 SKIP。
+#   （旧脚本写死 --test-sparse 9 PASS，在 RVV 板上必然 MISMATCH。）
 #
 # 用法：
 #   ./tools/build/check_riscv.sh            # 板上原生跑
@@ -14,9 +19,9 @@
 #                        VLEN 用 max,vlen=256 指定。原生运行不需要。
 #   其余变量透传 build_riscv.sh（VLLM_RISCV_CC / _MARCH / _OUTDIR）。
 #
-# 退出码：0 = 构建成功且 16/0 + 9/0；1 = 构建失败或计数不符
+# 退出码：0 = 构建成功且两项 FAIL=0、总数 17/10、进程退出码 0；1 = 不符
 #
-# 边界（照实标注）：本脚本只证明「可编译 + 自检通过 + 与 x86 同为 16/9 条」，
+# 边界（照实标注）：本脚本只证明「可编译 + 自检通过 + 与 x86 同为 17/10 条用例」，
 #   **不**构成性能结论。默认热内核是 RVV =3（VLLM_RVV=0 回标量参考路径），
 #   收益只在板端实测界定（8 线程，Qwen3VL-2B Q8_0）：
 #     prefill 32 token：48.4 / 33.1 / 12.7 / 6.2 s（=0/1/2/3），
@@ -56,23 +61,25 @@ else
     RUN="qemu-riscv64 -cpu ${VLLM_RISCV_QEMU_CPU:-max} -L /usr/riscv64-linux-gnu"
 fi
 
-check() { # $1=flag $2=want
+check() { # $1=flag $2=用例总数(PASS+SKIP)；要求进程退出码 0 且 FAIL=0
     out=$($RUN "$BIN" "$1" 2>&1)
+    rc=$?
     p=$(printf '%s\n' "$out" | grep -c '\[PASS\]')
     f=$(printf '%s\n' "$out" | grep -c '\[FAIL\]')
     s=$(printf '%s\n' "$out" | grep -c '\[SKIP\]')
-    if [ "$p" -eq "$2" ] && [ "$f" -eq 0 ]; then
-        printf '     %-14s PASS=%s FAIL=%s SKIP=%s  (want %s/0)  -> OK\n' "$1" "$p" "$f" "$s" "$2"
+    t=$((p + s))
+    if [ "$rc" -eq 0 ] && [ "$f" -eq 0 ] && [ "$t" -eq "$2" ]; then
+        printf '     %-14s rc=%s PASS=%s FAIL=%s SKIP=%s  (want total %s / FAIL 0)  -> OK\n' "$1" "$rc" "$p" "$f" "$s" "$2"
         return 0
     fi
-    printf '     %-14s PASS=%s FAIL=%s SKIP=%s  (want %s/0)  -> MISMATCH\n' "$1" "$p" "$f" "$s" "$2"
+    printf '     %-14s rc=%s PASS=%s FAIL=%s SKIP=%s  (want total %s / FAIL 0)  -> MISMATCH\n' "$1" "$rc" "$p" "$f" "$s" "$2"
     printf '%s\n' "$out" | tail -20
     return 1
 }
 
-echo "=== [2/3] self-tests（RISC-V 口径：16 PASS + 1 SKIP / 9）==="
-check --test-l3 16 || exit 1
-check --test-sparse 9 || exit 1
+echo "=== [2/3] self-tests（用例总数 L3 17 / Sparse 10，FAIL 必须为 0）==="
+check --test-l3 17 || exit 1
+check --test-sparse 10 || exit 1
 
 echo "=== [3/3] artifact ==="
 ls -l "$BIN"

@@ -362,7 +362,7 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
     char chunk_id[64];
     snprintf(chunk_id, sizeof(chunk_id), "chatcmpl-%08lx", my_id);
     long created = vb_unix_now();
-    const char *model = b->model_id ? b->model_id : "qwen3-vl-8b";
+    const char *model = (b->model_id && b->model_id[0]) ? b->model_id : "kestrel";
     char dbuf[4096];
     int done = 0;
     const char *finish = "stop";

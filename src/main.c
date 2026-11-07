@@ -4379,6 +4379,28 @@ done:
     return 0;
 }
 
+/* API model id from the loaded model: explicit --model-id wins, otherwise the
+ * model directory basename (vLLM 的 served-model-name 同口径）。固定常量会在
+ * 换模型后与 /v1/models 自相矛盾，故不再使用。 */
+static void derive_model_id(char *buf, size_t n, const char *dir) {
+    if (!dir || !dir[0]) { snprintf(buf, n, "kestrel"); return; }
+    const char *end = dir + strlen(dir);
+    while (end > dir && (end[-1] == '/' || end[-1] == '\\')) end--;
+    const char *p = end;
+    while (p > dir && p[-1] != '/' && p[-1] != '\\') p--;
+    size_t len = (size_t)(end - p);
+    if (len == 0) { snprintf(buf, n, "kestrel"); return; }
+    if (len > n - 1) len = n - 1;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+}
+
+static void fill_model_id(VLLMServerCtx *ctx, const char *model_dir) {
+    if (g_serve_model_id) { ctx->model_id = g_serve_model_id; return; }
+    derive_model_id(ctx->model_id_buf, sizeof(ctx->model_id_buf), model_dir);
+    ctx->model_id = ctx->model_id_buf;
+}
+
 /* Real model identity from the parsed config (the advertised API model_id is
  * a generic constant; this reflects what actually loaded). */
 static void fill_model_name(VLLMServerCtx *ctx, const STModelConfig *c) {
@@ -4443,6 +4465,7 @@ static void *serve_load_thread(void *arg) {
         ctx->vis = m->vis;
         ctx->load_state = 2;
         fill_model_name(ctx, m->cfg);
+        fill_model_id(ctx, m->model_dir);   /* 管理页换模型后 id 同步更新 */
         vatt_model_ready(ctx);              /* 方案 2：固化模型指纹 */
         vllm_server_diskkv_scan(ctx);   /* index --disk-kv checkpoints */
         printf("[SERVE] model ready: %s (wmode=%d, vision=%d)\n",
@@ -4644,7 +4667,8 @@ static int vllm_serve_main(int port, const char *model_dir_arg, int auto_load) {
 
     VLLMServerCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.model_id = g_serve_model_id ? g_serve_model_id : "qwen3-vl-8b";
+    ctx.model_id = "kestrel";         /* 兜底；下面按 --model-id / 模型目录重设 */
+    fill_model_id(&ctx, model_dir);   /* --model-id 缺省时按模型目录名推导 */
     ctx.max_queued = g_serve_max_queued;
     ctx.min_free_mb = g_serve_min_free_mb;
     ctx.batch_max = g_serve_batch_max;   /* --batch-max N: continuous batching */
@@ -4765,6 +4789,7 @@ static int vllm_serve_main(int port, const char *model_dir_arg, int auto_load) {
         ctx.ist = m.ist; ctx.vis = m.vis;
         ctx.load_state = 2;
         fill_model_name(&ctx, m.cfg);
+        fill_model_id(&ctx, m.model_dir);
         vatt_model_ready(&ctx);          /* 方案 2：固化模型指纹 */
         vllm_server_diskkv_scan(&ctx);   /* index --disk-kv checkpoints */
         printf("[SERVE] model ready: %s (wmode=%d, vision=%d)\n",

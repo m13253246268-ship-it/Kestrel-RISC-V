@@ -904,6 +904,13 @@ static void dkv_save(VLLMServerCtx *ctx, const int *ids, int n_ids) {
 
 /* ---------- /v1/models ---------- */
 
+/* 对外宣告的 model id：优先 --model-id，其次由 main.c 按已加载模型目录推导
+ * (fill_model_id)；"kestrel" 只是兜底占位，不再写死具体模型名，避免与实际
+ * 加载的模型自相矛盾。 */
+static const char *api_model_id(const VLLMServerCtx *ctx) {
+    return (ctx && ctx->model_id && ctx->model_id[0]) ? ctx->model_id : "kestrel";
+}
+
 static void handle_models(VLLMServerCtx *ctx, VHttpResponse *resp) {
     char *body = (char *)malloc(2048);
     if (!body) { json_error(resp, 500, "Out of memory"); return; }
@@ -911,7 +918,7 @@ static void handle_models(VLLMServerCtx *ctx, VHttpResponse *resp) {
     vjson_obj_set(root, "object", vjson_new_string("list"));
     VJson *data = vjson_new_array();
     VJson *m = vjson_new_object();
-    vjson_obj_set(m, "id", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+    vjson_obj_set(m, "id", vjson_new_string(api_model_id(ctx)));
     vjson_obj_set(m, "object", vjson_new_string("model"));
     vjson_obj_set(m, "created", vjson_new_number((double)unix_now()));
     vjson_obj_set(m, "owned_by", vjson_new_string("vllm_kestrel"));
@@ -1176,7 +1183,7 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
     snprintf(chunk_id, sizeof(chunk_id), "chatcmpl-%08lx", my_id);
 
     long created = unix_now();
-    const char *model = ctx->model_id ? ctx->model_id : "qwen3-vl-8b";
+    const char *model = api_model_id(ctx);
     char dbuf[4096];
     int done = 0;
     const char *finish = "stop";
@@ -3115,7 +3122,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(root, "id", vjson_new_string("chatcmpl-00000000"));
                         vjson_obj_set(root, "object", vjson_new_string("chat.completion"));
                         vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-                        vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+                        vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
                         VJson *choices = vjson_new_array();
                         VJson *ch = vjson_new_object();
                         vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -3218,7 +3225,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(root, "id", vjson_new_string("chatcmpl-00000000"));
                         vjson_obj_set(root, "object", vjson_new_string("chat.completion"));
                         vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-                        vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+                        vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
                         VJson *choices = vjson_new_array();
                         VJson *ch = vjson_new_object();
                         vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -3379,7 +3386,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                     vjson_obj_set(root, "id", vjson_new_string("chatcmpl-00000000"));
                     vjson_obj_set(root, "object", vjson_new_string("chat.completion"));
                     vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-                    vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+                    vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
                     VJson *choices = vjson_new_array();
                     VJson *ch = vjson_new_object();
                     vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -3517,7 +3524,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(root, "id", vjson_new_string("chatcmpl-00000000"));
                 vjson_obj_set(root, "object", vjson_new_string("chat.completion"));
                 vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-                vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+                vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
                 VJson *choices = vjson_new_array();
                 VJson *ch = vjson_new_object();
                 vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -3887,7 +3894,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(root, "id", vjson_new_string("cmpl-00000000"));
                 vjson_obj_set(root, "object", vjson_new_string("text_completion"));
                 vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-                vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+                vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
                 VJson *choices = vjson_new_array();
                 VJson *ch = vjson_new_object();
                 vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -3948,7 +3955,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
             vjson_obj_set(root, "id", vjson_new_string("cmpl-00000000"));
             vjson_obj_set(root, "object", vjson_new_string("text_completion"));
             vjson_obj_set(root, "created", vjson_new_number((double)unix_now()));
-            vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+            vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
             VJson *choices = vjson_new_array();
             VJson *ch = vjson_new_object();
             vjson_obj_set(ch, "index", vjson_new_number(0));
@@ -4040,7 +4047,7 @@ static char *anthropic_from_openai(VLLMServerCtx *ctx, const char *openai_body) 
     vjson_obj_set(root, "id", vjson_new_string("msg_vllm_kestrel"));
     vjson_obj_set(root, "type", vjson_new_string("message"));
     vjson_obj_set(root, "role", vjson_new_string("assistant"));
-    vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+    vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
     VJson *content = vjson_new_array();
     VJson *block = vjson_new_object();
     vjson_obj_set(block, "type", vjson_new_string("text"));
@@ -4096,7 +4103,7 @@ static void handle_anthropic(VLLMServerCtx *ctx, const VHttpRequest *req,
 
     /* Convert to an OpenAI-format body so the existing chat core runs it. */
     VJson *o = vjson_new_object();
-    vjson_obj_set(o, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+    vjson_obj_set(o, "model", vjson_new_string(api_model_id(ctx)));
     VJson *omsg = vjson_new_array();
     const VJson *sys = vjson_obj_get(body, "system");
     if (sys) {
@@ -4170,7 +4177,7 @@ static void handle_health(VLLMServerCtx *ctx, VHttpResponse *resp) {
     if (!body) { json_error(resp, 500, "Out of memory"); return; }
     VJson *root = vjson_new_object();
     vjson_obj_set(root, "status", vjson_new_string("ok"));
-    vjson_obj_set(root, "model", vjson_new_string(ctx->model_id ? ctx->model_id : "qwen3-vl-8b"));
+    vjson_obj_set(root, "model", vjson_new_string(api_model_id(ctx)));
     vhttp_mutex_lock(ctx->stat_lock);
     vjson_obj_set(root, "busy", vjson_new_bool(ctx->busy));
     vjson_obj_set(root, "queued", vjson_new_number((double)ctx->queued_requests));

@@ -125,6 +125,9 @@ typedef struct VLLMServerCtx {
                                 * model on disk; the admin page supplies the path) */
     char   model_name[128];    /* real model identity filled after load (e.g.
                                 * "Qwen3-VL-2B (dim=2048 layers=28)"); "" until then */
+    char   model_id_buf[128];  /* API model id derived from the model dir basename
+                                * when --model-id is absent (e.g. "Qwen3-0.6B-q4");
+                                * explicit --model-id still wins */
     int   port;                /* serving port */
     int   threads;             /* HTTP worker threads */
     int   prefix_cache;        /* --prefix-cache */
