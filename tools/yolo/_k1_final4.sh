@@ -11,6 +11,8 @@ M=/root/kv/models
 G=$M/gguf
 O=/tmp/final4; mkdir -p $O
 echo "BIN md5=$(md5sum $B | cut -d' ' -f1)"
+echo "GGUF Q4_0 sha=$(sha256sum $G/Qwen3-0.6B-Q4_0.gguf | cut -c1-16) ($(ls -l $G/*.gguf | awk '{print $5}' | tr '\n' ' '))"
+echo "VQF(Q4-only) sizes=$(ls -l $M/Qwen3-0.6B-col/model.vqf $M/Qwen3-1.7B-col/model.vqf $M/Qwen3-4B-col/model.vqf | awk '{print $5}' | tr '\n' ' ')"
 echo "START load=$(cut -d' ' -f1-3 /proc/loadavg)"
 
 # TOKIDS 是多行块（每行 `<id> t=<step> ms=<x> rss=<y>`），必须把整段 id 序列一起哈希：
@@ -18,10 +20,14 @@ echo "START load=$(cut -d' ' -f1-3 /proc/loadavg)"
 ids() { grep -E 'TOKIDS|^ *[0-9]+ t=' "$1" \
         | sed -E 's/.*TOKIDS: *//; s/ t=.*//' \
         | tr -s ' \n' '\n' | grep -E '^[0-9]+$' | tr '\n' ',' | md5sum | cut -c1-8; }
+idsn() { grep -E 'TOKIDS|^ *[0-9]+ t=' "$1" | sed -E 's/.*TOKIDS: *//; s/ t=.*//' \
+        | tr -s ' \n' '\n' | grep -cE '^[0-9]+$'; }
 steady() { awk '/ t=[0-9]+ ms=/{t=0;ms=0;
              for(i=1;i<=NF;i++){if($i~/^t=/){t=substr($i,3)+0} if($i~/^ms=/){ms=substr($i,4)+0}}
              if(t>=2){s+=ms;n++}} END{printf "%.1f", (n?s/n:0)}' "$1"; }
-pf() { grep -oE 'prefill [0-9]+ tokens in [0-9.]+s \([0-9]+ tok/s\)' "$1" | grep -oE '\([0-9]+ tok/s' | tr -dc '0-9'; }
+# prefill 实际 token 数与按实际 N 反算的 tok/s（引擎只打印整数 tok/s，且 ctx=128 实为 118 token）
+pf() { grep -oE 'prefill [0-9]+ tokens in [0-9.]+s' "$1" | tail -1 \
+        | awk '{n=$2; s=$5; s=substr(s,1,length(s)-1)+0; if(s>0) printf "%.2f/%d", n/s, n; else printf "0/0"}'; }
 
 ours() { # X ctx
   local X=$1
@@ -30,8 +36,9 @@ ours() { # X ctx
   taskset -c 0-3 env VLLM_Q4_VMADOT=1 VLLM_THREADS=4 OMP_NUM_THREADS=4 VLLM_Q4_IME=2 \
     timeout 3600 $B --stream-test --model $M/Qwen3-$X-col --stream-ctx $CTX --stream-n 32 \
     --threads 4 --warmup > $F 2>&1
-  printf 'OURS %-5s c%-4s load=%s | pp=%s tok/s | dec=%s ms | ids=%s\n' \
-    "$X" "$CTX" "$(cut -d' ' -f1 /proc/loadavg)" "$(pf $F)" "$(steady $F)" "$(ids $F)"
+  local P="$(pf $F)"
+  printf 'OURS %-5s c%-4s load=%s | pp=%s tok/s (n=%s) | dec=%s ms | ids=%s nid=%s\n' \
+    "$X" "$CTX" "$(cut -d' ' -f1 /proc/loadavg)" "${P%/*}" "${P#*/}" "$(steady $F)" "$(ids $F)" "$(idsn $F)"
 }
 lb() { # X
   local X=$1

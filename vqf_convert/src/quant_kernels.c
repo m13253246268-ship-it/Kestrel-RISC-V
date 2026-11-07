@@ -61,39 +61,13 @@ static inline uint16_t f32_to_f16_bits(float x) {
  *   qs[i] = round(w[i] / scale),  clamped to [-127, 127]
  * ================================================================ */
 
-/* d2 精度实验（L-IME-001 r10）：per-row（per-output-channel）scale 的 q8。
- * `g_q8_rowcols > 0` 时，行内所有 block 复用同一个 f16 尺度（行 max-abs/127），
- * 34 B/block 格式不变，引擎无需改动即可加载跑 Part F。用于判定 IME int8
- * per-channel 入口（整条 K 纯 int32 累加、尾部一次缩放）的精度代价。
- * 由 model_layers.c 在 VLLM_Q8_ROWSCALE=1 时设置；一次性，用后复位为 0。 */
-int g_q8_rowcols = 0;
-
 void f32_to_q8_0(uint8_t *q8_out, const float *f32_in, int n_elements) {
     int block_size = 32;
     int n_blocks = n_elements / block_size;
-    const int rc = g_q8_rowcols;
-    g_q8_rowcols = 0;
-    if (rc > 0 && (n_elements % rc != 0 || rc % block_size != 0)) {
-        fprintf(stderr, "[ROWSCALE8] WARN n=%d cols=%d 不整除，回退 per-block\n", n_elements, rc);
-    }
-    const int rowmode = (rc > 0 && n_elements % rc == 0 && rc % block_size == 0);
-    float row_max = 0.0f;
 
     for (int b = 0; b < n_blocks; b++) {
         /* Find block max-abs for scale */
         float max_abs = 1e-10f;
-        if (rowmode) {
-            const int nb_row = rc / block_size;
-            if (b % nb_row == 0) {
-                row_max = 1e-10f;
-                const float *xr = f32_in + (size_t)b * block_size;
-                for (int i = 0; i < rc; i++) {
-                    float av = fabsf(xr[i]);
-                    if (av > row_max) row_max = av;
-                }
-            }
-            max_abs = row_max;
-        } else
         for (int i = 0; i < block_size; i++) {
             float v = f32_in[b * block_size + i];
             float av = fabsf(v);
@@ -115,14 +89,7 @@ void f32_to_q8_0(uint8_t *q8_out, const float *f32_in, int n_elements) {
         float rscale = 1.0f / scale;
         for (int i = 0; i < block_size; i++) {
             float v = f32_in[b * block_size + i];
-            /* volatile 中间量：钉死单次 IEEE 乘加序列，杜绝 -ffast-math 的
-             * FMA 融合 / reciprocal / 重结合 —— 两端编译器逐字节一致 */
             volatile float qv = v * rscale;
-            /* round-half-away-from-zero（等价 ggml quantize_row_q8_0 的
-             * roundf）。**不能用 (int)(qv + 0.5f)**：C 的 (int) 向零截断，
-             * 负 qv 会整体 +1（qv<=-0.5 时），造成 P(q=0) 翻倍、非零 q 均值
-             * +0.55 LSB 的系统性正偏（llama Q8_0 仅 +0.05），量化噪声 RMS
-             * 0.29→0.76 LSB。 */
             int q = (int)(qv < 0.0f ? qv - 0.5f : qv + 0.5f);
             if (q > 127) q = 127;
             if (q < -127) q = -127;
@@ -131,69 +98,9 @@ void f32_to_q8_0(uint8_t *q8_out, const float *f32_in, int n_elements) {
     }
 }
 
-/* ================================================================
- * Q4_0 Quantization: f32 weights → compact Q4_0 format
- * (axiom: fixedpoint_quantize_saturate, B=4 path; int4_ready)
- *
- * Each block of 32 elements → 18 bytes: { f16 scale d; uint8 nibbles qs[16]; }
- *   d = max_signed / -8   (matches llama.cpp q4_0 asymmetric range [-8,+7])
- *   qs[j] = low nibble  = round(elem[j]    / d) clamped to [0,15]
- *           high nibble = round(elem[16+j] / d) clamped to [0,15]
- * Dequantized value = (nibble - 8) * d
- * ================================================================ */
-/* C-1 精度实验（L-IME-001 §12.3）：per-row scale 的 q4 量化。
- * `g_q4_rowcols > 0` 时，把「每 32 元素一个 d」换成「每行（cols 个元素）一个 d」，
- * 行内所有 block 复用同一个 f16 尺度 —— 文件格式与字节数完全不变（仍 18 B/block），
- * 引擎无需任何改动即可加载，因此可以直接跑 Part F 拿到 per-row scale 的 PPL 代价。
- * 由调用方（model_layers.c）在 VLLM_Q4_ROWSCALE=1 时设置；默认 0 = 原 per-block 行为。
- * 每次调用后复位为 0。本分支仅存在于转换器，重新提取（extract_quant.py）会抹掉。 */
-int g_q4_rowcols = 0;
-
 void f32_to_q4_0(uint8_t *q4_out, const float *f32_in, int n_elements) {
     int block_size = 32;
     int n_blocks = n_elements / block_size;
-
-    const int rc = g_q4_rowcols;
-    g_q4_rowcols = 0;   /* 一次性：避免残留到 lm_head 等未设置的调用 */
-    if (rc > 0 && (n_elements % rc != 0 || rc % block_size != 0)) {
-        fprintf(stderr, "[ROWSCALE] WARN n=%d cols=%d 不整除或 cols%%32!=0，回退 per-block\n",
-                n_elements, rc);
-    } else if (rc > 0) {
-        const int cols = rc;
-        const int rows = n_elements / cols;
-        const int nb_row = cols / block_size;
-        for (int r = 0; r < rows; r++) {
-            const float *xr = f32_in + (size_t)r * cols;
-            float amax = 0.0f, maxv = 0.0f;
-            for (int i = 0; i < cols; i++) {
-                float v = xr[i];
-                float av = fabsf(v);
-                if (av > amax) { amax = av; maxv = v; }
-            }
-            float d = maxv / -8.0f;
-            if (d == 0.0f) d = 1.0f;
-            float id = 1.0f / d;
-            uint16_t h = f32_to_f16_bits(d);
-            for (int b = 0; b < nb_row; b++) {
-                uint8_t *blk = q4_out + ((size_t)r * nb_row + b) * 18;
-                memcpy(blk, &h, 2);
-                const float *xb = xr + b * block_size;
-                uint8_t *qs = blk + 2;
-                for (int j = 0; j < 16; j++) {
-                    volatile float x0 = xb[j] * id;
-                    volatile float x1 = xb[16 + j] * id;
-                    int xi0 = (int)(x0 + 8.5f);
-                    int xi1 = (int)(x1 + 8.5f);
-                    if (xi0 > 15) xi0 = 15;
-                    if (xi0 < 0)  xi0 = 0;
-                    if (xi1 > 15) xi1 = 15;
-                    if (xi1 < 0)  xi1 = 0;
-                    qs[j] = (uint8_t)(xi0 | (xi1 << 4));
-                }
-            }
-        }
-        return;
-    }
 
     for (int b = 0; b < n_blocks; b++) {
         const float *xb = f32_in + b * block_size;

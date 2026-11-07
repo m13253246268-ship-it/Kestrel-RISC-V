@@ -270,6 +270,14 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 4. Model conversion, encryption/signing, and bit-level comparison all have determinism
    red lines (`-ffp-contract=off`, identical FNV/HMAC conventions, etc.). Read the header
    comments of the relevant scripts before changing build parameters.
+5. **`VLLM_SILU_RVV=1` is an approximation, not bit-level identical.** On RISC-V
+   (VLEN=256) it routes the dense-FFN SiLU through an RVV polynomial-exp branch
+   (`|err|≈2.5e-7`, ~+6–8% prefill, on by default). Attestation mode (`VLLM_ATTEST=1`)
+   forces SiLU back to the scalar `fast_silu` (`expf`) path and ignores `VLLM_SILU_RVV`:
+   the approximation can flip a token under greedy argmax, changing the generated text
+   and therefore the SM3 digest preimage, so an external recomputation against the
+   reference text would no longer match. Attestation thus trades the prefill gain for
+   bit-level determinism. (`VLLM_SILU_RVV=0` is the explicit scalar escape hatch.)
 
 For more performance / adaptation details, see the `arm记录/` and `mcu参考/` document
 series at the repository root, and `tools/preproc/README.md`.

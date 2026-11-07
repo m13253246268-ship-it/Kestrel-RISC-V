@@ -135,12 +135,20 @@ typedef struct {
     VQFSig   sig;
 } VQFHeaderLegacy;         /* 432B */
 
+/* 张量布局标识（VQFTensor.layout） */
+#define VQF_LAYOUT_LEGACY        0u    /* 默认/legacy 布局（LLM q4 18B/块 或 Conv CHW [OC,K]） */
+#define VQF_LAYOUT_Q4_4X4        1u    /* q4 4x4 布局（72B/块） */
+#define VQF_LAYOUT_Q4_LANE       2u    /* q4 lane-major 布局（32行tile） */
+#define VQF_LAYOUT_Q4_COL        3u    /* q4 col-major 4-bit 布局（32行tile,列主序） */
+#define VQF_LAYOUT_CONV_HWC_TAP  4u    /* Conv int8 离线预打包：HWC tap-major + Kp(32B对齐) 补零 [OC,Kp] */
+#define VQF_LAYOUT_CONV_IME_K1   5u    /* Conv int8 离线预打包：SpacemiT K1 IME pack_a 布局 [mt][kb][mv][32] */
+
 typedef struct {
     char     name[32];     /* 内部张量名：q8_q / q4_gate / x8_o / token_embed ... */
     uint32_t qtype;        /* VQF_QT_* */
     uint32_t rows, cols;   /* 几何（诊断用） */
-    uint32_t layout;       /* q4 布局：0=legacy(18B/块) 1=4x4(72B/块) 2=lane-major(32行tile)
-                             3=col-major 4-bit(32行tile,列主序,供 int8 整数点积 T4-1)。
+    uint32_t layout;       /* VQF_LAYOUT_*：0=legacy 1=4x4 2=lane-major 3=col-major
+                             4=conv HWC tap-major([OC,Kp]) 5=conv IME K1 pack_a。
                              吃 offset 的 8 字节对齐空洞（44..47），sizeof 保持 64 */
     uint64_t offset;       /* 文件内数据偏移（64B 对齐） */
     uint64_t bytes;

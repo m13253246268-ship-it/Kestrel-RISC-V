@@ -90,7 +90,8 @@ typedef struct {
     int    rowlen;       /* M5：行宽（2D 为 ne[1]=K，行主序连续维） */
     int    nblk;         /* M5：每行的量化块数 = ceil(rowlen/LAYA_QB) */
     size_t n_elem;
-    int8_t *ime_a;       /* K-LAYA-003：IME 打包权重（惰性、仅 VLLM_LAYA_IME=1 时分配） */
+    int8_t *ime_a;       /* K-LAYA-003：IME 打包权重（惰性或预打包零拷贝） */
+    int     ime_owned;   /* 1=运行期单独calloc需free，0=指向m->imepool零拷贝无需单独free */
 } LayaEnt;
 
 struct LayaModel {
@@ -98,7 +99,8 @@ struct LayaModel {
     size_t         blob_size;
     float         *f32pool;  /* 1D 张量（norm/bias）展开的 F32 小池（<0.5 MB） */
     int8_t        *i8pool;   /* K-LAYA-002 M5：全部 2D 权重的 int8 arena（~421 MB） */
-    float         *qscpool;  /* K-LAYA-002 M5：int8 权重的 per-128 块 scale（~53 MB） */
+    float         *qscpool;  /* K-LAYA-002 M5：int8 权重的 per-LAYA_QB 块 scale */
+    int8_t        *imepool;  /* 离线/预打包 SpacemiT K1 IME 权重池（零拷贝直挂） */
     LayaEnt       *ent;
     int            n_ent;
     /* K-LAYA-002 P2：RoPE 表缓存。theta 固定（160000 全 / 10000 滑窗）⇒ 表只依赖
@@ -108,6 +110,12 @@ struct LayaModel {
      * 保证；lay_dot 档位原本也依赖串行初始化）。 */
     int            rope_cap;
     float         *rope_cosF, *rope_sinF, *rope_cosS, *rope_sinS;
+    /* 公理 set_5foperations_91154c82：基于生命周期不交集的持久化静态激活 Arena */
+    uint8_t       *arena;
+    size_t         arena_cap;
+    int8_t        *mm_xq;
+    float         *mm_xs;
+    int8_t        *mm_ime_bufs[4];
 };
 
 /* ---------------- fp16 -> fp32 ---------------- */
@@ -301,32 +309,9 @@ static inline float lay_dot_f16(const uint16_t *w, const float *x, int n) {
  *       决策等价门 12/12（4 场景×{choice/score/noul}×选项{3,8}，argmax 全一致，
  *       max|Δp|=3.17e-2 < 5e-2 J2 门）；板端配对 8.5–9.7×（mm 11–13×），
  *       L2 极差 1.03–1.20%（板上测量噪声，略超 1% 名义门，如实披露）。
- *       逃生舱 VLLM_LAYA_RVV=0 保留；档 1 作为与档 2 位级全等的标量参考保留。
  * ------------------------------------------------------------------ */
-static int lay_dot_level(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("VLLM_LAYA_RVV");
-        if (!e || !e[0]) v = 2;                        /* K-LAYA-002 P0：缺省 = 档 2（RVV int32）。
-                                                        *   用户 2026-10-29 显式拍板默认化。证据：
-                                                        *   决策等价门 12/12（4 场景×类型，argmax 全一致，
-                                                        *   max|Δp|=3.17e-2 < 5e-2）；板端配对 8.5–9.7×
-                                                        *   （mm 11–13×）；极差 1.03–1.20%（板上测量噪声，
-                                                        *   略超 default_enablement 1% 名义门，如实披露）。
-                                                        *   逃生舱 VLLM_LAYA_RVV=0 保留。 */
-        else if (e[0] == '0') v = 0;
-        else if (e[0] == '1') v = 1;
-        else if (e[0] == '2') v = 2;
-        else v = 2;                                    /* 越界/异常 → 安全侧（保持新默认水平） */
-#if ST_ARCH_RISCV
-        fprintf(stderr, "[LAYA-RVV] int8 dot level=%d"
-                        " (0=float 基线, 1=标量 int32, 2=RVV int32[默认])\n", v);
-        fflush(stderr);
-#endif
-    }
-    return v;
-}
-
+/* 收口：档 2（RVV int32）恒开为唯一路径，删除 VLLM_LAYA_RVV 开关、
+ * 档 0 float 基线与档 1 标量 int32 回退分支。 */
 #if ST_HAVE_RVV
 /* e8m1 的 VLMAX = VLEN/8（256 位机 = 32）。每次点积只读一次 cache。 */
 static inline size_t lay_rvv_vl8(void) {
@@ -404,32 +389,8 @@ static inline float lay_dot_i8(const int8_t *w, const float *sw,
     for (; b < K; b++) s += (float)w[b] * sw[b / LAYA_QB] * (float)x[b] * sx[b / LAYA_QB];
     return s;
 #elif ST_ARCH_RISCV
-    /* K-LAYA-002 M9：三档（见 lay_dot_level 上方口径）。level>=1 与档 0 是非位级
-     * 等价（顺序浮点链不可向量化），故默认 level=0 保留完整回退。 */
-    const int lv = lay_dot_level();
-#if ST_HAVE_RVV
-    if (lv >= 2) return lay_dot_i8_rvv(w, sw, x, sx, K);
-#endif
-    if (lv >= 1) {
-        float s = 0.0f;
-        for (int b = 0; b + LAYA_QB <= K; b += LAYA_QB) {
-            int32_t acc = 0;
-            for (int j = 0; j < LAYA_QB; j++)
-                acc += (int32_t)w[b + j] * (int32_t)x[b + j];
-            s += (float)acc * (sw[b / LAYA_QB] * sx[b / LAYA_QB]);
-        }
-        for (int b = (K / LAYA_QB) * LAYA_QB; b < K; b++)
-            s += (float)w[b] * sw[b / LAYA_QB] * (float)x[b] * sx[b / LAYA_QB];
-        return s;
-    }
-    /* level 0：历史基线（逐元素 float 链） */
-    {
-        float s = 0.0f;
-        for (int b = 0; b + LAYA_QB <= K; b += LAYA_QB)
-            for (int j = 0; j < LAYA_QB; j++) s += (float)w[b + j] * (float)x[b + j] * sw[b / LAYA_QB] * sx[b / LAYA_QB];
-        for (int b = (K / LAYA_QB) * LAYA_QB; b < K; b++) s += (float)w[b] * sw[b / LAYA_QB] * (float)x[b] * sx[b / LAYA_QB];
-        return s;
-    }
+    /* 收口：恒走档 2（RVV int32），删除 lay_dot_level 三档分派与档 0/1 回退。 */
+    return lay_dot_i8_rvv(w, sw, x, sx, K);
 #else
     float s = 0.0f;
     for (int b = 0; b + LAYA_QB <= K; b += LAYA_QB)
@@ -624,18 +585,67 @@ static void rope_head(float *v, const float *cos_t, const float *sin_t, int pos)
     }
 }
 
+/* 通用 IME 权重打包内核（公理 blas_matrix_block_natural_isomorphism）：
+ * [mt][kb] 64 B = 2×32 B，各 32 B = 4 行 × 8 K */
+static void lay_ime_pack_into(const int8_t *Wq, int8_t *p, int OC, int K) {
+    const int mt_n = OC / 8, kb_n = K / 8;
+    for (int mt = 0; mt < mt_n; mt++)
+        for (int kb = 0; kb < kb_n; kb++)
+            for (int mv = 0; mv < 2; mv++)
+                for (int q = 0; q < 4; q++)
+                    memcpy(p + ((size_t)mt * kb_n + kb) * 64 + mv * 32 + q * 8,
+                           Wq + (size_t)(mt * 8 + mv * 4 + q) * K + kb * 8, 8);
+}
+
+/* 收口：prepack 与 arena 恒开，删除 VLLM_LAYA_PREPACK / VLLM_LAYA_ARENA 开关。 */
+
+/* 收口：K1 IME 自动探测（读 /proc/cpuinfo 含 _ime/spacemit/SpacemiT），
+ * 取代手动 VLLM_LAYA_IME=1 开关，与 YOLO 的 yolo_ime_on() 同模式。 */
+static int lay_ime_on(void) {
+    static int g = -1;
+#ifdef _OPENMP
+    if (g < 0) {
+        g = 0;
+        FILE *fp = fopen("/proc/cpuinfo", "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "_ime") || strstr(line, "spacemit") || strstr(line, "SpacemiT")) {
+                    g = 1;
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+    }
+    return g;
+#else
+    return 0;   /* 绑核依赖 OpenMP 线程池；无 OMP 的构建不启用该路径 */
+#endif
+}
+
+typedef struct {
+    char     magic[4];   /* "LQ8V" */
+    uint32_t qb;
+    uint32_t n_ent;
+    uint32_t has_ime;
+    uint64_t f32n;
+    uint64_t i8n;
+    uint64_t blkn;
+    uint64_t imen;
+} LayaVqfHdr;
+
 /* ---------------- load ---------------- */
 LayaModel *laya_load(const char *pack_dir) {
-    char pbin[1024], pman[1024];
+    double t_load0 = lay_wtime();
+    char pbin[1024], pman[1024], pvqf[1024];
     snprintf(pbin, sizeof(pbin), "%s/laya_f16.bin", pack_dir);
     snprintf(pman, sizeof(pman), "%s/laya_manifest.txt", pack_dir);
-    FILE *fb = fopen(pbin, "rb");
-    if (!fb) { fprintf(stderr, "[LAYA] cannot open %s\n", pbin); return NULL; }
-    fseek(fb, 0, SEEK_END);
-    long sz = ftell(fb);
-    fseek(fb, 0, SEEK_SET);
+    const int ime_req = lay_ime_on();
+    snprintf(pvqf, sizeof(pvqf), "%s/laya_q8_qb%d%s.vqf", pack_dir, (int)LAYA_QB, ime_req ? "_ime" : "");
+
     FILE *fm = fopen(pman, "r");
-    if (!fm) { fprintf(stderr, "[LAYA] cannot open %s\n", pman); fclose(fb); return NULL; }
+    if (!fm) { fprintf(stderr, "[LAYA] cannot open %s\n", pman); return NULL; }
     int cap = 512, n = 0;
     LayaEnt *ent = (LayaEnt *)calloc((size_t)cap, sizeof(LayaEnt));
     char line[512];
@@ -657,7 +667,7 @@ LayaModel *laya_load(const char *pack_dir) {
     }
     fclose(fm);
     /* K-LAYA-002 M5：载入策略再次收窄——1D（norm/bias）+ F32 小张量（temperature）
-     * 展开/拷贝到 F32 池；**全部 2D 权重按行做 per-128 块对称量化，存入 int8 arena
+     * 展开/拷贝到 F32 池；**全部 2D 权重按行做 per-LAYA_QB 块对称量化，存入 int8 arena
      * + scale 池**，随后释放 843 MB 的 F16 blob ⇒ RSS 843 MB → ~474 MB。
      * 公理 collapse_to_classic + collapse_priority_rule（细粒度块 scale，避免单 scale
      * 不可逆失真）、conservation_law_under_collapse（以 J2 决策输出等价实测守门）。 */
@@ -670,88 +680,181 @@ LayaModel *laya_load(const char *pack_dir) {
         if (e->rowlen < 1) e->rowlen = 1;
         e->nblk = (e->rowlen + LAYA_QB - 1) / LAYA_QB;
     }
-    unsigned char *blob = (unsigned char *)malloc((size_t)sz);
-    if (!blob) { fprintf(stderr, "[LAYA] OOM blob (%.0f MB)\n", sz / 1e6); fclose(fb); free(ent); return NULL; }
-    if (fread(blob, 1, (size_t)sz, fb) != (size_t)sz) {
-        fprintf(stderr, "[LAYA] blob read failed %s\n", pbin);
-        free(blob); fclose(fb); free(ent); return NULL;
-    }
-    fclose(fb);
-    /* VLLM_LAYA_F16=1：逃生舱，跳过 int8 量化、保留 F16 权重（RSS 回到 ~843 MB）。
-     * 用途只有一个——与 fp32 golden 做数值/位级对拍。int8 是部署精度（默认），
-     * 其固有量化噪声（per-128 块，~1e-2 相对）会让 fp32 门永远不过，
-     * 因此不能拿它验证实现正确性。 */
-    const int f16_mode = getenv("VLLM_LAYA_F16") != NULL ? 1 : 0;
-    size_t f32n = 0, i8n = 0, blkn = 0;
+    /* 收口：f16_mode 逃生舱删除，恒走 int8 量化路径。 */
+    size_t f32n = 0, i8n = 0, blkn = 0, imen = 0;
     for (int i = 0; i < n; i++) {
         LayaEnt *e = &ent[i];
         if (e->is_f32 || e->ndim <= 1) f32n += e->n_elem;          /* 展开/拷贝为 F32 */
-        else if (f16_mode) { /* 直接引用 blob，不占池 */ }
         else {                                                     /* 2D → int8 + scales */
             size_t rows = e->n_elem / (size_t)e->rowlen;
             i8n  += e->n_elem;
             blkn += rows * (size_t)e->nblk;
+            int K = e->rowlen, OC = (int)rows;
+            if (ime_req && e->ndim == 2 && K % 8 == 0 && OC % 8 == 0 && K >= LAYA_QB &&
+                strcmp(e->name, "encoder.embeddings.tok_embeddings.weight") != 0 &&
+                strcmp(e->name, "type_emb.weight") != 0) {
+                imen += (size_t)(OC / 8) * (size_t)(K / 8) * 64;
+            }
         }
     }
     float  *f32pool = f32n ? (float *)malloc(sizeof(float) * f32n) : NULL;
     int8_t *i8pool  = i8n ? (int8_t *)malloc(i8n) : NULL;
     float  *qscpool = blkn ? (float *)malloc(sizeof(float) * blkn) : NULL;
-    if ((f32n && !f32pool) || (i8n && !i8pool) || (blkn && !qscpool)) {
+    int8_t *imepool = imen ? (int8_t *)malloc(imen) : NULL;
+    if ((f32n && !f32pool) || (i8n && !i8pool) || (blkn && !qscpool) || (imen && !imepool)) {
         fprintf(stderr, "[LAYA] OOM pools\n");
-        free(blob); free(f32pool); free(i8pool); free(qscpool); free(ent); return NULL;
+        free(f32pool); free(i8pool); free(qscpool); free(imepool); free(ent); return NULL;
     }
-    size_t f32cur = 0, i8cur = 0, sccur = 0;
-    for (int i = 0; i < n; i++) {
-        LayaEnt *e = &ent[i];
-        const unsigned char *src = blob + e->off;
-        if (e->is_f32) {                   /* F32 小张量（temperature）：拷贝到 F32 池 */
-            float *dst = f32pool + f32cur;
-            memcpy(dst, src, sizeof(float) * e->n_elem);
-            e->f32 = dst; e->f16 = NULL; e->i8 = NULL;
-            f32cur += e->n_elem;
-        } else if (e->ndim == 1) {         /* 1D F16 → F32 池（norm/bias） */
-            float *dst = f32pool + f32cur;
-            const uint16_t *h = (const uint16_t *)src;
-            for (size_t j = 0; j < e->n_elem; j++) dst[j] = f16_to_f32(h[j]);
-            e->f32 = dst; e->f16 = NULL; e->i8 = NULL;
-            f32cur += e->n_elem;
-        } else if (f16_mode) {             /* 对拍模式：F16 权重原地引用 blob */
-            e->f16 = (const uint16_t *)src; e->i8 = NULL; e->f32 = NULL;
-        } else {                           /* 2D F16 → int8 + per-128 块 scale */
-            int8_t *q = i8pool + i8cur;
-            float  *sc = qscpool + sccur;
-            const uint16_t *h = (const uint16_t *)src;
-            size_t rows = e->n_elem / (size_t)e->rowlen;
-            for (size_t r = 0; r < rows; r++)
-                lay_quant_f16_row(h + r * (size_t)e->rowlen, q + r * (size_t)e->rowlen,
-                                  sc + r * (size_t)e->nblk, e->rowlen);
-            e->i8 = q; e->qsc = sc; e->f16 = NULL; e->f32 = NULL;
-            i8cur += e->n_elem;
-            sccur += rows * (size_t)e->nblk;
+
+    /* 优先尝试从预打包 VQF 镜像零转换直读（省去 843MB F16 分配 + 4.21 亿次在线量化 + 2.3s IME 打包） */
+    int loaded_prepack = 0;
+    {
+        FILE *fv = fopen(pvqf, "rb");
+        if (fv) {
+            LayaVqfHdr hdr;
+            if (fread(&hdr, sizeof(hdr), 1, fv) == 1 &&
+                memcmp(hdr.magic, "LQ8V", 4) == 0 &&
+                hdr.qb == (uint32_t)LAYA_QB && hdr.n_ent == (uint32_t)n &&
+                hdr.has_ime == (uint32_t)ime_req &&
+                hdr.f32n == f32n && hdr.i8n == i8n && hdr.blkn == blkn && hdr.imen == imen) {
+                int ok_rd = 1;
+                if (f32n && fread(f32pool, sizeof(float), f32n, fv) != f32n) ok_rd = 0;
+                if (ok_rd && i8n && fread(i8pool, 1, i8n, fv) != i8n) ok_rd = 0;
+                if (ok_rd && blkn && fread(qscpool, sizeof(float), blkn, fv) != blkn) ok_rd = 0;
+                if (ok_rd && imen && imepool && fread(imepool, 1, imen, fv) != imen) ok_rd = 0;
+                if (ok_rd) {
+                    size_t f32cur = 0, i8cur = 0, sccur = 0, imecur = 0;
+                    for (int i = 0; i < n; i++) {
+                        LayaEnt *e = &ent[i];
+                        if (e->is_f32 || e->ndim == 1) {
+                            e->f32 = f32pool + f32cur; e->f16 = NULL; e->i8 = NULL;
+                            f32cur += e->n_elem;
+                        } else {
+                            size_t rows = e->n_elem / (size_t)e->rowlen;
+                            e->i8 = i8pool + i8cur;
+                            e->qsc = qscpool + sccur;
+                            e->f16 = NULL; e->f32 = NULL;
+                            i8cur += e->n_elem;
+                            sccur += rows * (size_t)e->nblk;
+                            int K = e->rowlen, OC = (int)rows;
+                            if (ime_req && imepool && e->ndim == 2 && K % 8 == 0 && OC % 8 == 0 && K >= LAYA_QB &&
+                                strcmp(e->name, "encoder.embeddings.tok_embeddings.weight") != 0 &&
+                                strcmp(e->name, "type_emb.weight") != 0) {
+                                e->ime_a = imepool + imecur;
+                                e->ime_owned = 0;
+                                imecur += (size_t)(OC / 8) * (size_t)(K / 8) * 64;
+                            }
+                        }
+                    }
+                    loaded_prepack = 1;
+                }
+            }
+            fclose(fv);
+        }
+    }
+
+    unsigned char *blob = NULL;
+    long sz = 0;
+    if (!loaded_prepack) {
+        FILE *fb = fopen(pbin, "rb");
+        if (!fb) {
+            fprintf(stderr, "[LAYA] cannot open %s\n", pbin);
+            free(f32pool); free(i8pool); free(qscpool); free(imepool); free(ent); return NULL;
+        }
+        fseek(fb, 0, SEEK_END);
+        sz = ftell(fb);
+        fseek(fb, 0, SEEK_SET);
+        blob = (unsigned char *)malloc((size_t)sz);
+        if (!blob) {
+            fprintf(stderr, "[LAYA] OOM blob (%.0f MB)\n", sz / 1e6);
+            fclose(fb); free(f32pool); free(i8pool); free(qscpool); free(imepool); free(ent); return NULL;
+        }
+        if (fread(blob, 1, (size_t)sz, fb) != (size_t)sz) {
+            fprintf(stderr, "[LAYA] blob read failed %s\n", pbin);
+            free(blob); fclose(fb); free(f32pool); free(i8pool); free(qscpool); free(imepool); free(ent); return NULL;
+        }
+        fclose(fb);
+        size_t f32cur = 0, i8cur = 0, sccur = 0, imecur = 0;
+        const int use_omp_q = 1;
+        for (int i = 0; i < n; i++) {
+            LayaEnt *e = &ent[i];
+            const unsigned char *src = blob + e->off;
+            if (e->is_f32) {                   /* F32 小张量（temperature）：拷贝到 F32 池 */
+                float *dst = f32pool + f32cur;
+                memcpy(dst, src, sizeof(float) * e->n_elem);
+                e->f32 = dst; e->f16 = NULL; e->i8 = NULL;
+                f32cur += e->n_elem;
+            } else if (e->ndim == 1) {         /* 1D F16 → F32 池（norm/bias） */
+                float *dst = f32pool + f32cur;
+                const uint16_t *h = (const uint16_t *)src;
+                for (size_t j = 0; j < e->n_elem; j++) dst[j] = f16_to_f32(h[j]);
+                e->f32 = dst; e->f16 = NULL; e->i8 = NULL;
+                f32cur += e->n_elem;
+            } else {                           /* 2D F16 → int8 + per-LAYA_QB 块 scale */
+                int8_t *q = i8pool + i8cur;
+                float  *sc = qscpool + sccur;
+                const uint16_t *h = (const uint16_t *)src;
+                size_t rows = e->n_elem / (size_t)e->rowlen;
+                long nrows = (long)rows;
+#pragma omp parallel for schedule(static) if(use_omp_q && nrows > 16)
+                for (long r = 0; r < nrows; r++)
+                    lay_quant_f16_row(h + (size_t)r * (size_t)e->rowlen, q + (size_t)r * (size_t)e->rowlen,
+                                      sc + (size_t)r * (size_t)e->nblk, e->rowlen);
+                e->i8 = q; e->qsc = sc; e->f16 = NULL; e->f32 = NULL;
+                i8cur += e->n_elem;
+                sccur += rows * (size_t)e->nblk;
+                int K = e->rowlen, OC = (int)rows;
+                if (ime_req && imepool && e->ndim == 2 && K % 8 == 0 && OC % 8 == 0 && K >= LAYA_QB &&
+                    strcmp(e->name, "encoder.embeddings.tok_embeddings.weight") != 0 &&
+                    strcmp(e->name, "type_emb.weight") != 0) {
+                    int8_t *ip = imepool + imecur;
+                    lay_ime_pack_into(q, ip, OC, K);
+                    e->ime_a = ip;
+                    e->ime_owned = 0;
+                    imecur += (size_t)(OC / 8) * (size_t)(K / 8) * 64;
+                }
+            }
+        }
+        /* 首次量化后自动将预打包 VQF 镜像持久化到 pack_dir */
+        {
+            FILE *fv = fopen(pvqf, "wb");
+            if (fv) {
+                LayaVqfHdr hdr;
+                memcpy(hdr.magic, "LQ8V", 4);
+                hdr.qb = (uint32_t)LAYA_QB;
+                hdr.n_ent = (uint32_t)n;
+                hdr.has_ime = (uint32_t)ime_req;
+                hdr.f32n = f32n; hdr.i8n = i8n; hdr.blkn = blkn; hdr.imen = imen;
+                fwrite(&hdr, sizeof(hdr), 1, fv);
+                if (f32n) fwrite(f32pool, sizeof(float), f32n, fv);
+                if (i8n)  fwrite(i8pool, 1, i8n, fv);
+                if (blkn) fwrite(qscpool, sizeof(float), blkn, fv);
+                if (imen && imepool) fwrite(imepool, 1, imen, fv);
+                fclose(fv);
+            }
         }
     }
     LayaModel *m = (LayaModel *)calloc(1, sizeof(LayaModel));
-    if (f16_mode) {                    /* F16 权重指向 blob，须保留 */
-        m->blob = blob; m->blob_size = (size_t)sz;
-    } else {
-        free(blob); blob = NULL;       /* F16 blob 不再需要 */
-        m->blob = NULL; m->blob_size = 0;
-    }
+    free(blob); blob = NULL;               /* F16 blob 不再需要 */
+    m->blob = NULL; m->blob_size = 0;
     m->ent = ent; m->n_ent = n;
-    m->f32pool = f32pool; m->i8pool = i8pool; m->qscpool = qscpool;
-    printf("[LAYA] loaded %d tensors (int8 %.0f MB + scales %.1f MB + F32 pool %.2f MB%s)\n",
+    m->f32pool = f32pool; m->i8pool = i8pool; m->qscpool = qscpool; m->imepool = imepool;
+    double load_ms = (lay_wtime() - t_load0) * 1e3;
+    printf("[LAYA] loaded %d tensors (int8 %.0f MB + scales %.1f MB + F32 pool %.2f MB, prepack=%d, load=%.1fms)\n",
            n, (double)i8n / 1e6, (double)(sizeof(float) * blkn) / 1e6,
            (double)(sizeof(float) * f32n) / 1e6,
-           f16_mode ? ", F16 blob kept for golden check" : "");
+           loaded_prepack, load_ms);
     return m;
 }
 
 void laya_free(LayaModel *m) {
     if (!m) return;
     if (m->ent)
-        for (int i = 0; i < m->n_ent; i++) free(m->ent[i].ime_a);
-    free(m->blob); free(m->f32pool); free(m->i8pool); free(m->qscpool); free(m->ent);
+        for (int i = 0; i < m->n_ent; i++)
+            if (m->ent[i].ime_owned && m->ent[i].ime_a) free(m->ent[i].ime_a);
+    free(m->blob); free(m->f32pool); free(m->i8pool); free(m->qscpool); free(m->imepool); free(m->ent);
     free(m->rope_cosF); free(m->rope_sinF); free(m->rope_cosS); free(m->rope_sinS);
+    free(m->arena);
     free(m);
 }
 
@@ -776,14 +879,10 @@ void laya_free(LayaModel *m) {
  * 要求的 out/hidden/完整 logits/KV 哈希四级对拍、以及
  * default_enablement_gate_v1 要求的极差测量都还没做 ⇒ 默认开目前只有源码依据。
  * ------------------------------------------------------------------ */
+/* 收口：VLLM_LAYA_ATTN_RVV 开关删除，RVV 平台恒开为唯一路径。 */
 static inline int lay_attn_rvv_on(void) {
 #if ST_HAVE_RVV
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("VLLM_LAYA_ATTN_RVV");
-        v = (e && e[0] == '0') ? 0 : 1;              /* 默认开；显式 0 回退标量 */
-    }
-    return v;
+    return 1;
 #else
     return 0;
 #endif
@@ -814,58 +913,21 @@ static void lay_transpose_k(const float *K, float *Kt, int n) {
  * 两者都被链的延迟而非吞吐限制。改为 4 条独立链（d 按 4 交错）后再两两合并：
  * 链深 64→16。**代价：浮点求和顺序改变，不再与旧值逐位相同**，验收口径从
  * 位级门换成 J2（argmax 一致 + max|Δp| ≤ 5e-2）。 */
-/* K-LAYA-003 L2 开关：0（默认）= 原单链（与旧版逐位相同）；1 = 4 条累加链。
- * 审查 B2 处置（2026-10-30）：同批四臂 ×3 轮，L2 单独 82275 ms vs base 78674 ms
- * （更慢），L3 单独 69301 ms，L2+L3 70448 ms ⇒ 收益全部来自 L3，L2 回退为默认关。
- * 同时消除 L2+L3 组合在 q15 的 argmax 翻转。 */
-static int lay_attn_split(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("VLLM_LAYA_ATTN_SPLIT");
-        v = (e && e[0] == '1') ? 1 : 0;
-    }
-    return v;
-}
+/* 收口：VLLM_LAYA_ATTN_SPLIT 开关删除（L2 实测更慢，默认关，直接删除），恒走单链。 */
 
 static void lay_attn_scores_rvv(const float *q, const float *kt0, size_t rowstride,
                                 int lo, int hi, float *att, float kscale) {
-    const int split = lay_attn_split();
     int j = lo;
     while (j < hi) {
         size_t vl = __riscv_vsetvl_e32m4((size_t)(hi - j));
         vfloat32m4_t a0 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-        vfloat32m4_t a1 = a0, a2 = a0, a3 = a0;
         const float *kt = kt0 + (size_t)(j - lo);
-        int d = 0;
-        if (!split) {
-            for (; d < LAYA_HD; d++) {
-                a0 = __riscv_vfadd_vv_f32m4(a0, __riscv_vfmul_vf_f32m4(
-                         __riscv_vle32_v_f32m4(kt, vl), q[d], vl), vl);
-                kt += rowstride;
-            }
-            __riscv_vse32_v_f32m4(att + (j - lo), __riscv_vfmul_vf_f32m4(a0, kscale, vl), vl);
-            j += (int)vl;
-            continue;
-        }
-        for (; d + 4 <= LAYA_HD; d += 4) {
-            a0 = __riscv_vfadd_vv_f32m4(a0, __riscv_vfmul_vf_f32m4(
-                     __riscv_vle32_v_f32m4(kt, vl), q[d + 0], vl), vl);
-            a1 = __riscv_vfadd_vv_f32m4(a1, __riscv_vfmul_vf_f32m4(
-                     __riscv_vle32_v_f32m4(kt + rowstride, vl), q[d + 1], vl), vl);
-            a2 = __riscv_vfadd_vv_f32m4(a2, __riscv_vfmul_vf_f32m4(
-                     __riscv_vle32_v_f32m4(kt + 2 * rowstride, vl), q[d + 2], vl), vl);
-            a3 = __riscv_vfadd_vv_f32m4(a3, __riscv_vfmul_vf_f32m4(
-                     __riscv_vle32_v_f32m4(kt + 3 * rowstride, vl), q[d + 3], vl), vl);
-            kt += 4 * rowstride;
-        }
-        for (; d < LAYA_HD; d++) {   /* LAYA_HD 不是 4 的倍数时兜底（当前恒 64 ⇒ 空） */
+        for (int d = 0; d < LAYA_HD; d++) {
             a0 = __riscv_vfadd_vv_f32m4(a0, __riscv_vfmul_vf_f32m4(
                      __riscv_vle32_v_f32m4(kt, vl), q[d], vl), vl);
             kt += rowstride;
         }
-        vfloat32m4_t s = __riscv_vfadd_vv_f32m4(
-            __riscv_vfadd_vv_f32m4(a0, a1, vl), __riscv_vfadd_vv_f32m4(a2, a3, vl), vl);
-        __riscv_vse32_v_f32m4(att + (j - lo), __riscv_vfmul_vf_f32m4(s, kscale, vl), vl);
+        __riscv_vse32_v_f32m4(att + (j - lo), __riscv_vfmul_vf_f32m4(a0, kscale, vl), vl);
         j += (int)vl;
     }
 }
@@ -879,37 +941,14 @@ static void lay_attn_av_rvv(const float *V, int lo, int m, int off,
     for (int t = 0; t < LAYA_HD; t += vmax) {
         size_t vl = __riscv_vsetvl_e32m8((size_t)(LAYA_HD - t));
         vfloat32m8_t o0 = __riscv_vfmv_v_f_f32m8(0.0f, vl);
-        vfloat32m8_t o1 = o0, o2 = o0, o3 = o0;
-        int j = 0;
-        if (!lay_attn_split()) {
-            for (; j < m; j++) {
-                float w = att[j] * inv;
-                if (w == 0.0f) continue;           /* 与标量一致的 0 权重短路 */
-                o0 = __riscv_vfadd_vv_f32m8(o0, __riscv_vfmul_vf_f32m8(
-                         __riscv_vle32_v_f32m8(V + (size_t)(lo + j) * LAYA_D + off + t, vl),
-                         w, vl), vl);
-            }
-            __riscv_vse32_v_f32m8(oh + t, o0, vl);
-            continue;
-        }
-        for (; j + 4 <= m; j += 4) {
-            const float *v0 = V + (size_t)(lo + j + 0) * LAYA_D + off + t;
-            o0 = __riscv_vfadd_vv_f32m8(o0, __riscv_vfmul_vf_f32m8(
-                     __riscv_vle32_v_f32m8(v0, vl), att[j + 0] * inv, vl), vl);
-            o1 = __riscv_vfadd_vv_f32m8(o1, __riscv_vfmul_vf_f32m8(
-                     __riscv_vle32_v_f32m8(v0 + LAYA_D, vl), att[j + 1] * inv, vl), vl);
-            o2 = __riscv_vfadd_vv_f32m8(o2, __riscv_vfmul_vf_f32m8(
-                     __riscv_vle32_v_f32m8(v0 + 2 * LAYA_D, vl), att[j + 2] * inv, vl), vl);
-            o3 = __riscv_vfadd_vv_f32m8(o3, __riscv_vfmul_vf_f32m8(
-                     __riscv_vle32_v_f32m8(v0 + 3 * LAYA_D, vl), att[j + 3] * inv, vl), vl);
-        }
-        for (; j < m; j++)
+        for (int j = 0; j < m; j++) {
+            float w = att[j] * inv;
+            if (w == 0.0f) continue;           /* 与标量一致的 0 权重短路 */
             o0 = __riscv_vfadd_vv_f32m8(o0, __riscv_vfmul_vf_f32m8(
                      __riscv_vle32_v_f32m8(V + (size_t)(lo + j) * LAYA_D + off + t, vl),
-                     att[j] * inv, vl), vl);
-        vfloat32m8_t o = __riscv_vfadd_vv_f32m8(
-            __riscv_vfadd_vv_f32m8(o0, o1, vl), __riscv_vfadd_vv_f32m8(o2, o3, vl), vl);
-        __riscv_vse32_v_f32m8(oh + t, o, vl);
+                     w, vl), vl);
+        }
+        __riscv_vse32_v_f32m8(oh + t, o0, vl);
     }
 }
 #endif
@@ -1034,14 +1073,7 @@ static int lay_tile_env(int which) {
     ".insn 4, " LIME_STR(0x2b | ((vd) << 7) | (3 << 12) | ((vs1) << 15) |        \
                          ((vs2) << 20) | (0x71 << 25)) "\n\t"
 
-static int lay_ime_on(void) {
-    static int g = -1;
-    if (g < 0) {
-        const char *e = getenv("VLLM_LAYA_IME");
-        g = (e && e[0] == '1') ? 1 : 0;
-    }
-    return g;
-}
+/* 收口：lay_ime_on() 旧定义（VLLM_LAYA_IME 环境变量版）删除，已被文件顶部的自动探测版取代。 */
 
 /* 8(M=输出行) × 16(N=token) × Kp 微内核：acc[8][16]。
  * 语义：acc[mv*4+j][q*4+r] = 行(mv*4+q) · token(j*4+r) 的 int32 点积。 */
@@ -1118,7 +1150,7 @@ static int8_t *lay_ime_pack_w(const int8_t *Wq, int OC, int K) {
 }
 
 /* T 为 16 的整数倍。Y[T][N]，逐 (t,o) 与 lay_dot_i8 同值。 */
-static void lay_ime_matmul(const LayaEnt *W, const int8_t *Xq, const float *Xs,
+static void lay_ime_matmul(const LayaModel *m, const LayaEnt *W, const int8_t *Xq, const float *Xs,
                            float *Y, int T, int K, int N) {
     const int kb_tot = K / 8;
     const int nblk = W->nblk;
@@ -1129,16 +1161,21 @@ static void lay_ime_matmul(const LayaEnt *W, const int8_t *Xq, const float *Xs,
     double tg0 = lay_wtime();
     int nt = 4;
     { int v = omp_get_max_threads(); if (v < nt) nt = v; }
-    /* 每线程一块激活打包缓冲：必须在并行区外分配，否则「某个线程 malloc 失败」
-     * 会让 omp for 少一个参与者而死锁。 */
+    /* 每线程一块激活打包缓冲：优先复用 LayaModel 静态 Arena 中的 mm_ime_bufs */
     int8_t *bufs[4] = {NULL, NULL, NULL, NULL};
-    for (int i = 0; i < nt; i++) bufs[i] = (int8_t *)malloc((size_t)kb_tot * 128);
-    int have_all = 1;
-    for (int i = 0; i < nt; i++) if (!bufs[i]) have_all = 0;
-    if (!have_all) {
-        for (int i = 0; i < nt; i++) free(bufs[i]);
-        for (size_t i = 0; i < (size_t)T * N; i++) Y[i] = 0.f;
-        return;
+    int own_bufs = 0;
+    if (m && m->mm_ime_bufs[0] && kb_tot * 128 <= (LAYA_HFFN / 8) * 128) {
+        for (int i = 0; i < nt; i++) bufs[i] = m->mm_ime_bufs[i];
+    } else {
+        own_bufs = 1;
+        for (int i = 0; i < nt; i++) bufs[i] = (int8_t *)malloc((size_t)kb_tot * 128);
+        int have_all = 1;
+        for (int i = 0; i < nt; i++) if (!bufs[i]) have_all = 0;
+        if (!have_all) {
+            for (int i = 0; i < nt; i++) free(bufs[i]);
+            for (size_t i = 0; i < (size_t)T * N; i++) Y[i] = 0.f;
+            return;
+        }
     }
 #pragma omp parallel num_threads(nt)
     {
@@ -1194,7 +1231,7 @@ static void lay_ime_matmul(const LayaEnt *W, const int8_t *Xq, const float *Xs,
         }
         if (have_old) sched_setaffinity(0, sizeof(old), &old);
     }
-    for (int i = 0; i < nt; i++) free(bufs[i]);
+    if (own_bufs) for (int i = 0; i < nt; i++) free(bufs[i]);
     g_ime_gemm_ms += (lay_wtime() - tg0) * 1e3;
 }
 
@@ -1204,9 +1241,18 @@ static void lay_matmul(const LayaModel *m, const LayaEnt *W, const LayaEnt *B,
                        const float *X, float *Y, int T, int K, int N) {
     if (W->i8) {   /* K-LAYA-002 M5：int8 权重 + int8 激活（逐行量化，按 token 并行） */
         int nblk = (K + LAYA_QB - 1) / LAYA_QB;
-        int8_t *Xq = (int8_t *)malloc((size_t)T * (size_t)K);
-        float  *Xs = (float *)malloc(sizeof(float) * (size_t)T * (size_t)nblk);
-        if (!Xq || !Xs) { free(Xq); free(Xs); for (size_t i = 0; i < (size_t)T * N; i++) Y[i] = 0.f; return; }
+        int own_xq = 0;
+        int8_t *Xq = NULL;
+        float  *Xs = NULL;
+        if (m && m->mm_xq && m->mm_xs && K <= LAYA_HFFN) {
+            Xq = m->mm_xq;
+            Xs = m->mm_xs;
+        } else {
+            own_xq = 1;
+            Xq = (int8_t *)malloc((size_t)T * (size_t)K);
+            Xs = (float *)malloc(sizeof(float) * (size_t)T * (size_t)nblk);
+            if (!Xq || !Xs) { free(Xq); free(Xs); for (size_t i = 0; i < (size_t)T * N; i++) Y[i] = 0.f; return; }
+        }
 #pragma omp parallel for schedule(static) if(T > 2)
         for (int t = 0; t < T; t++)
             lay_quant_act(X + (size_t)t * K, Xq + (size_t)t * K, Xs + (size_t)t * nblk, K);
@@ -1214,12 +1260,15 @@ static void lay_matmul(const LayaModel *m, const LayaEnt *W, const LayaEnt *B,
         const float  *Ws = W->qsc;
 #if ST_ARCH_RISCV && defined(_OPENMP)
         /* K-LAYA-003 L1：IME 路径（默认关，VLLM_LAYA_IME=1 才走）。
-         * 权重首次使用时打包一次并挂在 LayaEnt 上；T%16 的尾 token 仍走原 RVV 点积。 */
+         * 权重若已在 laya_load 预打包则零拷贝直挂，否则首次使用时打包一次；T%16 的尾 token 仍走原 RVV 点积。 */
         if (lay_ime_on() && K % 8 == 0 && N % 8 == 0 && K >= LAYA_QB) {
-            if (!W->ime_a) ((LayaEnt *)W)->ime_a = lay_ime_pack_w(Wi, N, K);
+            if (!W->ime_a) {
+                ((LayaEnt *)W)->ime_a = lay_ime_pack_w(Wi, N, K);
+                ((LayaEnt *)W)->ime_owned = 1;
+            }
             if (W->ime_a) {
                 int tb = (T / 16) * 16;
-                lay_ime_matmul(W, Xq, Xs, Y, tb, K, N);
+                lay_ime_matmul(m, W, Xq, Xs, Y, tb, K, N);
                 for (int t = tb; t < T; t++)
                     for (int o = 0; o < N; o++)
                         Y[(size_t)t * N + o] =
@@ -1229,7 +1278,7 @@ static void lay_matmul(const LayaModel *m, const LayaEnt *W, const LayaEnt *B,
                     for (int t = 0; t < T; t++)
                         for (int o = 0; o < N; o++)
                             Y[(size_t)t * N + o] += lay_at(m, B, (size_t)o);
-                free(Xq); free(Xs);
+                if (own_xq) { free(Xq); free(Xs); }
                 return;
             }
         }
@@ -1319,7 +1368,7 @@ static void lay_matmul(const LayaModel *m, const LayaEnt *W, const LayaEnt *B,
                 }
             }
         }
-        free(Xq); free(Xs);
+        if (own_xq) { free(Xq); free(Xs); }
         if (B)
             for (int t = 0; t < T; t++)
                 for (int o = 0; o < N; o++)
@@ -1392,10 +1441,7 @@ static void lay_matmul(const LayaModel *m, const LayaEnt *W, const LayaEnt *B,
 int laya_forward(LayaModel *m, const int *ids, int n,
                  const int *markers, int nm, int qtype, float *logits_out) {
     if (n <= 0 || nm <= 0) return -1;
-    /* 单线程预热位移档位（lay_dot_i8 / attn_pos 会在 OpenMP 并行区里调用，
-     * 静态初始化若放在并行区内会多线程竞争 + 重复打印）。 */
-    (void)lay_dot_level();
-    (void)lay_attn_rvv_on();
+    /* 收口：预热调用删除（lay_dot_level/lay_attn_rvv_on 均已变为编译期常量或唯一路径）。 */
     char nmb[128];
     const LayaEnt *e_tok  = lay_find(m, "encoder.embeddings.tok_embeddings.weight");
     const LayaEnt *e_embn = lay_find(m, "encoder.embeddings.norm.weight");
@@ -1422,28 +1468,10 @@ int laya_forward(LayaModel *m, const int *ids, int n,
     const float *cosF = m->rope_cosF, *sinF = m->rope_sinF;
     const float *cosS = m->rope_cosS, *sinS = m->rope_sinS;
 
-    size_t nd = (size_t)n * LAYA_D;
-    float *x    = malloc(sizeof(float) * nd);
-    float *Q    = malloc(sizeof(float) * nd);
-    float *K    = malloc(sizeof(float) * nd);
-    float *V    = malloc(sizeof(float) * nd);
-    float *nrm  = malloc(sizeof(float) * nd);
-    float *nn_a = malloc(sizeof(float) * nd);                      /* [n,D] norm 输出 */
-    float *qkv_a = malloc(sizeof(float) * nd * 3);                 /* [n,3D] Wqkv / in_proj 输出 */
-    float *wi_a = malloc(sizeof(float) * (size_t)n * 2 * LAYA_INTER);
-    float *mh_a = malloc(sizeof(float) * (size_t)n * LAYA_INTER);
-    float *ff_a = malloc(sizeof(float) * (size_t)n * LAYA_HFFN);
-    float *tmp_a = malloc(sizeof(float) * nd);
-    float *aou_a = malloc(sizeof(float) * nd);   /* M5c: [n,D] attention 输出，供 Wo/out_proj 分块 MatMul */
-    float *sc  = malloc(sizeof(float) * LAYA_D);
-    float *sc2 = malloc(sizeof(float) * LAYA_D);
-    /* K-LAYA-002 M10：K 的转置副本 Kt[D][n]，供 scores 的 lane=key 内核连续取数。
-     * 仅在 RVV 档>=2 时分配（否则 NULL ⇒ attn_pos 走原标量路径）。 */
-    float *Kt = lay_attn_rvv_on() ? (float *)malloc(sizeof(float) * LAYA_D * (size_t)n) : NULL;
+    if (g_timing < 0) g_timing = getenv("VLLM_LAYA_TIMING") ? 1 : 0;
+    double _tw0 = tmark();
 
-    /* K-LAYA-002 M4/M5c：位置级并行的线程私有 scratch（只余 attention 的 att）；
-     * attention 输出改为 token 维共享缓冲 aou_a，Wo/out_proj 走 lay_matmul 分块路径。
-     * 逐 p/逐块计算与串行同序 ⇒ 结果与线程数无关（J3 位级门）。 */
+    size_t nd = (size_t)n * LAYA_D;
     int nth = 1;
 #ifdef _OPENMP
     nth = omp_get_max_threads();
@@ -1451,18 +1479,69 @@ int laya_forward(LayaModel *m, const int *ids, int n,
     if (nth > LAYA_NT_MAX) nth = LAYA_NT_MAX;
 #endif
     if (n < 4) nth = 1;
+
+    /* 收口：lay_arena_on() 删除，Arena 恒开为唯一路径。 */
+    float *x = NULL, *Q = NULL, *K = NULL, *V = NULL, *nrm = NULL, *nn_a = NULL;
+    float *qkv_a = NULL, *wi_a = NULL, *mh_a = NULL, *ff_a = NULL, *tmp_a = NULL, *aou_a = NULL;
+    float *sc = NULL, *sc2 = NULL, *Kt = NULL;
     float *att_t[LAYA_NT_MAX];
     for (int t = 0; t < LAYA_NT_MAX; t++) att_t[t] = NULL;
-    for (int t = 0; t < nth; t++) {
-        att_t[t] = malloc(sizeof(float) * (size_t)n);
-        if (!att_t[t]) { nth = t; break; }
+    int ok = 0;
+
+    {
+        /* 公理 set_5foperations_91154c82：基于生命周期不交集的持久化静态激活 Arena
+         * - work_big (5248*n floats): 复用于 qkv_a(3072*n), wi_a(5248*n), ff_a(4096*n) (L_qkv ∩ L_wi ∩ L_ff = ∅)
+         * - work_mid (2624*n floats): 复用于 aou_a(1024*n), mh_a(2624*n) (L_aou ∩ L_mh = ∅)
+         * - work_norm(1024*n floats): 复用于 nn_a(1024*n), nrm(1024*n) (L_nn ∩ L_nrm = ∅)
+         * - mm_xq / mm_xs / mm_ime_bufs: 消除单次前向 240~720 次内部 MatMul malloc/free */
+        #define LAY_ALIGN64(sz) (((size_t)(sz) + 63u) & ~(size_t)63u)
+        #define LAY_PAD_CL(sz)  (LAY_ALIGN64(sz) + 64u)
+        size_t b_nd      = LAY_PAD_CL(sizeof(float) * nd);
+        size_t b_big     = LAY_PAD_CL(sizeof(float) * (size_t)n * (2 * LAYA_INTER)); /* 5248 * n */
+        size_t b_mid     = LAY_PAD_CL(sizeof(float) * (size_t)n * LAYA_INTER);       /* 2624 * n */
+        size_t b_sc      = LAY_PAD_CL(sizeof(float) * LAYA_D);
+        size_t b_att     = LAY_PAD_CL(sizeof(float) * (size_t)n); /* 每线程至少隔开 128B 防 false sharing */
+        if (b_att < 256u) b_att = 256u;
+        size_t b_xq      = LAY_PAD_CL((size_t)n * LAYA_HFFN);
+        int    max_nblk  = (LAYA_HFFN + LAYA_QB - 1) / LAYA_QB;
+        size_t b_xs      = LAY_PAD_CL(sizeof(float) * (size_t)n * (size_t)max_nblk);
+        size_t b_ime     = LAY_PAD_CL((size_t)(LAYA_HFFN / 8) * 128);
+        size_t need = 5 * b_nd /* x, Q, K, V, tmp_a */
+                    + b_nd     /* work_norm: nn_a / nrm */
+                    + b_big    /* work_big:  qkv_a / wi_a / ff_a */
+                    + b_mid    /* work_mid:  aou_a / mh_a */
+                    + (lay_attn_rvv_on() ? b_nd : 0) /* Kt */
+                    + 2 * b_sc /* sc, sc2 */
+                    + (size_t)nth * b_att
+                    + b_xq + b_xs + 4 * b_ime + 64;
+        if (m->arena_cap < need) {
+            uint8_t *na = (uint8_t *)realloc(m->arena, need);
+            if (!na) goto done;
+            m->arena = na;
+            m->arena_cap = need;
+        }
+        uintptr_t raw = (uintptr_t)m->arena;
+        uint8_t *cur = (uint8_t *)((raw + 63u) & ~(uintptr_t)63u);
+        x     = (float *)cur; cur += b_nd;
+        Q     = (float *)cur; cur += b_nd;
+        K     = (float *)cur; cur += b_nd;
+        V     = (float *)cur; cur += b_nd;
+        tmp_a = (float *)cur; cur += b_nd;
+        nn_a  = (float *)cur; nrm  = nn_a;  cur += b_nd;
+        wi_a  = (float *)cur; qkv_a = wi_a; ff_a = wi_a; cur += b_big;
+        mh_a  = (float *)cur; aou_a = mh_a; cur += b_mid;
+        if (lay_attn_rvv_on()) { Kt = (float *)cur; cur += b_nd; }
+        sc    = (float *)cur; cur += b_sc;
+        sc2   = (float *)cur; cur += b_sc;
+        for (int t = 0; t < nth; t++) { att_t[t] = (float *)cur; cur += b_att; }
+        m->mm_xq = (int8_t *)cur; cur += b_xq;
+        m->mm_xs = (float *)cur;  cur += b_xs;
+        for (int i = 0; i < 4; i++) { m->mm_ime_bufs[i] = (int8_t *)cur; cur += b_ime; }
+        #undef LAY_PAD_CL
+        #undef LAY_ALIGN64
+        ok = 1;
     }
-    int ok = x && Q && K && V && nrm && nn_a && qkv_a && wi_a && mh_a && ff_a && tmp_a && aou_a &&
-             sc && sc2 && nth >= 1 &&
-             (!lay_attn_rvv_on() || Kt);
     if (!ok) goto done;
-    if (g_timing < 0) g_timing = getenv("VLLM_LAYA_TIMING") ? 1 : 0;
-    double _tw0 = tmark();
     {
     double _t = tmark();
     for (int p = 0; p < n; p++)
@@ -1699,7 +1778,9 @@ int laya_forward(LayaModel *m, const int *ids, int n,
     }
     tacc(TT_SCO, _t); }
 
-    if (g_timing == 1) {
+done:
+    /* arena 恒开：x/Q/K/V 等均指向 m->arena，无需逐一 free。 */
+    if (ok && g_timing == 1) {
         double rest = (_tw0 > 0.0) ? (lay_wtime() - _tw0) : 0.0;
         double sum = 0.0; for (int i = 0; i < TT_N; i++) sum += g_tt[i];
         fprintf(stderr, "[LAYA-TIME] n=%d total=%.1fms | emb=%.1f norm=%.1f mm=%.1f rope=%.1f attn=%.1f act=%.1f resid=%.1f sco=%.1f | sum=%.1f (%.0f%%) misc=%.1f",
@@ -1713,13 +1794,6 @@ int laya_forward(LayaModel *m, const int *ids, int n,
         for (int i = 0; i < TT_N; i++) g_tt[i] = 0.0;
         g_tt_total += rest;
     }
-
-done:
-    free(x); free(Q); free(K); free(V); free(nrm);
-    free(nn_a); free(qkv_a); free(wi_a); free(mh_a); free(ff_a); free(tmp_a); free(aou_a);
-    free(sc); free(sc2);
-    free(Kt);
-    for (int t = 0; t < LAYA_NT_MAX; t++) free(att_t[t]);
     return ok ? 0 : -1;
 }
 

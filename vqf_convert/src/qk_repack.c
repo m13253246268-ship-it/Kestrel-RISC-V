@@ -92,7 +92,11 @@ int repack_q4_0_lane_inplace(uint8_t *buf, int rows, int cols) {
  *   [64,576) 列主序 4-bit：列 c 占 16 B（out[64+c*16 + r/2]），行 r 的 nibble 放
  *            低半字节（r 偶）/ 高半字节（r 奇）。nibble 值 = legacy 原始 4-bit（即
  *            value+8），内核用 (nib & 0xF) - 8 还原有符号 int4，**不再异或 0x88**。
- * 与 lane(2) 同源（legacy 18B/块），仅重排；体积不变（576 B/块）。 */
+ * 与 lane(2) 同源（legacy 18B/块），仅重排；体积不变（576 B/块）。
+ *
+ * [SHS 公理映射: bitwise_5for_5fsuperposition_358d7499 (bitwise_or_superposition)]
+ * 偶行低半字节 [3:0] 与奇行高半字节 [7:4] 位域正交不交（mask_lo & mask_hi == 0），
+ * 直接成对合成单字节覆写，消除 memset(512B) 与 1024 次读-改-写 (|=) 冒险。 */
 int repack_q4_0_lane_col_inplace(uint8_t *buf, int rows, int cols) {
     if (rows % 32 != 0 || cols % 32 != 0) return -1;
     int nb = cols / 32;
@@ -106,22 +110,20 @@ int repack_q4_0_lane_col_inplace(uint8_t *buf, int rows, int cols) {
         memcpy(tmp, dst, tile_bytes);
         for (int b = 0; b < nb; b++) {
             uint8_t *out = dst + (size_t)b * 576;
+            const uint8_t *blk_base = tmp + (size_t)b * 18;
             /* scale：按行线性（r*2） */
             for (int r = 0; r < 32; r++)
-                memcpy(out + (size_t)r * 2,
-                       tmp + (size_t)r * row_stride + (size_t)b * 18, 2);
-            /* data：列主序，偶行低 / 奇行高 */
-            memset(out + 64, 0, 512);
-            for (int c = 0; c < 32; c++) {
-                int byteidx = c & 15;
-                int hi = (c >> 4) & 1;
-                for (int r = 0; r < 32; r++) {
-                    uint8_t byte = tmp[(size_t)r * row_stride
-                                     + (size_t)b * 18 + 2 + (size_t)byteidx];
-                    uint8_t nib = hi ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
-                    uint8_t *p = out + 64 + (size_t)c * 16 + (size_t)(r >> 1);
-                    if (r & 1) *p |= (uint8_t)(nib << 4);
-                    else       *p |= (uint8_t)(nib & 0x0F);
+                memcpy(out + (size_t)r * 2, blk_base + (size_t)r * row_stride, 2);
+            /* data：列主序，偶行低 / 奇行高正交合并直写（c=0..15 低半字节，c=16..31 高半字节） */
+            for (int byteidx = 0; byteidx < 16; byteidx++) {
+                uint8_t *out_lo = out + 64 + (size_t)byteidx * 16;
+                uint8_t *out_hi = out + 64 + (size_t)(byteidx + 16) * 16;
+                const uint8_t *col_src = blk_base + 2 + (size_t)byteidx;
+                for (int r = 0; r < 32; r += 2) {
+                    uint8_t b0 = col_src[(size_t)r * row_stride];
+                    uint8_t b1 = col_src[(size_t)(r + 1) * row_stride];
+                    out_lo[r >> 1] = (uint8_t)((b0 & 0x0Fu) | ((b1 & 0x0Fu) << 4));
+                    out_hi[r >> 1] = (uint8_t)((b0 >> 4) | (b1 & 0xF0u));
                 }
             }
         }
@@ -132,10 +134,13 @@ int repack_q4_0_lane_col_inplace(uint8_t *buf, int rows, int cols) {
 
 /* ---------------- Q8_0 legacy -> 8x8 tiled ----------------
  * per 8-row group: d[8] f16 scales, then qs[k*32+m*4+i] = row m block b
- * elem (k*4+i). Output = 272 B per 32-col block. */
+ * elem (k*4+i). Output = 272 B per 32-col block.
+ * [SHS 公理映射: blas_matrix_block_natural_isomorphism (block_matrix_assoc_natural)]
+ * 连续 4B 子块同构整体搬移，替代内层逐字节散列拷贝。 */
 int repack_q8_0_8x8_inplace(uint8_t *buf, int rows, int cols) {
     if (rows % 8 != 0 || cols % 32 != 0) return -1;
     int nb = cols / 32;
+    size_t row_stride = (size_t)nb * 34;
     size_t group_bytes = (size_t)nb * 272;
     uint8_t *tmp = (uint8_t *)malloc(group_bytes);
     if (!tmp) return -1;
@@ -144,14 +149,13 @@ int repack_q8_0_8x8_inplace(uint8_t *buf, int rows, int cols) {
         memcpy(tmp, dst, group_bytes);
         for (int b = 0; b < nb; b++) {
             uint8_t *out = dst + (size_t)b * 272;
+            const uint8_t *blk_base = tmp + (size_t)b * 34;
             for (int m = 0; m < 8; m++)
-                memcpy(out + (size_t)m * 2,
-                       tmp + (size_t)m * nb * 34 + (size_t)b * 34, 2);
+                memcpy(out + (size_t)m * 2, blk_base + (size_t)m * row_stride, 2);
             for (int k = 0; k < 8; k++)
                 for (int m = 0; m < 8; m++)
-                    for (int i = 0; i < 4; i++)
-                        out[16 + k * 32 + m * 4 + i] =
-                            tmp[(size_t)m * nb * 34 + (size_t)b * 34 + 2 + k * 4 + i];
+                    memcpy(out + 16 + (size_t)k * 32 + (size_t)m * 4,
+                           blk_base + (size_t)m * row_stride + 2 + (size_t)k * 4, 4);
         }
     }
     free(tmp);
@@ -159,10 +163,12 @@ int repack_q8_0_8x8_inplace(uint8_t *buf, int rows, int cols) {
 }
 
 /* ---------------- Q8_0 legacy -> 4x4 (block_q8_0x4) ----------------
- * per 4-row group: d[4] f16 scales, then qs[k*16+m*4+i]. 136 B/block. */
+ * per 4-row group: d[4] f16 scales, then qs[k*16+m*4+i]. 136 B/block.
+ * [SHS 公理映射: blas_matrix_block_natural_isomorphism (block_matrix_assoc_natural)] */
 int repack_q8_0_4x4_inplace(uint8_t *buf, int rows, int cols) {
     if (rows % 4 != 0 || cols % 32 != 0) return -1;
     int nb = cols / 32;
+    size_t row_stride = (size_t)nb * 34;
     size_t group_bytes = (size_t)nb * 136;
     uint8_t *tmp = (uint8_t *)malloc(group_bytes);
     if (!tmp) return -1;
@@ -171,32 +177,22 @@ int repack_q8_0_4x4_inplace(uint8_t *buf, int rows, int cols) {
         memcpy(tmp, dst, group_bytes);
         for (int b = 0; b < nb; b++) {
             uint8_t *out = dst + (size_t)b * 136;
+            const uint8_t *blk_base = tmp + (size_t)b * 34;
             for (int m = 0; m < 4; m++)
-                memcpy(out + (size_t)m * 2,
-                       tmp + (size_t)m * nb * 34 + (size_t)b * 34, 2);
+                memcpy(out + (size_t)m * 2, blk_base + (size_t)m * row_stride, 2);
             for (int k = 0; k < 8; k++)
                 for (int m = 0; m < 4; m++)
-                    for (int i = 0; i < 4; i++)
-                        out[8 + k * 16 + m * 4 + i] =
-                            tmp[(size_t)m * nb * 34 + (size_t)b * 34 + 2 + k * 4 + i];
+                    memcpy(out + 8 + (size_t)k * 16 + (size_t)m * 4,
+                           blk_base + (size_t)m * row_stride + 2 + (size_t)k * 4, 4);
         }
     }
     free(tmp);
     return 0;
 }
 
-/* dispatch: 默认 8x8（VLLM_Q8_8X8=0 回退 4x4），语义同引擎 */
-static int g_q8_8x8 = -1;
-static int q8_8x8_enabled(void) {
-    if (g_q8_8x8 < 0) {
-        const char *e = getenv("VLLM_Q8_8X8");
-        g_q8_8x8 = (e && e[0] == '0') ? 0 : 1;
-    }
-    return g_q8_8x8;
-}
+/* dispatch: 唯一默认 8x8 tiled */
 int repack_q8_0_tiled_inplace(uint8_t *buf, int rows, int cols) {
-    if (q8_8x8_enabled()) return repack_q8_0_8x8_inplace(buf, rows, cols);
-    return repack_q8_0_4x4_inplace(buf, rows, cols);
+    return repack_q8_0_8x8_inplace(buf, rows, cols);
 }
 
 /* ---------------- Q4_0 legacy -> 8x8l (x8 decode copy, pure scalar) ----------------
@@ -218,6 +214,86 @@ int repack_q4_0_8x8l(uint8_t *__restrict dst, const uint8_t *__restrict src,
                 e ^= 0x8888888888888888ULL;
                 memcpy(out + 16 + (size_t)i * 8, &e, 8);
             }
+        }
+    }
+    return 0;
+}
+
+/* ================================================================
+ * Conv int8 离线重排内核（VQF v4 阶段 P1）
+ * [SHS 公理映射: blas_matrix_block_natural_isomorphism +
+ *                tensor_5fcontraction_02096446]
+ * 将运行期 yconv_cpu_dotprod (nw) 与 yime_pack_a (iw) 的惰性重排
+ * 折叠到离线转换期，实现运行期 m->blob 零拷贝直挂。
+ * ================================================================ */
+
+/* CHW [OC, K] (K = C * KH * KW) -> HWC tap-major [OC, Kp] (Kp = (K+31)&~31)
+ * 逐字节等价于 vllm_yolo.c 中 yconv_cpu_dotprod (hwc=1) 的 nw 构造。 */
+int repack_conv_q8_hwc_tap(int8_t *__restrict dst, const int8_t *__restrict src,
+                           int OC, int C, int KH, int KW) {
+    if (OC <= 0 || C <= 0 || KH <= 0 || KW <= 0) return -1;
+    int K = C * KH * KW;
+    int Kp = (K + 31) & ~31;
+    int KHW = KH * KW;
+    memset(dst, 0, (size_t)OC * (size_t)Kp);
+    for (int o = 0; o < OC; o++) {
+        int8_t *wo = dst + (size_t)o * Kp;
+        const int8_t *so = src + (size_t)o * K;
+        for (int ic = 0; ic < C; ic++)
+            for (int tap = 0; tap < KHW; tap++)
+                wo[tap * C + ic] = so[ic * KHW + tap];
+    }
+    return 0;
+}
+
+/* HWC tap-major [OC, Kp] -> CHW [OC, K] 逆向无损还原（供逃生舱回退） */
+int unpack_conv_q8_hwc_tap(int8_t *__restrict dst, const int8_t *__restrict src,
+                           int OC, int C, int KH, int KW) {
+    if (OC <= 0 || C <= 0 || KH <= 0 || KW <= 0) return -1;
+    int K = C * KH * KW;
+    int Kp = (K + 31) & ~31;
+    int KHW = KH * KW;
+    for (int o = 0; o < OC; o++) {
+        int8_t *do_row = dst + (size_t)o * K;
+        const int8_t *wo = src + (size_t)o * Kp;
+        for (int ic = 0; ic < C; ic++)
+            for (int tap = 0; tap < KHW; tap++)
+                do_row[ic * KHW + tap] = wo[tap * C + ic];
+    }
+    return 0;
+}
+
+/* HWC tap-major [OC, Kp] -> SpacemiT K1 IME pack_a 布局 [mt][kb][mv][32]
+ * 要求 OC % 8 == 0 且 Kp % 8 == 0（Kp 已对齐到 32，天然满足 Kp % 8 == 0）。
+ * 逐字节等价于 vllm_yolo.c 中的 yime_pack_a(Wq, OC, Kp)。 */
+int repack_conv_q8_ime_k1(int8_t *__restrict dst, const int8_t *__restrict src_hwc_kp,
+                          int OC, int Kp) {
+    if (OC <= 0 || (OC & 7) != 0 || Kp <= 0 || (Kp & 7) != 0) return -1;
+    int mt_n = OC >> 3, kb_n = Kp >> 3;
+    for (int mt = 0; mt < mt_n; mt++) {
+        for (int kb = 0; kb < kb_n; kb++) {
+            int8_t *d = dst + ((size_t)mt * kb_n + kb) * 64;
+            for (int mv = 0; mv < 2; mv++)
+                for (int q = 0; q < 4; q++)
+                    memcpy(d + mv * 32 + q * 8,
+                           src_hwc_kp + (size_t)(mt * 8 + mv * 4 + q) * Kp + kb * 8, 8);
+        }
+    }
+    return 0;
+}
+
+/* SpacemiT K1 IME pack_a [mt][kb][mv][32] -> HWC tap-major [OC, Kp] 逆向无损还原 */
+int unpack_conv_q8_ime_k1(int8_t *__restrict dst_hwc_kp, const int8_t *__restrict src_ime,
+                          int OC, int Kp) {
+    if (OC <= 0 || (OC & 7) != 0 || Kp <= 0 || (Kp & 7) != 0) return -1;
+    int mt_n = OC >> 3, kb_n = Kp >> 3;
+    for (int mt = 0; mt < mt_n; mt++) {
+        for (int kb = 0; kb < kb_n; kb++) {
+            const int8_t *s = src_ime + ((size_t)mt * kb_n + kb) * 64;
+            for (int mv = 0; mv < 2; mv++)
+                for (int q = 0; q < 4; q++)
+                    memcpy(dst_hwc_kp + (size_t)(mt * 8 + mv * 4 + q) * Kp + kb * 8,
+                           s + mv * 32 + q * 8, 8);
         }
     }
     return 0;

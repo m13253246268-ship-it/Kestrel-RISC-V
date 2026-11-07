@@ -21,12 +21,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from yolo_to_vqf import (  # noqa: E402
     read_vqf, OP_CONV, OP_ADD, OP_CONCAT, OP_MAXPOOL, OP_UPSAMPLE,
     OP_SIGMOID, OP_MUL, OP_SLICE, OP_SOFTMAX, OP_ATTN_PSA, OP_DETECT,
+    OP_MATMUL, OP_RMSNORM, OP_ROPE, OP_SWIGLU,
+    LAYOUT_CONV_HWC_TAP, LAYOUT_CONV_IME_K1,
+    unpack_conv_q8_hwc, unpack_conv_q8_ime,
     ACT_SILU, QT_F32, QT_F16, QT_Q8, GRAPH_MAGIC)
 
 
 # ---------------- 权重 ----------------
-def load_conv_w(T, cid, kh, kw):
-    qt, rows, cols, payload = T[f"c{cid:04d}_w"]
+def load_conv_w(T, cid, kh, kw, layouts=None):
+    nm = f"c{cid:04d}_w"
+    qt, rows, cols, payload = T[nm]
+    layout = layouts.get(nm, 0) if layouts else 0
     oc = rows
     ic = cols // (kh * kw)
     if qt == QT_F32:
@@ -34,7 +39,12 @@ def load_conv_w(T, cid, kh, kw):
     elif qt == QT_F16:
         w = np.frombuffer(payload, np.float16).reshape(oc, ic, kh, kw).astype(np.float32)
     elif qt == QT_Q8:
-        q = np.frombuffer(payload, np.int8).reshape(oc, ic, kh, kw).astype(np.float32)
+        if layout == LAYOUT_CONV_HWC_TAP:
+            q = unpack_conv_q8_hwc(payload, oc, ic, kh, kw).astype(np.float32)
+        elif layout == LAYOUT_CONV_IME_K1:
+            q = unpack_conv_q8_ime(payload, oc, ic, kh, kw).astype(np.float32)
+        else:
+            q = np.frombuffer(payload, np.int8).reshape(oc, ic, kh, kw).astype(np.float32)
         s = np.frombuffer(T[f"c{cid:04d}_s"][3], np.float32).reshape(oc, 1, 1, 1)
         w = q * s
     else:
@@ -147,6 +157,7 @@ def detect(boxes, clss, shapes, strides, reg_max, nc):
 # ---------------- 执行 ----------------
 def execute(v, x0):
     T = v["tensors"]
+    layouts = v.get("layouts", {})
     gb = T["graph"][3]
     magic, gver, nops = struct.unpack_from("<III", gb, 0)
     assert magic == GRAPH_MAGIC, "bad graph magic"
@@ -161,7 +172,7 @@ def execute(v, x0):
         order.append((op, ins, o, pr))
         if op == OP_CONV:
             cid, hb, sh, sw, ph, pw, gp, act, kh, kw = pr
-            w = load_conv_w(T, cid, kh, kw)
+            w = load_conv_w(T, cid, kh, kw, layouts)
             b = load_bias(T, cid) if hb else None
             S[o] = conv2d(S[ins[0]], w, b, sh, sw, ph, pw, gp, act)
         elif op == OP_ADD:
@@ -180,19 +191,63 @@ def execute(v, x0):
             _ax, a, bnd = pr
             S[o] = S[ins[0]][a:bnd]
         elif op == OP_SOFTMAX:
-            S[o] = softmax(S[ins[0]], axis=pr[0])
+            S[o] = softmax(S[ins[0]], axis=pr[0] if pr else 0)
         elif op == OP_ATTN_PSA:
             nh, hd, kd, wq, wp, wpe = pr
             S[o] = attn_psa(S[ins[0]], nh, hd, kd,
-                            load_conv_w(T, wq, 1, 1), load_bias(T, wq),
-                            load_conv_w(T, wp, 1, 1), load_bias(T, wp),
-                            load_conv_w(T, wpe, 3, 3), load_bias(T, wpe))
+                            load_conv_w(T, wq, 1, 1, layouts), load_bias(T, wq),
+                            load_conv_w(T, wp, 1, 1, layouts), load_bias(T, wp),
+                            load_conv_w(T, wpe, 3, 3, layouts), load_bias(T, wpe))
         elif op == OP_DETECT:
             nc, reg_max, s0, s1, s2, _wdfl = pr
             bx = [S[i] for i in ins[:3]]
             cl = [S[i] for i in ins[3:6]]
             shapes = [(b.shape[1], b.shape[2]) for b in bx]
             S[o] = detect(bx, cl, shapes, [s0, s1, s2], reg_max, nc)
+        elif op == OP_MATMUL:
+            cid = pr[0]
+            hb = pr[1] if len(pr) > 1 else 0
+            act = pr[2] if len(pr) > 2 else 0
+            w = load_conv_w(T, cid, 1, 1, layouts)
+            b = load_bias(T, cid) if hb else None
+            S[o] = conv2d(S[ins[0]], w, b, 1, 1, 0, 0, 1, act)
+        elif op == OP_RMSNORM:
+            cid = pr[0]
+            eps_bits = pr[1] if (len(pr) > 1 and pr[1] != 0) else 0x358637BD
+            eps = struct.unpack("<f", struct.pack("<I", eps_bits))[0]
+            x = S[ins[0]]
+            rms = 1.0 / np.sqrt(np.mean(x * x, axis=0, keepdims=True) + eps)
+            wn = f"c{cid:04d}_b"
+            if wn in T:
+                w = np.frombuffer(T[wn][3], np.float32).reshape(-1, 1, 1)
+            else:
+                w = load_conv_w(T, cid, 1, 1, layouts).reshape(-1, 1, 1)
+            S[o] = (x * rms * w).astype(np.float32)
+        elif op == OP_ROPE:
+            hd = pr[0] if (len(pr) > 0 and pr[0] > 0) else S[ins[0]].shape[0]
+            theta_bits = pr[1] if (len(pr) > 1 and pr[1] != 0) else 0x461C4000
+            theta = struct.unpack("<f", struct.pack("<I", theta_bits))[0]
+            pos0 = pr[2] if len(pr) > 2 else 0
+            x = S[ins[0]]
+            C, H, W = x.shape
+            N = H * W
+            nh = C // hd
+            half = hd // 2
+            xr = x.reshape(nh, hd, N)
+            out = np.empty_like(xr)
+            freqs = 1.0 / (theta ** (2.0 * np.arange(half, dtype=np.float32) / float(hd)))
+            positions = (pos0 + np.arange(N, dtype=np.float32))[None, :]  # [1, N]
+            ang = freqs[:, None] * positions                              # [half, N]
+            cs, sn = np.cos(ang), np.sin(ang)
+            x0_p, x1_p = xr[:, :half, :], xr[:, half:2 * half, :]
+            out[:, :half, :] = x0_p * cs[None, :, :] - x1_p * sn[None, :, :]
+            out[:, half:2 * half, :] = x0_p * sn[None, :, :] + x1_p * cs[None, :, :]
+            if 2 * half < hd:
+                out[:, 2 * half:, :] = xr[:, 2 * half:, :]
+            S[o] = out.reshape(C, H, W).astype(np.float32)
+        elif op == OP_SWIGLU:
+            g, u = S[ins[0]], S[ins[1]]
+            S[o] = (silu(g) * u).astype(np.float32)
         else:
             raise RuntimeError(f"unknown op {op}")
     return S, order

@@ -1,427 +1,377 @@
 [English](README.en.md) | **简体中文**
 
-# vLLM-Kestrel — 边云协同 · 精确注意力 LLM 推理引擎
+# vLLM-Kestrel
 
-> Axiom-Guided Exact-Attention edge LLM runtime
+**面向 RISC-V 板端的纯 C 推理引擎。**
 
-纯 C 实现的自包含 LLM 推理引擎，面向板端（aarch64-Linux / RISC-V）做一级目标，提供
-OpenAI 兼容的 HTTP 服务、自研 VQF 量化模型格式、连续批调度、KV 分层驻留、MoE 专家并行、
-多模态（Qwen3-VL / YOLO）与嵌入检索等能力。
+以 SpacemiT K1 为主要验证平台，通过自研 VQF 权重布局、RVV 内核和分层驻留运行 Qwen 稠密模型与 MoE；提供 OpenAI 兼容 HTTP 接口，并包含视觉、嵌入和 Laya 决策模型的独立执行路径。
 
-本仓库当前处于**整理开源资料**阶段：**x86-64 主机可编译 + 数值自检**，RISC-V 可交叉编译
-验证「可编译 + 自检通过」；板端实测数据来自云端 K1（8 核 rv64gcv，4 线程绑核 hart0-3），
-只对同型号板子成立。x86 构建只用于「可编译 + 与 ARM 同口径的回归」，**不作为性能基准**
-（详见文末「诚实说明」）。
+项目重点是板端推理：让量化布局、计算内核和内存访问协同工作，同时保留可检查的数值与性能验证入口。模型权重不随源码分发。
 
-本文第 6 节把当前千问（Qwen3 0.6B / 1.7B / 4B）的全部优化开关按**质量档**（会改变数值）
-和**快档**（位级一致、只换速度）分开列出，并给出复现脚本。
+[快速开始](#快速开始) · [模型准备](#模型准备) · [执行路径](#执行路径与配置) · [MoE 部署](#moe-部署) · [性能记录](#历史性能记录) · [验证方法](#正确性与性能验证) · [源码导航](#源码导航)
 
----
+## 能力与平台
 
-## 1. 目录结构
+| 能力 | 当前入口与范围 |
+|---|---|
+| 稠密 LLM | Qwen2.5 / Qwen3；VQF Q4、Q8 等权重格式 |
+| MoE | Qwen3-30B-A3B；专家连续布局、lane sidecar、按层及专家驻留 |
+| HTTP 服务 | 对话、文本补全、嵌入接口；SSE 流式输出、连续批调度、KV 前缀复用 |
+| 多模态与检测 | Qwen3-VL、YOLO；需分别准备相应模型 |
+| 嵌入与决策 | Qwen3-Embedding、Laya / ModernBERT |
+| 验证工具 | L3 / Sparse 自检、算子对拍、生成 token 序列与中间张量比较 |
 
-```
-kestrel_vllm_riscv/
-├── include/                  # 头文件（common / core / serve / model / media）
-├── src/                      # 引擎源码（main.c 为入口）
-│   ├── core/                 # 注意力 / 调度 / transformer / matmul / TP / EP / L3 / KV
-│   ├── model/                # safetensors 解析 / VQF / 分词器 / vision / laya / yolo
-│   ├── serve/                # HTTP 服务 / 连续批 / 管理 / 会话 / 审计 / 规则包 / 内嵌 Web
-│   ├── media/                # RTSP / H264 / MP4 视频源
-│   └── common/               # 设备探测 / 国密（SM2/SM3/SM4）
-├── tools/
-│   ├── build/                # 构建 + 回归闸门脚本（x64 / riscv）
-│   ├── client/               # vllm_client.py（OpenAI 兼容客户端，零依赖）
-│   ├── preproc/              # 数据预处理脚本（自研层链驱动用，见其 README）
-│   ├── bench/                # 内核级探针 / 基准脚本
-│   ├── yolo/                 # YOLO 量化工具 + 板端实测脚本（见 6.5）
-│   └── ops/                  # vllm_mgr.py 运维脚本
-├── vqf_convert/              # 独立模型转换工具：safetensors -> VQF
-│   ├── build.bat / build.sh
-│   └── vqf_conv(.exe)        # 转换产物
-└── build-riscv/              # RISC-V 构建产物（默认输出目录）
-```
+主要性能记录来自 **SpacemiT K1：8 核、rv64gcv、VLEN=256**。本地约 8 GB 与云端约 16 GB 的机器分别记录，尤其不能混用 MoE 成绩。K1 的 IME / `vmadot` 是硬件专用能力，历史测试使用 hart 0–3。
 
-模型权重**不随源码分发**，统一放在仓库外（见「模型准备」）。
+Windows x86-64 构建用于开发与数值自检，本文不提供 x86 性能基准。源码也包含 aarch64 路径；其他硬件的功能和性能需要单独验证。
 
----
+## 快速开始
 
-## 2. 模型格式：VQF
+以下 Linux 命令均从本项目目录执行。准备好包含 `model.vqf`、词表和配置的模型目录后，可直接构建并启动。
 
-引擎**只加载自研 VQF 格式**，原始 safetensors / GGUF 已整体移出引擎，由独立工具
-`vqf_convert/`（`vqf_conv`）负责转换。
-
-一个**可加载的模型目录**需包含：
-
-| 文件 | 必需 | 说明 |
-|---|---|---|
-| `model.vqf` | 是 | 量化权重（或 `--model` 直接指向 `.vqf` 单文件） |
-| `vocab.bin` | 是 | 二进制词表（由 `tools/build/build_vocab_bin.py` 生成） |
-| `config.json` | 是 | 特殊 token ID（eos / im_end 等） |
-| `merges.bin` | 否 | BPE 合并表；缺失回退贪心最长前缀 |
-
----
-
-## 3. 模型准备
-
-> 各类模型（Dense / MoE / 多模态 / Embedding / Laya / YOLO）的**适配方式**详见
-> [docs/模型适配.md](docs/模型适配.md)。
-
-### 3.1 获取原始模型
-
-以 HF 模型目录为例（需 `config.json` + `*.safetensors` + 分词器文件）。例如：
-
-- `Qwen2.5-0.5B`（dense，小）
-- `Qwen3-30B-A3B`（MoE，大）
-- `Qwen3-VL-2B-Instruct`（多模态）
-
-### 3.2 转换 safetensors → VQF
+### 1. 构建 RISC-V 程序
 
 ```bash
-# Windows（MinGW-w64 gcc）
-cd vqf_convert && build.bat
-# Linux
-cd vqf_convert && ./build.sh
-# 产物：vqf_conv(.exe)
-```
-
-转换命令：
-
-```bash
-vqf_conv --model <safetensors 目录> --convert-vqf <输出 .vqf> \
-         [--stream] [--wmode dual|q4|q8|q4i|g256]
-```
-
-- `--wmode`：`dual`(默认，Q4+Q8 双份) / `q4` / `q8` / `q4i`(预解包 int8) / `g256`
-- `--stream`：低峰值内存转换（量化缓冲不驻留 RAM，适合 30B 级大模型）
-- 环境变量：
-  - `VLLM_VQF_KEY=<口令>` 输出 SM4-CTR + HMAC-SM3 加密文件
-  - `VLLM_VQF_SIGN_PRIV=<64hex>` 内嵌 SM2 供应链签名
-  - `VLLM_WMODE=q4|q8|q4i|g256` 等价于 `--wmode`
-
-转换完成后，把 `model.vqf` 与 `vocab.bin`、`config.json`（可选 `merges.bin`）放在同一目录。
-
----
-
-## 4. 编译
-
-### 4.1 x86-64 主机（Windows + MinGW-w64）—— 当前可验证路径
-
-依赖：MinGW-w64 x86_64 GCC（含 winpthreads、winsock2）。
-
-```powershell
-# 仅构建
-powershell -ExecutionPolicy Bypass -File tools\build\build_x64.ps1
-# 指定 gcc 与输出目录
-powershell -ExecutionPolicy Bypass -File tools\build\build_x64.ps1 `
-    -Gcc D:\tools\mingw64\bin\gcc.exe -OutDir .\build-x64
-# 产物：build-x64\vllm_kestrel_x64.exe
-```
-
-**回归闸门**（构建 + L3/Sparse 自检计数）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\build\check_x64.ps1
-```
-
-期望输出：`--test-l3 16 PASS / 0 FAIL`、`--test-sparse 9/9`，退出码 0。
-
-### 4.2 RISC-V 64（Linux）
-
-```bash
-# 板上原生构建（自动探测 gcc）
+# K1 板上原生构建
 ./tools/build/build_riscv.sh
 
-# x86 主机交叉编译（需 riscv64-linux-gnu-gcc）
+# 或在 Linux 主机上交叉编译
 CC=riscv64-linux-gnu-gcc ./tools/build/build_riscv.sh
-# 产物：build-riscv/vllm_kestrel
 ```
 
-环境变量：
+产物为 `build-riscv/vllm_kestrel`。构建脚本支持：
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `VLLM_RISCV_CC` | 自动探测 | 指定编译器 |
-| `VLLM_RISCV_MARCH` | `rv64gcv` | `-march`；无向量板改 `rv64gc` |
-| `VLLM_RISCV_OUTDIR` | `<repo>/build-riscv` | 产物目录 |
-| `VLLM_RISCV_EXTRA` | 空 | 追加编译/链接参数 |
-
-**回归闸门**：
-
-```bash
-./tools/build/check_riscv.sh          # 板上原生跑（含自检）
-./tools/build/check_riscv.sh --build  # 只构建（交叉编译主机无 qemu 时）
-```
-
-确定性红线：`-ffp-contract=off` 必须保留，禁止编译器把 `mul+add` 收缩成 `fma`，
-否则与参考实现的舍入链不同序，位级对拍失效。
-
----
-
-## 5. 启动
-
-### 5.1 启动 HTTP 服务（推荐）
-
-```bash
-# Linux / 板端
-./build-riscv/vllm_kestrel --serve --port 8080 --model <模型目录> --threads 8
-
-# Windows
-.\build-x64\vllm_kestrel_x64.exe --serve --port 8080 --model <模型目录> --threads 8
-```
-
-- `--model` 指向**含 `model.vqf` 的目录**，或直接指向 `.vqf` 单文件
-- `--threads N`：worker 线程数（1–32）
-- 不带任何参数直接运行 = 启动服务（端口 8080，通过管理页手动加载模型）
-- `--serve`（不带 `--port`）= 交互式输入端口号
-
-服务启动后打印可用入口：
-
-```
-[SERVE] OpenAI-compatible API listening on http://0.0.0.0:8080
-        管理入口 /admin/   对话入口 /chat   审查入口 /review
-        GET  /v1/models      GET /health
-        POST /v1/chat/completions  (stream=true SSE supported)
-        POST /v1/completions       POST /v1/embeddings
-```
-
-### 5.2 常用服务参数
-
-| 参数 | 说明 |
+| 环境变量 | 默认 / 用途 |
 |---|---|
-| `--model <dir\|.vqf>` | 模型目录或 VQF 单文件 |
-| `--model-id <id>` | 模型标识（默认 `qwen3-vl-8b`） |
-| `--port <N>` | 显式端口 |
-| `--threads <N>` | worker 线程 |
-| `--wmode <m>` | `dual`/`q4`/`q4i`/`q8`/`q2mix`/`g256` |
-| `--auto-load` | 启动即加载模型 |
-| `--no-auto-load` | 启动不加载（默认），经管理页手动加载 |
-| `--load-on-use` | 首个请求到达时自动加载 |
-| `--auto-unload <s>` | 空闲 N 秒自动卸载 |
-| `--batch-max <N>` | 连续批调度上限 |
-| `--max-queued <N>` | 排队上限 |
-| `--min-free-mb <N>` | 保留空闲内存阈值 |
-| `--spec` / `--spec-k <N>` | n-gram 投机解码 |
+| `VLLM_RISCV_CC` | 自动探测编译器，也可显式指定 |
+| `VLLM_RISCV_MARCH` | `rv64gcv` |
+| `VLLM_RISCV_OUTDIR` | 项目下的 `build-riscv` |
+| `VLLM_RISCV_EXTRA` | 追加编译与链接参数 |
 
-### 5.3 离线 / 自检模式（无需模型）
+保留脚本中的 `-ffp-contract=off`：乘加融合会改变浮点舍入顺序，影响参考实现对拍。
+
+### 2. 启动服务并加载模型
 
 ```bash
-vllm_kestrel --test-l3        # L3 Q4 内核 + 磁盘驱逐自检（期望 16 PASS）
-vllm_kestrel --test-sparse    # 稀疏注意力自检（期望 9 PASS）
+./build-riscv/vllm_kestrel \
+  --serve --port 8080 \
+  --model /path/to/model \
+  --threads 8 --auto-load
 ```
 
-不带任何参数运行时，会执行公理自测套件后进入服务（见 `main.c`）。
+显式指定 `--port` 可避免交互式端口询问。服务默认不自动加载模型；这里使用 `--auto-load`，也可改用 `--load-on-use` 在首个请求时加载。
 
-### 5.4 其它模式（按需）
+服务入口包括 `/health`、`/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`，以及管理页 `/admin/` 和对话页 `/chat`。
 
-```bash
---embed "文本" / --embed-file <f> / --embed-stdin   # 句子向量
---yolo-model <vqf> --yolo-image <图>                 # 单图检测
---laya-pack <目录> --laya-cases <f>                  # Laya 决策模型
---longctx-quality --model <vqf>                      # 长上下文捞针
-```
-
----
-
-## 6. 优化模式：质量档与快档
-
-千问（Qwen3）这条线上有两层开关，**不要混用**：
-
-- **质量档**：改变数值结果，按精度从高到低取舍，包括权重量化档位（转换时定死）、KV 缓存
-  精度、稀疏注意力、投机解码的位级约束。
-- **快档**：**位级一致**（输出 token 与标量参考路径逐位相同），只换指令与访存方式，可以
-  任意叠开。
-
-判定口径：快档一律要求 `TOKIDS` 的**完整 id 序列**与基准一致（脚本需哈希整段，只取首行会
-退化成所有模型同值，见 6.5），质量档则必须过 NLL 质量门（见 6.5）。开关的推导与实测注释分别
-写在 `src/model/vllm_safetensors.c`（内核）和 `src/model/vqf.c`（权重 / 稀疏驻留）对应位置。
-
-### 6.1 质量档 A：权重量化（转换时决定）
-
-`--wmode` 在 `vqf_conv` 转换时就定死，运行时无法切换。精度从高到低：
-
-| 档 | 转换参数 | 权重精度 | 说明 |
-|---|---|---|---|
-| `q8` | `--wmode q8` | 8-bit | 全 Q8_0，精度最高、体积最大，是质量基线 |
-| `q4i` | `--wmode q4i` | 8-bit（同 q8 量化） | Q8 权重预解包成 int8 行布局，省掉运行期解包 |
-| `g256` | `--wmode g256` | 8-bit（256 元素分组） | 分组粒度与 q8 不同，误差分布不同，需实测 NLL |
-| `dual` | `--wmode dual`（默认） | 混合 | Q4_0 + Q8_0 **双份**：prefill 走 Q8；decode 在 aarch64 优先 Q4，RISC-V 上 dense 单 token 无 Q4 SIMD，实际也走 Q8 |
-| `q4` | `--wmode q4` | 4-bit | 只有 Q4_0，体积最小，dense 模型最低可用档 |
-| `q2mix` | 引擎 `--wmode q2mix` | 注意力 Q4 + FFN Q2_1 | 最省内存的档，但 **v1 转换器拒收**（`vqf_conv` 只认前面五种），当前没有可用的产出路径；代码注释记录 dense 上 2-bit FFN 误差不可恢复（`g_q2mix_tail`） |
-
-再强调一次：`dual` 里同时带 Q4/Q8 两份权重，Q4 那份只在**有 Q4 内核的架构**上换来速度，
-并不代表精度更高。选档看 NLL，不看体积。
-
-### 6.2 质量档 B：运行时近似开关（默认全关）
-
-| 开关 | 做法 | 代价与适用面 |
-|---|---|---|
-| `VLLM_KV_F32=1` | KV 缓存不做 int8 | **往上**提精度（默认是 int8 KV），内存翻倍，只用于质量基线/A-B |
-| `--kv-q4` | KV 走 Q4 载荷缓存 | 往下省内存，精度低于默认 int8 KV |
-| `--sparse-attn [--sparse-k N] [--sparse-ratio R]` | decode 只对 top-k KV 块做注意力 | 长上下文省算力，**是近似**；prefill 历史段也会受影响，必须过 NLL 门 |
-| `--spec --spec-k N` + `VLLM_SPEC_FAST=1` | 投机解码放开「位级一致」硬约束 | 输出「几乎一致」但非逐 token 相同；不设 `VLLM_SPEC_FAST` 时 `--spec` 走回滚+重放，位级一致（属快档） |
-
-`VLLM_PREFILL_Q8CACHE=1` 不是运行档位，而是**质量门的测量开关**：把 prefill 历史段的 f32
-正典行改写成 q8 反量化值，用来量化「删掉 f32 KV」的 NLL 代价。
-
-### 6.3 快档：位级一致，随便叠
-
-| 快档 | 开启方式 | 默认 | 作用面 |
-|---|---|---|---|
-| RVV 档位 | `VLLM_RVV=1\|2\|3` | `3` | Q4/Q8 取数与 prefill 跨 token 权重复用；`0` = 标量参考路径（逃生舱） |
-| token 分块内核 | `VLLM_Q4_INTB=0` 关闭 | 开 | prefill GEMM 一个工作项 = 32 行 tile × 8 token |
-| IME 混合 | `VLLM_Q4_IME=1` | 关 | slot0-3 绑 hart0-3 走 vmadot，其余 slot 走 colbt |
-| IME 纯路径 | `VLLM_Q4_IME=2` | 关 | **4 线程生产推荐**；所有单元都走 IME（落到 hart4-7 的线程按 CPU 号自动退回 colbt） |
-| IME K 分块 | `VLLM_Q4_IME_KB=n` | `0` | 单元内按 n 块切 K，只改访存局部性 |
-| decode vmadot | `VLLM_Q4_VMADOT=1` | 关 | M=1 单 token matvec 走 vmadot |
-| decode 新内核 | `VLLM_Q4_DEC=1` | 关 | `rv_q4_dec_rows` 入口（`VMADOT=1` 会隐含打开） |
-| Q4 bt4 批内核 | `VLLM_Q4_BT=0` 关闭 | 开 | 每 4 个 token 走 bt4 行内核，余数回退单 token |
-| 线程与绑核 | `--threads N` + `taskset -c 0-(N-1)` | 依平台 | 线程池大小与亲和性 |
-| 投机解码 | `--spec --spec-k N` | 关 | n-gram 草稿 + 验证，默认回滚重放，位级一致 |
-| prefill 走 Q8 | `--prefill-q8` | `dual` 下已为 1 | 仅影响同时带 Q4/Q8 的模型 |
-
-`--warmup` 不加速，只是把首轮页入踢出计时窗口（`--stream-test` 会跑一轮完整 prefill +
-8 步 decode 再丢弃），所有性能数字都要求在 `--warmup` 下取。
-
-### 6.4 推荐组合
+### 3. 发起请求
 
 ```bash
-# 板端 4 线程（当前生产推荐；8 线程尚未实测，保持默认 VLLM_Q4_IME=0 即可）
-taskset -c 0-3 env VLLM_Q4_VMADOT=1 VLLM_Q4_IME=2 \
-  VLLM_THREADS=4 OMP_NUM_THREADS=4 \
-  ./build-riscv/vllm_kestrel --serve --model <模型目录> --threads 4
+curl http://127.0.0.1:8080/health
 
-# 质量优先：q8 权重 + f32 KV + 不开稀疏注意力
-vqf_conv --model <safetensors> --convert-vqf model.vqf --wmode q8
-VLLM_KV_F32=1 ./build-riscv/vllm_kestrel --serve --model <模型目录> --threads 4
-
-# 内存优先：q4 权重 + Q4 KV；长上下文再叠 --sparse-attn（需过 NLL 门）
-vqf_conv --model <safetensors> --convert-vqf model.vqf --wmode q4
-./build-riscv/vllm_kestrel --serve --model <模型目录> --threads 4 --kv-q4 --sparse-attn
-```
-
-### 6.5 复现脚本
-
-**构建与自检**（x86 或板端）：
-
-```bash
-./tools/build/build_riscv.sh          # 板端原生构建，成功日志出现 [riscv] OK
-./tools/build/check_riscv.sh          # 构建 + 自检：--test-l3 16 PASS、--test-sparse 9 PASS
-```
-
-**性能采集**（板端，`tools/yolo/` 下是当时实测用的脚本，路径写死为 `/root/kv/...`）：
-
-| 脚本 | 做的事 |
-|---|---|
-| `tools/yolo/_k1_final4.sh` | 官方 `llama-bench`（Q4_0, `-p 32,128 -n 32 -t 4 -r 3`）vs 本引擎（`VLLM_Q4_IME=2`），3 轮交替、同会话同负载 |
-| `tools/yolo/_k1_ime4.sh` | `VLLM_Q4_IME=2` vs `=0` 的 A/B，含 `PREFILL-TIMING` 与 `PREFILL-KERNELS` 分解 |
-| `tools/yolo/_k1_p4.sh` | `VLLM_Q4_IME_KB` 的位级 + A/B，附 `VmHWM/RssAnon/RssFile` 峰值 |
-| `tools/yolo/_k1_multimodel.sh` | 0.6B / 1.7B / 4B 多模型跑同一口径 |
-
-单臂手工复现（4 线程、ctx 128）：
-
-```bash
-taskset -c 0-3 env VLLM_Q4_VMADOT=1 VLLM_Q4_IME=2 VLLM_THREADS=4 OMP_NUM_THREADS=4 \
-  ./build-riscv/vllm_kestrel --stream-test --model /root/kv/models/Qwen3-0.6B-col \
-  --stream-ctx 128 --stream-n 32 --threads 4 --warmup
-```
-
-`--stream-test` 会打印 prefill 用时、逐 token 的 `t=`/`ms=`、稳态 decode 均值，最后一行
-`TOKIDS` 用来做位级对拍。
-
-**位级 / 质量门**：
-
-```bash
-# 位级：TOKIDS 的完整 id 序列 md5 必须与基线一致（基线见下表）
-taskset -c 0-3 env VLLM_Q4_VMADOT=1 VLLM_Q4_IME=2 VLLM_THREADS=4 OMP_NUM_THREADS=4 \
-  ./build-riscv/vllm_kestrel --stream-test --model /root/kv/models/Qwen3-0.6B-col \
-  --stream-ctx 128 --stream-n 32 --threads 4 --warmup | grep TOKIDS
-
-# 质量：CORPUS_NLL_MEAN 与基准一致（0.6B 3.846915 / 1.7B 4.709014 / 4B 4.799563）
-taskset -c 0-3 env VLLM_STREAM_NLL=1 VLLM_Q4_VMADOT=1 VLLM_Q4_IME=2 \
-  VLLM_THREADS=4 OMP_NUM_THREADS=4 \
-  ./build-riscv/vllm_kestrel --stream-test --model /root/kv/models/Qwen3-0.6B-col \
-  --stream-ctx 32 --stream-n 32 --threads 4 --warmup
-```
-
-`TOKIDS` 基线（`--stream-n 32`，md5 为 32 个 id 拼成 `a,b,c,...,` 后取前 8 位）：
-
-| 模型 | `--stream-ctx 32` | `--stream-ctx 128` |
-|---|---|---|
-| Qwen3-0.6B | `d29857f2` | `fb9ac449` |
-| Qwen3-1.7B | `2e9bdbdd` | `2e9bdbdd` |
-| Qwen3-4B | `8b081e31` | `47dfdb01` |
-
-注意：`VLLM_STREAM_NLL=1` 时不输出 `TOKIDS`（md5 退化为空串的 `d41d8cd9`），位级与质量
-两项必须分两次跑。NLL 数值以本机实测为准，上面是 K1 上的参考值。
-
-### 6.6 实测量（云端 K1，2026-11-03）
-
-口径：`taskset -c 0-3` + `--threads 4` + `--warmup`，官方 `llama-bench`（Q4_0, `-p 32,128
--n 32 -t 4 -r 3`）与本引擎（`VLLM_Q4_IME=2`）**交替跑 3 轮**，机器负载 3–7（桌面环境常驻）。
-官方取 3 轮中位数，本引擎的 pp 由 `prefill ... in X.XXXs` 反算（引擎只打印整数 tok/s）。
-
-| 模型 | ctx | 官方 tok/s | 本引擎 tok/s | 比值 | 官方 decode ms/tok | 本引擎 decode ms/tok |
-|---|---|---|---|---|---|---|
-| 0.6B | 32 | 57.99 | 54.5 | 94% | 97.6 | 84.1 |
-| 0.6B | 128 | 43.81 | 50.3 | 115% | 97.6 | 90.0 |
-| 1.7B | 32 | 26.49 | 22.1 | 84% | 219.3 | 207.0 |
-| 1.7B | 128 | 16.12 | 21.7 | 135% | 219.3 | 211.2 |
-| 4B | 32 | 11.07 | 9.57 | 86% | 460.8 | 465.5 |
-| 4B | 128 | 8.16 | 8.44 | 103% | 460.8 | 475.9 |
-
-结论：**短 prompt（32 token）仍落后 6%~16%**（prefill 里 GEMM 占 77%~90%，是纯算力差距）；
-**128 token 已超过官方 3%~35%**；decode 在 0.6B/1.7B 上快 6%~14%，4B 慢 1%~3%（持平）。
-注意本引擎 `--stream-ctx 128` 实际是 118 token，官方 pp128 是 128 token，批次差 8%，
-长 ctx 的比值按此打折看。
-
-IME 开关本身的收益（`VLLM_Q4_IME=2` vs `=0`，3 轮均值，prefill 总时长）：
-
-| 模型 | ctx 32 | ctx 128 |
-|---|---|---|
-| 0.6B | 819.7 → 547.9 ms（1.50x） | 3080.8 → 2281.7 ms（1.35x） |
-| 1.7B | 2262.6 → 1356.5 ms（1.67x） | 8809.0 → 5364.1 ms（1.64x） |
-| 4B | 5606.9 → 3234.5 ms（1.73x） | 21693.6 → 13842.1 ms（1.57x） |
-
-两臂的 `TOKIDS` 完全一致，确认 IME 是位级中立的快档。
-
----
-
-## 7. 使用（客户端）
-
-`tools/client/vllm_client.py` 是零第三方依赖的 OpenAI 兼容客户端（Python 3.6+ 可跑）。
-
-```bash
-python tools/client/vllm_client.py --url http://127.0.0.1:8080 health
-python tools/client/vllm_client.py --url http://127.0.0.1:8080 models
-python tools/client/vllm_client.py chat "你好" --stream --max-tokens 128
-python tools/client/vllm_client.py chat --system "你是一个助手" "介绍一下自己"
-python tools/client/vllm_client.py complete "The capital of France is"
-python tools/client/vllm_client.py chat --image photo.jpg "这张图里有什么？" --stream
-echo "你好" | python tools/client/vllm_client.py chat
-```
-
-也可用任意 OpenAI 兼容客户端（如 `curl`）直接调用：
-
-```bash
-curl http://127.0.0.1:8080/v1/models
 curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"你好，请介绍一下自己。"}],"stream":true}'
 ```
 
----
+也可使用项目提供的零第三方依赖 Python 客户端：
 
-## 8. 诚实说明（当前边界）
+```bash
+python tools/client/vllm_client.py --url http://127.0.0.1:8080 models
+python tools/client/vllm_client.py --url http://127.0.0.1:8080 chat "你好" --stream --max-tokens 128
+```
 
-1. **x86-64 构建只用于「可编译 + 自检与 ARM 同口径」**，不作为性能基准。开放项：
-   x64 偶发整请求卡死；L3 Q4 点积在 x86 无 AVX2 内核（走标量回退，数值对、性能无意义）。
-2. **板端数据只对云端 K1 成立**（8 核 rv64gcv，`vmadot` 仅 hart0-3 可执行，hart4-7 会 SIGILL）。
-   RISC-V 侧可交叉编译验证「可编译 + 自检通过」；热内核为 RVV 档位 3，`VLLM_RVV=0` 可随时
-   退回标量参考路径（逃生舱）；换板子必须重新实测，不能直接套用第 6 节的数字。
-3. **回归闸门只证明「能编译 + 自检通过 + 跨架构同计数」**，不构成性能结论。
-4. 模型转换、加密签名、位级对拍均有确定性红线（`-ffp-contract=off`、FNV/HMAC 同口径等），
-   改动构建参数前请先读对应脚本头部的注释。
+<details>
+<summary>Windows x86-64 开发构建</summary>
 
-更多性能 / 适配细节见仓库根目录的 `arm记录/`、`mcu参考/` 系列文档与
-`tools/preproc/README.md`。
+依赖 MinGW-w64 GCC（含 winpthreads、winsock2）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\build\build_x64.ps1
+powershell -ExecutionPolicy Bypass -File tools\build\check_x64.ps1
+
+.\build-x64\vllm_kestrel_x64.exe --serve --port 8080 `
+  --model D:\models\qwen --threads 8 --auto-load
+```
+
+也可向构建脚本传入 `-Gcc` 和 `-OutDir` 指定编译器与输出目录。
+
+</details>
+
+## 模型准备
+
+### 模型目录
+
+通用 Qwen LLM 运行路径加载 VQF；原始 safetensors 由独立转换器处理，GGUF 不能直接用于该路径。Laya、YOLO 使用各自的打包工具，详见[模型适配说明](docs/模型适配.md)。
+
+```text
+model/
+├── model.vqf       # 量化权重
+├── config.json     # 模型配置与特殊 token 信息
+├── vocab.bin       # 引擎词表，必需
+└── merges.bin      # BPE 合并表，建议提供
+```
+
+服务的 `--model` 可指向模型目录或 `.vqf` 文件；下文的 `--stream-test` 示例统一使用目录。词表必须与模型匹配，缺失 `merges.bin` 时的分词回退可能改变输入 token 序列。
+
+### 转换权重
+
+在 Linux 主机上构建转换器：
+
+```bash
+(cd vqf_convert && ./build.sh)
+
+./vqf_convert/vqf_conv \
+  --model /path/to/hf-model \
+  --convert-vqf /path/to/output/model.vqf \
+  --wmode q4 --stream
+```
+
+输出目录需预先存在。Windows 可在 `vqf_convert` 中运行 `build.bat`，生成 `vqf_conv.exe`。
+
+| 转换选项 | 用途 |
+|---|---|
+| `--wmode q4` | Q4 权重，较小存储占用 |
+| `--wmode q8` | Q8 权重，用于更高权重精度的配置 |
+| `--wmode dual` | 同时保存 Q4 / Q8，转换器默认值 |
+| `--wmode q4i` / `g256` | 特定预打包或分组格式，按模型适配说明使用 |
+| `--stream` | 降低转换过程峰值内存，适用于大模型 |
+
+量化精度与布局是两个维度。`--wmode q4` 不等于自动获得性能表中的 col-major 布局；复现时必须核对 VQF 布局和生成工具。转换阶段未保存的精度不能靠运行参数恢复。
+
+### 准备词表
+
+```bash
+python tools/build/build_vocab_bin.py \
+  /path/to/tokenizer.json /path/to/existing_vocab.bin /path/to/output/vocab.bin
+
+python tools/gen_merges_bin.py \
+  /path/to/tokenizer.json /path/to/output/merges.bin
+```
+
+当前 `build_vocab_bin.py` 需要已有的兼容 `vocab.bin` 来复制特殊 token，并非仅凭 `tokenizer.json` 就能从零生成任意模型词表。准备时还需将匹配的 `config.json` 放入模型目录；具体约束见[词表准备](docs/模型适配.md#13-词表准备)。
+
+## 执行路径与配置
+
+### 权重布局与内核
+
+| 路径 | 作用 | 当前行为 |
+|---|---|---|
+| VQF row / 4×4 | 基础 Q4 布局 | 根据张量布局选择对应实现 |
+| VQF lane-major | 连续 lane 访问，减少离散取数 | RVV 路径默认 level 3，仍受向量长度与形状条件约束 |
+| VQF col-major | 面向批量 prefill 和单 token decode | 专用 decode 内核默认开启，复用激活量化与缓冲 |
+| MoE sidecar | gate/up、down 按专家及 lane 连续存储 | RVV 构建在提供路径后懒加载并校验 |
+| Laya LQ8V | 缓存 INT8 / IME 预打包数据 | 减少重复量化与打包；持久化 Arena 复用前向缓冲 |
+
+普通稠密模型先使用默认配置，无需复制历史实验中的整组环境变量。以下配置按当前实现核对：
+
+| 配置 | 当前语义 |
+|---|---|
+| `VLLM_Q4_RVV` | 默认 `3`；`0` 可用于参考路径对照，具体分支受布局约束 |
+| `VLLM_Q4_DEC` | 默认开启；`0` 关闭专用 decode 内核 |
+| `VLLM_Q4_IME` | 当前 `rv_q4_ime_mode()` 固定返回 `0`；旧版 `=1/2` 实验不能作为当前推荐命令 |
+| `VLLM_Q4_VMADOT=1` | K1 专用 decode 路径，并隐含开启 DEC；需满足硬件与核亲和性要求 |
+| `VLLM_GU_LANE_PATH` / `VLLM_DN_LANE_PATH` | 指向 MoE sidecar；不再需要旧的 `GU_LANE=1` / `DN_LANE=1` 启用开关 |
+
+这些默认行为的源码入口为 [vllm_safetensors.c](src/model/vllm_safetensors.c) 和 [vqf.c](src/model/vqf.c)。启用某个内核不意味着其在任意模型、形状和硬件上都会执行。
+
+### 数值精度与服务配置
+
+权重量化、KV 量化、稀疏注意力及近似算子都需要独立验证。**生成 token 相同与中间浮点结果逐位相同是不同的验证层次。** 尤其 MoE 的历史 RVV 路径相对标量曾出现约 1 ulp 差异和 token 翻转，不应将所有优化统称为“位级一致”。
+
+| 参数 | 用途 |
+|---|---|
+| `--threads N` | 工作线程数；基准比较时固定 |
+| `--auto-load` / `--load-on-use` | 启动加载 / 首次使用加载 |
+| `--auto-unload N` | 空闲 N 秒后卸载 |
+| `--batch-max N` / `--max-queued N` | 连续批与排队上限 |
+| `--min-free-mb N` | 保留空闲内存阈值 |
+| `VLLM_KV_F32=1` | F32 KV 对照配置，增加内存需求 |
+| `--kv-q4` | 更低精度 KV 配置，需质量评估 |
+| `--sparse-attn` | 显式开启近似稀疏注意力；默认不开启 |
+| `--spec --spec-k N` | 投机解码配置，需验证所选模式的输出约束 |
+| `--no-prefix-kv` | 关闭服务端 KV 前缀复用 |
+
+多轮请求可将响应中的 `history_tokens` 作为下一轮的 `context_tokens` 回传，供服务端匹配精确 token 前缀。复用是否命中取决于缓存和输入条件。
+
+## MoE 部署
+
+Qwen3-30B-A3B 使用 48 层、128 个专家、top-8 路由。历史 Q4 权重约 16.5 GB，板端运行依赖分层驻留；decode 对存储、缺页与系统页缓存十分敏感。
+
+### 数据准备顺序
+
+1. 转换 Q4 VQF，准备词表和配置。
+2. 将 down 权重转成专家连续布局（EC）。该步骤会原地修改文件，应先保留原件。
+3. 从对应源文件生成 GU / DN lane sidecar，并完成全量校验。
+
+工具源码：[vqf_down_relayout.c](tools/bench/vqf_down_relayout.c)、[gu_lane_repack.c](tools/bench/gu_lane_repack.c)、[dn_lane_repack.c](tools/bench/dn_lane_repack.c)。编译工具后的调用顺序为：
+
+```bash
+# 0：检查；1：原地转换 EC
+./vqf_down_relayout /path/to/model/model.vqf 0
+./vqf_down_relayout /path/to/model/model.vqf 1
+
+# 0：预检查；1：生成；2：全量校验
+./gu_lane_repack /path/to/model/model.vqf /path/to/model/gu_lane.bin 0
+./gu_lane_repack /path/to/model/model.vqf /path/to/model/gu_lane.bin 1
+./gu_lane_repack /path/to/model/model.vqf /path/to/model/gu_lane.bin 2
+
+./dn_lane_repack /path/to/model/model.vqf /path/to/model/dn_lane.bin 0
+./dn_lane_repack /path/to/model/model.vqf /path/to/model/dn_lane.bin 1
+./dn_lane_repack /path/to/model/model.vqf /path/to/model/dn_lane.bin 2
+```
+
+每一步成功后再执行下一步。**`VLLM_DN_EC=1` 必须对应已转换的 EC 权重，DN sidecar 也必须从该布局生成**，否则可能错读专家数据。历史 30B 配置的两个 sidecar 合计约 15.1 GB，加上原 VQF 约需 31.6 GB 存储，另需预留备份与转换空间。
+
+### 运行示例
+
+```bash
+MODEL=/path/to/model
+
+env OMP_NUM_THREADS=8 VLLM_THREADS=8 \
+  VLLM_VQF_STREAM=12 VLLM_DN_EC=1 VLLM_SA=1 \
+  VLLM_GU_LANE_PATH="$MODEL/gu_lane.bin" \
+  VLLM_DN_LANE_PATH="$MODEL/dn_lane.bin" VLLM_DN_SAPF=1 \
+  ./build-riscv/vllm_kestrel \
+  --stream-test --model "$MODEL" --stream-n 256 --threads 8
+```
+
+`VLLM_VQF_STREAM` 控制保留层数，`VLLM_SA` 控制专家驻留，`VLLM_DN_SAPF` 配合已注册的 DN sidecar 做专家级预取与驱逐。需要分项诊断时增加 `VLLM_MOE_PROF=1 VLLM_SA_STAT=1`。
+
+检查日志中 sidecar 启用、STREAM 和 SA 状态；出现拒绝或回退时，不应把该次运行计为优化配置。加密 VQF 与可驱逐映射存在兼容限制。sidecar 加载校验头部及源文件绑定信息，不替代生成阶段的数据区全量校验。
+
+[final_bench_cloud.sh](tools/bench/final_bench_cloud.sh) 提供首尾基线及 n=64/128/256 的测试矩阵，使用前需修改脚本中的设备路径。
+
+## 历史性能记录
+
+**本节是历史记录整理，不是当前提交的复测结果，也不构成“收口后无退化”的证明。** 稠密与 Laya 数据来自工作区[最近性能记录](../最近性能记录.txt)，MoE 与四线程对照表沿用此前 README 的记录。历史汇报未完整保存提交号、原始日志及所有统计条件，引用时应同时保留下述口径。
+
+### 稠密 Qwen：云端 K1，8 核 RVV
+
+历史命令参数为 `--stream-ctx 32 --stream-n 16`；下表为 col-major + DEC 路径。Prefill 吞吐、decode 延迟与吞吐按记录原值列出，存在取整和统计分母差异，不能将 ctx 参数直接视为实际 prefill token 数。记录未完整注明 warmup 与重复轮数。
+
+| 模型 | Prefill 耗时 | 报告 prefill 吞吐 | Decode 延迟 | 报告 decode 吞吐 | 峰值 RSS |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 302.9 ms | 97 tok/s | 48 ms/tok | 20.83 tok/s | 293 MB |
+| Qwen3-0.6B | 414.0 ms | 72 tok/s | 58 ms/tok | 17.13 tok/s | 356 MB |
+| Qwen3-1.7B | 1178.7 ms | 25 tok/s | 148 ms/tok | 6.74 tok/s | 971 MB |
+| Qwen3-4B | 3000.8 ms | 10 tok/s | 341 ms/tok | 2.94 tok/s | 2240 MB |
+
+同一历史批次中，col-major 的 DEC 关闭 → 开启记录分别为：0.6B **75 → 58**、1.7B **195 → 148**、4B **428 → 341 ms/tok**。这是 decode 内核开关对比，应与 lane → col 的布局变化分开理解。
+
+### SpacemiT 官方 llama-bench 对照
+
+最近记录中的官方程序使用 **4 线程、Q4_0 GGUF**，Kestrel 使用 **8 核、col-major VQF**。该官方版本在 8 线程配置下报告首选核心数量错误；这仅描述当时安装的版本，不代表所有 llama.cpp 版本的限制。
+
+| 模型 / 指标 | 官方历史值 | Kestrel 历史值 |
+|---|---:|---:|
+| Qwen3-0.6B prefill | 58.94 tok/s（pp32） | 72.00 tok/s |
+| Qwen3-0.6B decode | 10.68 tok/s（tg16） | 17.13 tok/s |
+| Qwen3-1.7B decode | 4.71 tok/s（tg16） | 6.74 tok/s |
+| Qwen3-4B decode | 2.28 tok/s（tg16） | 2.94 tok/s |
+
+这组结果反映不同线程配置下的部署表现，不能单独归因于内核效率；权重格式、输入与计时边界也需对齐后才能做严格性能比较。
+
+<details>
+<summary>早期四线程对照：2026-11-03，保留供追溯</summary>
+
+历史条件：`taskset -c 0-3`、4 线程、warmup、旧版 `VLLM_Q4_IME=2`，交替三轮。当前源码已固定关闭该 IME prefill 模式，不能用当前二进制直接复现旧开关行为。
+
+| 模型 | ctx 参数 | 官方 prefill tok/s | Kestrel prefill tok/s | 官方 decode ms/tok | Kestrel decode ms/tok |
+|---|---:|---:|---:|---:|---:|
+| Qwen3-0.6B | 32 | 57.99 | 54.5 | 97.6 | 84.1 |
+| Qwen3-0.6B | 128 | 43.81 | 50.3 | 97.6 | 90.0 |
+| Qwen3-1.7B | 32 | 26.49 | 22.1 | 219.3 | 207.0 |
+| Qwen3-1.7B | 128 | 16.12 | 21.7 | 219.3 | 211.2 |
+| Qwen3-4B | 32 | 11.07 | 9.57 | 460.8 | 465.5 |
+| Qwen3-4B | 128 | 8.16 | 8.44 | 460.8 | 475.9 |
+
+历史记录注明 Kestrel 的 ctx=128 实际输入为 118 token，官方 pp128 为 128 token，因此不是等工作量比较。相关脚本为 [_k1_final4.sh](tools/yolo/_k1_final4.sh)。
+
+</details>
+
+### MoE：Qwen3-30B-A3B
+
+8 线程、STREAM=12、EC、RVV、SA；优化配置增加 GU / DN lane 与 DN_SAPF。以下为历史 decode 平均延迟，**数值越低越好**。
+
+| 配置 | 本地 K1，约 7.8 GB RAM | 云端 K1，约 15.5 GB RAM |
+|---|---:|---:|
+| 无 lane sidecar 基线，n=256 | 2048 ms/tok | 1983 ms/tok |
+| lane + DN_SAPF，n=64 | 1778 ms/tok | 1629 ms/tok |
+| lane + DN_SAPF，n=128 | 1651 ms/tok | 1390 ms/tok |
+| lane + DN_SAPF，n=256 | 1581 ms/tok | 1329 ms/tok |
+
+n=256 同口径下的延迟降幅分别为 22.8% 和 33.0%。生成长度改变会影响冷启动与缺页开销在均值中的占比，不能用 n=16 与 n=256 判断回归。云端更充裕的页缓存是历史分析中的重要差异，换机器、内存或存储后都需重测。
+
+历史优化配置的 token 对照只覆盖当时测试组合；RVV 与标量并非普遍逐位等价。进程 RSS 也不包含系统页缓存等全部内存消耗，不能用较小 RSS 推导不会 OOM。
+
+### Laya：预打包加载与 Arena 复用
+
+历史云端 K1 数据，模型为 ModernBERT-large 28 层编码器及决策头，约 4.21 亿参数、206 个张量。
+
+| 执行路径 | 原加载耗时 | 首次构建缓存 | 已有缓存加载 | 缓存加载加速 |
+|---|---:|---:|---:|---:|
+| RVV，8 核 | 21795.6 ms | 6490.8 ms | 809.9 ms | 26.91× |
+| K1 IME，4 核 | 21822.5 ms | 10033.7 ms | 1582.2 ms | 13.79× |
+
+n=59 的峰值 RSS：RVV **1210.6 → 410.8 MB**（下降 66.1%），IME **1210.6 → 763.4 MB**（下降 36.9%）。IME 首请求耗时分别为 n=59 的 **5134.2 → 3037.7 ms**、n=256 的 **11018.5 → 7867.8 ms**。
+
+加载加速、首请求与稳态推理是不同指标。历史门禁报告 42 个中间层及输出文件 `SAME=42 DIFF=0`，结论限定于该组输入和配置。
+
+Laya 数据准备入口为 [laya_pack.py](tools/laya_pack.py)，模型接入流程见[模型适配说明](docs/模型适配.md)。
+
+## 正确性与性能验证
+
+### 无模型自检
+
+```bash
+# 板端构建并执行回归门禁
+./tools/build/check_riscv.sh
+
+# 交叉编译环境仅构建
+./tools/build/check_riscv.sh --build
+
+# 单独执行，保留完整输出和退出码
+./build-riscv/vllm_kestrel --test-l3
+./build-riscv/vllm_kestrel --test-sparse
+```
+
+当前 `check_riscv.sh` 的硬编码通过条件为 L3 **16 PASS / 0 FAIL**、Sparse **9 PASS / 0 FAIL**，SKIP 单独统计。此前测试汇报出现过 Sparse 10 PASS；脚本期望与该记录尚未统一，应核对当前二进制的实际输出，不能直接宣称门禁已通过。本次 README 整理未运行构建或自检。
+
+### 稠密模型基准
+
+```bash
+env OMP_NUM_THREADS=8 VLLM_THREADS=8 \
+  ./build-riscv/vllm_kestrel \
+  --stream-test --model /path/to/model \
+  --stream-ctx 32 --stream-n 64 --threads 8 --warmup
+```
+
+此命令用于建立新的固定口径，不等同于上述 n=16 历史测试。应读取日志中的实际 prefill token 数；`--warmup` 会执行预热，必须在比较双方保持一致。
+
+### 记录与判定
+
+- **固定条件**：同一设备、线程与亲和性、模型文件及布局、输入 token、生成长度、量化配置和 warmup 策略。
+- **保留证据**：源码提交与二进制标识、编译选项、环境变量、模型校验值、完整 stdout/stderr、退出码、内存与存储状态。
+- **交替测试**：使用 A/B/A/B 或首尾基线控制漂移，报告重复轮数和统计方式；不将单次波动当作收益。
+- **分层对拍**：算子及中间张量检查数值差异；完整 `TOKIDS` 检查生成结果。不要只比较首行 token，也不要把 token 相同当成浮点逐位相同。
+- **单独评估近似**：涉及量化或稀疏注意力时，使用固定语料的 NLL、召回或任务质量指标。质量测试与速度测试分开采集。
+
+`VLLM_Q4CHK=1` 可用于相关 Q4 算子对拍；`VLLM_STREAM_NLL=1` 为 NLL 测量配置。历史记录注明 NLL 模式不输出 `TOKIDS`，不能对空输出取哈希后宣称一致。
+
+## 源码导航
+
+| 路径 | 内容 |
+|---|---|
+| [src/main.c](src/main.c) | 命令行、服务与测试入口 |
+| [src/core](src/core/) | 注意力、调度、线程池、KV 与内核 |
+| [src/model](src/model/) | VQF、分词器、LLM、视觉、Laya 与 YOLO |
+| [src/serve](src/serve/) | HTTP、连续批、会话与内嵌页面 |
+| [src/media](src/media/) | 视频源与媒体处理 |
+| [include](include/) | 公共接口 |
+| [vqf_convert](vqf_convert/) | 独立权重转换器 |
+| [tools/build](tools/build/) | 构建和自检脚本 |
+| [tools/bench](tools/bench/) | 基准、布局重排与诊断工具 |
+| [tools/client](tools/client/) | Python 客户端 |
+| [模型适配说明](docs/模型适配.md) | 各类模型的准备与接入约束 |
+
+本文区分当前源码行为和历史测试记录。构建成功、自检通过、输出一致与性能无退化分别需要对应证据；旧实验脚本中的开关及设备绝对路径，使用前应与当前实现核对。

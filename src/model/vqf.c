@@ -111,13 +111,10 @@ int vqf_is_file(const char *path) {
     return ok && m == VQF_MAGIC;
 }
 
-/* 当前引擎布局 flags（加载时由环境 + wmode 决定） */
+/* 当前引擎布局 flags（加载时由 wmode 决定；Q8_8X8 已收口为恒开） */
 static uint32_t vqf_cur_flags(const STModelWeights *w) {
     uint32_t f = 0;
-    if (g_st_q8_repack) {
-        const char *e = getenv("VLLM_Q8_8X8");
-        if (!(e && e[0] == '0')) f |= VQF_FLAG_Q8_8X8;
-    }
+    if (g_st_q8_repack) f |= VQF_FLAG_Q8_8X8;
     if (g_st_q4_repack) f |= VQF_FLAG_Q4_4X4;
     if (w->q8_buf_q4)   f |= VQF_FLAG_Q8BUF_Q4;
     if (st_wmode_effective() == 4) f |= VQF_FLAG_G256;
@@ -591,24 +588,14 @@ int vqf_load(STModelWeights *w, const char *path) {
     w->has_x8  = (h->flags & VQF_FLAG_X8) ? 1 : 0;
     w->q8_buf_q4 = (h->flags & VQF_FLAG_Q8BUF_Q4) ? 1 : 0;
     w->emb_f16 = (h->flags & VQF_FLAG_EMB_F16) ? 1 : 0;
-    /* v5 lane-major：文件已固化 32 行 tile 布局，只有 RVV 内核（VLLM_Q4_RVV=1/2）
-     * 能吃下它；标量 mode2 比 4x4 更慢（按 tile 跳访存），故未启用时明确告警，
-     * 避免"安了 v5 模型却没开 RVV"变成静默性能回退。 */
-    if (w->q4_q_layout >= 2 || w->q4_k_layout >= 2 || w->q4_v_layout >= 2 ||
-        w->q4_o_layout >= 2 || w->q4_gate_layout >= 2 || w->q4_up_layout >= 2 ||
-        w->q4_down_layout >= 2 || w->q4_lm_layout >= 2) {
-        int rvv_on = 0;
-#if ST_HAVE_RVV
-        const char *e = getenv("VLLM_Q4_RVV");
-        rvv_on = (e && e[0] && atoi(e) >= 1);
-#endif
-        if (!rvv_on) {
-            fprintf(stderr, "[VQF] WARN: q4 lane-major(v5) 布局需要 VLLM_Q4_RVV=1/2；"
-                            "当前走标量 mode2，prefill/decode 会显著变慢\n");
+    /* v5 lane-major（layout=2）：RVV 路径已收口为恒开，仅非 RVV 构建保留告警。 */
+    if (w->q4_q_layout == 2 || w->q4_k_layout == 2 || w->q4_v_layout == 2 ||
+        w->q4_o_layout == 2 || w->q4_gate_layout == 2 || w->q4_up_layout == 2 ||
+        w->q4_down_layout == 2 || w->q4_lm_layout == 2) {
 #if !ST_HAVE_RVV
-            fprintf(stderr, "[VQF] WARN: 本构建未启用 RVV，lane-major 只剩标量路径\n");
+        fprintf(stderr, "[VQF] WARN: 本构建未启用 RVV，lane-major(v5) 只剩标量路径，"
+                        "prefill/decode 会显著变慢\n");
 #endif
-        }
     }
     g_vqf_loaded_flags = h->flags;      /* /admin 只读展示"文件内固化布局" */
     g_vqf_loaded_version = h->version;

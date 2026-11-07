@@ -35,8 +35,14 @@ VQF_FLAG_DET     = (1 << 10)
 
 QT_F32, QT_Q8, QT_Q4, QT_F16, QT_BLOB = 0x01, 0x02, 0x03, 0x05, 0x06
 
+# VQFTensor.layout 常量（镜像 vqf_format.h）
+LAYOUT_LEGACY       = 0
+LAYOUT_CONV_HWC_TAP = 4   # HWC tap-major + Kp(32B对齐) 补零 [OC, Kp]
+LAYOUT_CONV_IME_K1  = 5   # SpacemiT K1 IME pack_a 布局 [mt][kb][mv][32]
+
 OP_CONV, OP_ADD, OP_CONCAT, OP_MAXPOOL, OP_UPSAMPLE = 1, 2, 3, 4, 5
 OP_SIGMOID, OP_MUL, OP_SLICE, OP_SOFTMAX, OP_ATTN_PSA, OP_DETECT = 6, 7, 8, 9, 10, 11
+OP_MATMUL, OP_RMSNORM, OP_ROPE, OP_SWIGLU = 12, 13, 14, 15
 ACT_NONE, ACT_SILU = 0, 1
 
 FAM_V5, FAM_V8, FAM_V11 = 0, 1, 2
@@ -345,7 +351,7 @@ def encode_graph(ops, n_slots):
 
 
 # ================================================================
-# 量化（int8 per-channel 对称；与 collapse_priority_rule 一致）
+# 量化与离线预打包（阶段 P1 + 阶段 P3 静态内存规划）
 # ================================================================
 def quant_q8(w):
     """w [oc, ic, kh, kw] -> (int8 [oc,ic,kh,kw], scale[oc])"""
@@ -356,11 +362,161 @@ def quant_q8(w):
     return q, s.astype(np.float32)
 
 
+def repack_conv_q8_hwc(q):
+    """q [oc, ic, kh, kw] int8 -> HWC tap-major [oc, Kp] bytes (Kp = (ic*kh*kw + 31) & ~31)"""
+    oc, ic, kh, kw = q.shape
+    K = ic * kh * kw
+    Kp = (K + 31) & ~31
+    tap_major = np.ascontiguousarray(q.reshape(oc, ic, kh * kw).transpose(0, 2, 1)).reshape(oc, K)
+    out = np.zeros((oc, Kp), dtype=np.int8)
+    out[:, :K] = tap_major
+    return out.tobytes()
+
+
+def unpack_conv_q8_hwc(buf, oc, ic, kh, kw):
+    """HWC tap-major [oc, Kp] -> [oc, ic, kh, kw] int8"""
+    K = ic * kh * kw
+    Kp = (K + 31) & ~31
+    arr = np.frombuffer(buf, dtype=np.int8).reshape(oc, Kp)[:, :K]
+    return np.ascontiguousarray(arr.reshape(oc, kh * kw, ic).transpose(0, 2, 1)).reshape(oc, ic, kh, kw)
+
+
+def repack_conv_q8_ime(q):
+    """q [oc, ic, kh, kw] or [oc, Kp] int8 -> SpacemiT K1 IME pack_a [mt_n, kb_n, 2, 4, 8] bytes"""
+    if q.ndim == 4:
+        oc, ic, kh, kw = q.shape
+        Kp = (ic * kh * kw + 31) & ~31
+        q_hwc_kp = np.frombuffer(repack_conv_q8_hwc(q), dtype=np.int8).reshape(oc, Kp)
+    else:
+        q_hwc_kp = q
+        oc, Kp = q_hwc_kp.shape
+    assert oc % 8 == 0 and Kp % 8 == 0
+    mt_n, kb_n = oc // 8, Kp // 8
+    out = np.zeros((mt_n, kb_n, 2, 4, 8), dtype=np.int8)
+    for mt in range(mt_n):
+        for kb in range(kb_n):
+            for mv in range(2):
+                for q_idx in range(4):
+                    out[mt, kb, mv, q_idx, :] = q_hwc_kp[mt * 8 + mv * 4 + q_idx, kb * 8: kb * 8 + 8]
+    return out.tobytes()
+
+
+def unpack_conv_q8_ime(buf, oc, ic, kh, kw):
+    """SpacemiT K1 IME pack_a -> [oc, ic, kh, kw] int8"""
+    K = ic * kh * kw
+    Kp = (K + 31) & ~31
+    mt_n, kb_n = oc // 8, Kp // 8
+    ime = np.frombuffer(buf, dtype=np.int8).reshape(mt_n, kb_n, 2, 4, 8)
+    hwc = np.zeros((oc, Kp), dtype=np.int8)
+    for mt in range(mt_n):
+        for kb in range(kb_n):
+            for mv in range(2):
+                for q in range(4):
+                    hwc[mt * 8 + mv * 4 + q, kb * 8: kb * 8 + 8] = ime[mt, kb, mv, q, :]
+    return unpack_conv_q8_hwc(hwc.tobytes(), oc, ic, kh, kw)
+
+
+def plan_static_arena(ops, n_slots, weights_dict, ih, iw):
+    """阶段 P3：基于生命周期不交集公理（set_5foperations_91154c82）的离线静态内存规划器。
+    返回 (peak_bytes, raw_bytes, slot_offsets)"""
+    last_use = [-1] * n_slots
+    for idx, (op, ins, out, pr) in enumerate(ops):
+        if out < n_slots and last_use[out] < idx:
+            last_use[out] = idx
+        for s in ins:
+            if s < n_slots and last_use[s] < idx:
+                last_use[s] = idx
+    if ops:
+        last_use[ops[-1][2]] = len(ops)
+
+    shapes = [None] * n_slots
+    s_elems = [0] * n_slots
+    shapes[0] = (3, ih, iw)
+    s_elems[0] = ((3 * ih * iw) + 15) & ~15
+
+    def _get_oc(cid):
+        w_entry = weights_dict[f"c{cid:04d}_w"]
+        return int(w_entry[1]) if isinstance(w_entry, tuple) else int(w_entry.shape[0])
+
+    for op, ins, out, pr in ops:
+        if op == OP_CONV:
+            cid, _hb, sh, sw, ph, pw, _gp, _act, kh, kw = pr
+            ic, h, w = shapes[ins[0]]
+            oc = _get_oc(cid)
+            oh = (h + 2 * ph - kh) // sh + 1
+            ow = (w + 2 * pw - kw) // sw + 1
+        elif op == OP_CONCAT:
+            oh, ow = shapes[ins[0]][1], shapes[ins[0]][2]
+            oc = sum(shapes[s][0] for s in ins)
+        elif op == OP_MAXPOOL:
+            k, st, p = pr
+            oc, h, w = shapes[ins[0]]
+            oh = (h + 2 * p - k) // st + 1
+            ow = (w + 2 * p - k) // st + 1
+        elif op == OP_UPSAMPLE:
+            sc = pr[0]
+            oc, h, w = shapes[ins[0]]
+            oh, ow = h * sc, w * sc
+        elif op == OP_SLICE:
+            _ax, a, bnd = pr
+            _, oh, ow = shapes[ins[0]]
+            oc = bnd - a
+        elif op == OP_DETECT:
+            nc = pr[0]
+            A = sum(shapes[ins[s]][1] * shapes[ins[s]][2] for s in range(3))
+            oc, oh, ow = 4 + nc, A, 1
+        elif op == OP_MATMUL:
+            cid = pr[0]
+            _, oh, ow = shapes[ins[0]]
+            oc = _get_oc(cid)
+        else:
+            oc, oh, ow = shapes[ins[0]]
+        shapes[out] = (oc, oh, ow)
+        s_elems[out] = ((oc * oh * ow) + 15) & ~15
+
+    blks = []  # [off, len, active_slot]
+    s_off = [0] * n_slots
+    total_elems = 0
+    raw_elems = sum(s_elems)
+
+    for step in range(len(ops) + 1):
+        for b in blks:
+            if b[2] >= 0 and last_use[b[2]] < step - 1:
+                b[2] = -1
+        i = 0
+        while i + 1 < len(blks):
+            if blks[i][2] < 0 and blks[i + 1][2] < 0 and blks[i][0] + blks[i][1] == blks[i + 1][0]:
+                blks[i][1] += blks[i + 1][1]
+                blks.pop(i + 1)
+            else:
+                i += 1
+        s = 0 if step == 0 else ops[step - 1][2]
+        need = s_elems[s]
+        if need == 0:
+            continue
+        best = -1
+        for bi, b in enumerate(blks):
+            if b[2] < 0 and b[1] >= need:
+                if best < 0 or b[1] < blks[best][1]:
+                    best = bi
+        if best >= 0:
+            s_off[s] = blks[best][0]
+            if blks[best][1] > need:
+                blks.insert(best + 1, [blks[best][0] + need, blks[best][1] - need, -1])
+                blks[best][1] = need
+            blks[best][2] = s
+        else:
+            s_off[s] = total_elems
+            blks.append([total_elems, need, s])
+            total_elems += need
+    return total_elems * 4, raw_elems * 4, s_off
+
+
 # ================================================================
 # VQF v4 写盘
 # ================================================================
 def write_vqf(path, arch, tensors, family, graph_bytes):
-    """tensors: list of (name, qtype, rows, cols, payload_bytes)"""
+    """tensors: list of (name, qtype, rows, cols, payload_bytes[, layout])"""
     dir_off = (HDR_BYTES + VQF_ALIGN - 1) & ~(VQF_ALIGN - 1)
     n = len(tensors)
     data_off = (dir_off + n * 64 + VQF_HEADER_BYTES - 1) & ~(VQF_HEADER_BYTES - 1)
@@ -379,10 +535,12 @@ def write_vqf(path, arch, tensors, family, graph_bytes):
 
     # ---- 目录 ----
     directory = bytearray(n * 64)
-    for i, (name, qt, rows, cols, payload) in enumerate(tensors):
+    for i, t in enumerate(tensors):
+        name, qt, rows, cols, payload = t[0], t[1], t[2], t[3], t[4]
+        layout = t[5] if len(t) > 5 else 0
         nb = name.encode("utf-8")[:31]
         directory[i * 64:i * 64 + len(nb)] = nb
-        struct.pack_into("<IIIIQQ", directory, i * 64 + 32, qt, rows, cols, 0, offs[i], len(payload))
+        struct.pack_into("<IIIIQQ", directory, i * 64 + 32, qt, rows, cols, layout, offs[i], len(payload))
 
     # ---- 数据区 ----
     dat = bytearray(data_end - data_off)
@@ -434,17 +592,115 @@ def to_bytes(np_arr):
     return np.ascontiguousarray(np_arr, dtype=np.float32).tobytes()
 
 
+def decode_graph(gb):
+    magic, gver, nops = struct.unpack_from("<III", gb, 0)
+    assert magic == GRAPH_MAGIC, "bad graph magic"
+    p = 12
+    ops = []
+    max_s = 0
+    for _ in range(nops):
+        op, nin, nparam, o = struct.unpack_from("<IIII", gb, p); p += 16
+        ins = list(struct.unpack_from("<%dI" % nin, gb, p)); p += 4 * nin
+        pr = list(struct.unpack_from("<%dI" % nparam, gb, p)); p += 4 * nparam
+        ops.append((op, ins, o, pr))
+        if o > max_s:
+            max_s = o
+        for s in ins:
+            if s > max_s:
+                max_s = s
+    return ops, max_s + 1
+
+
+def repack_existing_vqf(in_path, out_path, conv_layout):
+    """无需 PyTorch checkpoint，直接对已有 VQF v4 Q8 模型执行离线权重重排与静态 Arena 规划。"""
+    v = read_vqf(in_path)
+    T = v["tensors"]
+    gb = T["graph"][3]
+    ops, nslots = decode_graph(gb)
+
+    # 收集每个 conv id 的 (kh, kw, gp)
+    conv_meta = {}
+    for op, ins, o, pr in ops:
+        if op == OP_CONV:
+            cid, hb, sh, sw, ph, pw, gp, act, kh, kw = pr
+            conv_meta[cid] = (kh, kw, gp)
+        elif op == OP_ATTN_PSA:
+            nh, hd, kd, wq, wp, wpe = pr
+            conv_meta[wq] = (1, 1, 1)
+            conv_meta[wp] = (1, 1, 1)
+            # wpe 为 depthwise (gp = C > 1)，保持 legacy CHW
+            oc_pe = T[f"c{wpe:04d}_w"][1]
+            conv_meta[wpe] = (3, 3, oc_pe)
+
+    peak_bytes, raw_bytes, _s_off = plan_static_arena(ops, nslots, T, v["ih"], v["iw"])
+    saved = (1.0 - peak_bytes / raw_bytes) if raw_bytes > 0 else 0.0
+    print(f"[yolo2vqf-repack] in={in_path} layout={conv_layout} "
+          f"arena={peak_bytes/1024:.1f}KB "
+          f"(naive={raw_bytes/1024:.1f}KB, saved={saved*100:.1f}%)")
+
+    # 按原文件 tensor 顺序重排写出
+    with open(in_path, "rb") as f:
+        blob = f.read()
+    arch = blob[HDR_ARCH_OFF:HDR_ARCH_OFF + HDR_ARCH_LEN]
+    out_tensors = []
+    for i in range(v["n"]):
+        base = 448 + i * 64
+        nm = blob[base:base + 32].split(b"\x00")[0].decode("utf-8")
+        qt, rows, cols, old_layout, off, byts = struct.unpack_from("<IIIIQQ", blob, base + 32)
+        payload = blob[off:off + byts]
+        new_layout = old_layout
+        if nm.startswith("c") and nm.endswith("_w") and qt == QT_Q8:
+            cid = int(nm[1:5])
+            kh, kw, gp = conv_meta.get(cid, (1, 1, 1))
+            oc = rows
+            icg = cols // (kh * kw)
+            # 先还原为标准 CHW [oc, icg, kh, kw]
+            if old_layout == LAYOUT_CONV_HWC_TAP:
+                q_chw = unpack_conv_q8_hwc(payload, oc, icg, kh, kw)
+            elif old_layout == LAYOUT_CONV_IME_K1:
+                q_chw = unpack_conv_q8_ime(payload, oc, icg, kh, kw)
+            else:
+                q_chw = np.frombuffer(payload, dtype=np.int8).reshape(oc, icg, kh, kw).copy()
+
+            if gp == 1 and conv_layout == "ime" and (oc % 8 == 0):
+                payload = repack_conv_q8_ime(q_chw)
+                new_layout = LAYOUT_CONV_IME_K1
+            elif gp == 1 and conv_layout in ("hwc", "ime"):
+                payload = repack_conv_q8_hwc(q_chw)
+                new_layout = LAYOUT_CONV_HWC_TAP
+            else:
+                payload = np.ascontiguousarray(q_chw, dtype=np.int8).tobytes()
+                new_layout = LAYOUT_LEGACY
+        out_tensors.append((nm, qt, rows, cols, payload, new_layout))
+
+    data_end, fsum = write_vqf(out_path, arch, out_tensors, v["family"], len(gb))
+    print(f"[yolo2vqf-repack] wrote {out_path}: {len(out_tensors)} tensors, "
+          f"{data_end/1048576:.2f} MB, FNV={fsum:016x}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", required=True)
+    ap.add_argument("--pt", help="PyTorch checkpoint (.pt)")
+    ap.add_argument("--repack-vqf", help="直接对已有 .vqf 进行离线重排（无需 --pt）")
     ap.add_argument("--out")
     ap.add_argument("--f16", action="store_true", help="权重存 F16")
     ap.add_argument("--q8", action="store_true", help="权重 per-channel int8")
+    ap.add_argument("--conv-layout", choices=["legacy", "hwc", "ime"], default="hwc",
+                    help="Q8 卷积权重离线预打包布局：legacy(0) / hwc(4,默认) / ime(5,SpacemiT K1)")
     ap.add_argument("--imgsz", default="640x640",
                     help="输入尺寸 HxW（默认 640x640；只改 arch 头，图按动态尺寸执行）")
     ap.add_argument("--dump-graph", action="store_true")
     ap.add_argument("--check", action="store_true", help="写盘后读回并对比 torch golden")
     args = ap.parse_args()
+
+    if args.repack_vqf:
+        if not args.out:
+            sys.exit("--repack-vqf 需要指定 --out")
+        repack_existing_vqf(args.repack_vqf, args.out, args.conv_layout)
+        return
+
+    if not args.pt:
+        sys.exit("需要指定 --pt 或 --repack-vqf")
 
     import torch
 
@@ -475,30 +731,60 @@ def main():
             print(f"  {i:3d} op={op:2d} out=s{o:<3d} in={ins} params={params}")
         return
 
+    # 收集每个 conv 的 groups 参数，仅对 groups == 1 执行 HWC/IME 离线预打包
+    conv_groups = {}
+    for op, ins, o, pr in b.ops:
+        if op == OP_CONV:
+            conv_groups[pr[0]] = pr[6]
+        elif op == OP_ATTN_PSA:
+            conv_groups[pr[3]] = 1
+            conv_groups[pr[4]] = 1
+            conv_groups[pr[5]] = pr[0] * pr[1]
+
     # ---- 组装张量表 ----
     tensors = []
-    tensors.append(("graph", QT_BLOB, len(b.ops), 0, gb))
-    tensors.append(("names", QT_BLOB, len(names), 0, ("\n".join(names)).encode("utf-8")))
+    tensors.append(("graph", QT_BLOB, len(b.ops), 0, gb, LAYOUT_LEGACY))
+    tensors.append(("names", QT_BLOB, len(names), 0, ("\n".join(names)).encode("utf-8"), LAYOUT_LEGACY))
+    t_dict_for_plan = {}
     for name, arr in b.weights:
         if arr.ndim == 4:                       # conv 权重 [oc,ic,kh,kw]
             rows, cols = int(arr.shape[0]), int(np.prod(arr.shape[1:]))
         else:                                   # bias / norm [n]
             rows, cols = int(arr.size), 1
+        t_dict_for_plan[name] = (QT_F32, rows, cols, b"")
         if args.q8 and arr.ndim == 4:
             q, s = quant_q8(arr)
-            tensors.append((name, QT_Q8, rows, cols, q.tobytes()))
-            tensors.append((name[:-2] + "_s", QT_F32, rows, 1, s.tobytes()))
+            cid = int(name[1:5]) if (name.startswith("c") and name.endswith("_w")) else -1
+            gp = conv_groups.get(cid, 1)
+            if gp == 1 and args.conv_layout == "hwc":
+                q_bytes = repack_conv_q8_hwc(q)
+                lay = LAYOUT_CONV_HWC_TAP
+            elif gp == 1 and args.conv_layout == "ime":
+                q_bytes = repack_conv_q8_ime(q)
+                lay = LAYOUT_CONV_IME_K1
+            else:
+                q_bytes = q.tobytes()
+                lay = LAYOUT_LEGACY
+            tensors.append((name, QT_Q8, rows, cols, q_bytes, lay))
+            tensors.append((name[:-2] + "_s", QT_F32, rows, 1, s.tobytes(), LAYOUT_LEGACY))
         elif args.f16 and arr.ndim == 4:
             tensors.append((name, QT_F16, rows, cols,
-                            arr.astype(np.float16).tobytes()))
+                            arr.astype(np.float16).tobytes(), LAYOUT_LEGACY))
         else:
-            tensors.append((name, QT_F32, rows, cols, to_bytes(arr)))
+            tensors.append((name, QT_F32, rows, cols, to_bytes(arr), LAYOUT_LEGACY))
+
+    peak_bytes, raw_bytes, _s_off = plan_static_arena(b.ops, nslots, t_dict_for_plan, ih, iw)
+    saved = (1.0 - peak_bytes / raw_bytes) if raw_bytes > 0 else 0.0
+    print(f"[yolo2vqf] static arena plan ({ih}x{iw}): "
+          f"arena={peak_bytes/1024:.1f}KB "
+          f"vs naive={raw_bytes/1024:.1f}KB "
+          f"(saved {saved*100:.1f}%)")
 
     if not args.out:
         sys.exit("需要 --out 或 --dump-graph")
     data_end, fsum = write_vqf(args.out, arch, tensors, fam, len(gb))
     print(f"[yolo2vqf] wrote {args.out}: {len(tensors)} tensors, "
-          f"{data_end/1048576:.2f} MB, FNV={fsum:016x}")
+          f"layout={args.conv_layout}, {data_end/1048576:.2f} MB, FNV={fsum:016x}")
 
     if args.check:
         check(args.pt, args.out)
@@ -518,15 +804,17 @@ def read_vqf(path):
         struct.unpack_from("<12I", arch, 0)
     conf, iou, graph_bytes = struct.unpack_from("<ffI", arch, 48)
     tensors = {}
+    layouts = {}
     for i in range(n):
         base = 448 + i * 64
         nm = blob[base:base + 32].split(b"\x00")[0].decode("utf-8")
-        qt, rows, cols, _rsv, off, byts = struct.unpack_from("<IIIIQQ", blob, base + 32)
+        qt, rows, cols, layout, off, byts = struct.unpack_from("<IIIIQQ", blob, base + 32)
         tensors[nm] = (qt, rows, cols, blob[off:off + byts])
+        layouts[nm] = layout
     return dict(magic=magic, version=version, flags=flags, n=n, data_off=data_off,
                 file_len=file_len, family=family, iw=iw, ih=ih, nc=nc,
                 strides=[s0, s1, s2], reg_max=reg_max, n_ops=n_ops, conf=conf,
-                iou=iou, tensors=tensors)
+                iou=iou, tensors=tensors, layouts=layouts)
 
 
 def check(pt, vqf):

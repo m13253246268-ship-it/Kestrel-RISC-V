@@ -48,11 +48,11 @@ static int qkv_bias_present(const STModelConfig *cfg) {
     return find_tensor(cfg, "model.layers.0.self_attn.q_proj.bias") != NULL;
 }
 
-/* 引擎抽取层引用的全局（默认值 = 引擎状态：repack 开）。*/
+/* 引擎抽取层引用的全局（默认值 = 最优唯一布局：Q8 8x8 tiled + Q4 col-major）。*/
 int g_st_q8_repack = 1;
 int g_st_q4_repack = 1;
-int g_st_q4_lane = 1;   /* v5 lane-major：稠密模型 + 全投影 32 对齐才启用 */
-int g_st_q4_col = 0;    /* T4-1 列主序 4-bit（VLLM_Q4_COL=1，layout=3） */
+int g_st_q4_lane = 0;
+int g_st_q4_col = 1;    /* T4-1 列主序 4-bit（layout=3，32 对齐矩阵唯一默认） */
 int g_st_no_q4 = 0;
 int g_q2mix_tail = 0;
 int g_model_load_layer = -1;
@@ -120,7 +120,7 @@ static int w_alloc(STModelWeights *w, const STModelConfig *cfg) {
         C((size_t)nl * Q8B((size_t)ff * dim), w->q8_up_weight);
         C((size_t)nl * Q8B((size_t)dim * ff), w->q8_down_weight);
     }
-    if (wm == 0 || wm == 1) {   /* q4 + x8 鍖?*/
+    if (wm == 0 || wm == 1) {   /* q4 */
         C(Q4B((size_t)vc * dim), w->q4_lm_weight);
         C((size_t)nl * Q4B((size_t)dim * q_out), w->q4_q_weight);
         C((size_t)nl * Q4B((size_t)dim * k_out), w->q4_k_weight);
@@ -129,21 +129,6 @@ static int w_alloc(STModelWeights *w, const STModelConfig *cfg) {
         C((size_t)nl * Q4B((size_t)ff * dim), w->q4_gate_weight);
         C((size_t)nl * Q4B((size_t)ff * dim), w->q4_up_weight);
         C((size_t)nl * Q4B((size_t)dim * ff), w->q4_down_weight);
-    }
-    /* x8（8x8l decode 副本）：与引擎 alloc 同 gate —— 仅 wm==1 且
-     * VLLM_ENABLE_8X8L=1 时分配（dual/q4i/q8/g256 不分配）。 */
-    if (wm == 1) {
-        const char *e8 = getenv("VLLM_ENABLE_8X8L");
-        if (e8 && e8[0] && e8[0] != '0') {
-            C((size_t)nl * Q4B((size_t)ff * dim), w->x8_gate_weight);
-            C((size_t)nl * Q4B((size_t)ff * dim), w->x8_up_weight);
-            C((size_t)nl * Q4B((size_t)dim * ff), w->x8_down_weight);
-            C((size_t)nl * Q4B((size_t)dim * q_out), w->x8_q_weight);
-            C((size_t)nl * Q4B((size_t)dim * k_out), w->x8_k_weight);
-            C((size_t)nl * Q4B((size_t)dim * k_out), w->x8_v_weight);
-            C((size_t)nl * Q4B((size_t)q_out * dim), w->x8_o_weight);
-            w->has_x8 = 1;
-        }
     }
 #undef C
     w->n_layers_allocated = nl;
@@ -598,43 +583,21 @@ static int run_convert(const char *model_dir, const char *out) {
          * Qwen3-Embedding-0.6B, vocab=151669）会写出 flags 缺 Q4_4X4 的文件，
          * 被引擎 vqf_load 的 layout 校验拒绝。逐矩阵 repack_q4_0_4x4_inplace
          * 自带 rows%4/cols%32 门控，几何不合的矩阵自动跳过，与引擎一致。 */
-        /* M4e (Q8 tiled)：wm3(q4i) 预解包 int8，repack 永不适用（引擎 2700）；
-         * 否则 VLLM_DISABLE_Q8_REPACK 显式关闭；几何按 8x8(默认) 或 4x4
-         * (VLLM_Q8_8X8=0) 门控（引擎 2702-2713）。 */
+        /* Q8 唯一默认：8x8 tiled（wm3 q4i 预解包除外） */
         if (wm == 3) {
             g_st_q8_repack = 0;
-        } else if (g_st_q8_repack) {
-            const char *dq = getenv("VLLM_DISABLE_Q8_REPACK");
-            if (dq && dq[0] && dq[0] != '0') g_st_q8_repack = 0;
-            if (g_st_q8_repack) {
-                const char *q8e = getenv("VLLM_Q8_8X8");
-                int eight = !(q8e && q8e[0] == '0');
-                if (eight) {
-                    if (!(q_out % 8 == 0 && k_out % 8 == 0 && ff % 8 == 0 &&
-                          dim % 8 == 0 && dim % 32 == 0 && ff % 32 == 0))
-                        g_st_q8_repack = 0;
-                } else {
-                    if (!(q_out % 4 == 0 && k_out % 4 == 0 && ff % 4 == 0 &&
-                          dim % 4 == 0 && dim % 32 == 0 && ff % 32 == 0))
-                        g_st_q8_repack = 0;
-                }
-            }
+        } else {
+            g_st_q8_repack = (q_out % 8 == 0 && k_out % 8 == 0 && ff % 8 == 0 &&
+                              dim % 8 == 0 && dim % 32 == 0 && ff % 32 == 0) ? 1 : 0;
         }
-        /* M4d(v5): lane-major 仅稠密模型 + 全投影 32 对齐（MoE 专家段几何
-         * 依赖 4 行组，禁用 lane-major 防止专家 tile 跨界静默错）。
-         * VLLM_Q4_LANE=0 强制写 4x4（A/B 对照用：同模型、同量化，仅布局不同）。 */
-        {
-            const char *ql = getenv("VLLM_Q4_LANE");
-            const char *qc = getenv("VLLM_Q4_COL");
-            int geo_ok = !cfg.is_moe &&
-                (q_out % 32 == 0 && k_out % 32 == 0 && ff % 32 == 0 && dim % 32 == 0);
-            int col_on = (qc && qc[0] == '1') && geo_ok;
-            int lane_on = !(ql && ql[0] == '0');
-            g_st_q4_col  = col_on;
-            g_st_q4_lane = !col_on && lane_on && geo_ok;   /* col 优先于 lane（二选一） */
-        }
-        fprintf(stderr, "[conv] repack gates: q8=%d q4=%d q4lane=%d q4col=%d (wmode=%d)\n",
-                g_st_q8_repack, g_st_q4_repack, g_st_q4_lane, g_st_q4_col, wm);
+        /* Q4 唯一最优：稠密/向量模型 32 对齐矩阵全走 col-major(layout=3)；
+         * MoE 模型 FFN 专家矩阵依赖 4x4(layout=1)，故关闭全局 g_st_q4_col，
+         * MoE 的 Attention Q/K/V/O 仍可在逐矩阵处视情况保持 4x4。 */
+        g_st_q4_col  = (!cfg.is_moe && q_out % 32 == 0 && k_out % 32 == 0 &&
+                        ff % 32 == 0 && dim % 32 == 0) ? 1 : 0;
+        g_st_q4_lane = 0;
+        fprintf(stderr, "[conv] repack gates: q8_8x8=%d q4=%d q4col=%d (wmode=%d)\n",
+                g_st_q8_repack, g_st_q4_repack, g_st_q4_col, wm);
     }
     int dim = cfg.dim;
     /* embed + final_norm（Qwen3-VL 有 language_model 包裹层；qwen3_moe 无） */
@@ -671,7 +634,7 @@ static int run_convert(const char *model_dir, const char *out) {
                 if (wm == 3) f32_to_q4i8(dst, tmp, (int)n);
                 else if (wm == 4) f32_to_g256q8(dst, tmp, (int)n);
                 else f32_to_q8_0(dst, tmp, (int)n);
-                if (g_st_q8_repack)
+                if (g_st_q8_repack && (cfg.vocab_size % 8) == 0)
                     repack_q8_0_tiled_inplace(dst, (int)(n / dim), dim);
             }
             if (w.q4_lm_weight) {
@@ -714,13 +677,10 @@ static int run_convert(const char *model_dir, const char *out) {
     if (g_wmode == 4) flags |= VQF_FLAG_G256;
     if (w.vision && w.vision->is_allocated) flags |= VQF_FLAG_VISION;
     if (cfg.is_moe)  flags |= VQF_FLAG_MOE;
-    if (g_st_q8_repack) {
-        const char *e = getenv("VLLM_Q8_8X8");
-        if (!(e && e[0] == '0')) flags |= VQF_FLAG_Q8_8X8;
-    }
+    if (g_st_q8_repack) flags |= VQF_FLAG_Q8_8X8;
     /* 引擎 vqf_write 以 g_st_q4_repack 全局为准（与是否有 q4 矩阵无关） */
     if (g_st_q4_repack) flags |= VQF_FLAG_Q4_4X4;
-    /* v5：任一 q4 张量用了 lane-major 则置 Q4_LANE（逐张量 layout 看 VQFTensor.layout） */
+    /* v5：任一 q4 张量用了 col-major(3)/lane-major(2) 则置 Q4_LANE */
     if (w.q4_q_layout >= 2 || w.q4_k_layout >= 2 || w.q4_v_layout >= 2 ||
         w.q4_o_layout >= 2 || w.q4_gate_layout >= 2 || w.q4_up_layout >= 2 ||
         w.q4_down_layout >= 2 || w.q4_lm_layout >= 2)
@@ -786,18 +746,6 @@ static void s_plan(const STModelConfig *cfg, int wm, int vis_ok,
         P("q4_up",   0x03, nl * ff, dim);
         P("q4_down", 0x03, nl * dim, ff);
         P("q4_lm",   0x03, vc, dim);
-    }
-    if (wm == 1) {
-        const char *e8 = getenv("VLLM_ENABLE_8X8L");
-        if (e8 && e8[0] && e8[0] != '0') {
-            P("x8_q", 0x04, nl * dim, q_out);
-            P("x8_k", 0x04, nl * dim, k_out);
-            P("x8_v", 0x04, nl * dim, k_out);
-            P("x8_o", 0x04, nl * q_out, dim);
-            P("x8_gate", 0x04, nl * ff, dim);
-            P("x8_up",   0x04, nl * ff, dim);
-            P("x8_down", 0x04, nl * dim, ff);
-        }
     }
     if (vis_ok) {
         int vh = cfg->vis_hidden, vd = cfg->vis_depth, vf = cfg->vis_ffn;
@@ -990,33 +938,16 @@ static int run_convert_stream(const char *model_dir, const char *out) {
         int dim = cfg.dim, ff = cfg.ffn_dim, vc = cfg.vocab_size;
         int q_out = cfg.n_heads * cfg.head_dim;
         int k_out = cfg.n_kv_heads * cfg.head_dim;
-        (void)vc; (void)q_out; (void)k_out; (void)dim; (void)ff;
-        /* v5 lane-major：--stream 路径不写 VQF_VERSION_LANE / VQFTensor.layout /
-         * VQF_FLAG_Q4_LANE，若 st_load_layer_weights 按全局 g_st_q4_lane 做了
-         * lane-major 重排，头/目录却声明 4x4 → 静默错。故流式路径显式关闭，
-         * 与「旧头不声明就不重排」的 fail-closed 口径一致。 */
-        g_st_q4_lane = 0;
-        g_st_q4_col  = 0;   /* 流式路径同样不写 layout=3，fail-closed */
-        /* Q4 4x4：与引擎一致不做全局几何门（见 run_convert 同段注释）。 */
+        (void)vc;
         if (wm == 3) {
             g_st_q8_repack = 0;
-        } else if (g_st_q8_repack) {
-            const char *dq = getenv("VLLM_DISABLE_Q8_REPACK");
-            if (dq && dq[0] && dq[0] != '0') g_st_q8_repack = 0;
-            if (g_st_q8_repack) {
-                const char *q8e = getenv("VLLM_Q8_8X8");
-                int eight = !(q8e && q8e[0] == '0');
-                if (eight) {
-                    if (!(q_out % 8 == 0 && k_out % 8 == 0 && ff % 8 == 0 &&
-                          dim % 8 == 0 && dim % 32 == 0 && ff % 32 == 0))
-                        g_st_q8_repack = 0;
-                } else {
-                    if (!(q_out % 4 == 0 && k_out % 4 == 0 && ff % 4 == 0 &&
-                          dim % 4 == 0 && dim % 32 == 0 && ff % 32 == 0))
-                        g_st_q8_repack = 0;
-                }
-            }
+        } else {
+            g_st_q8_repack = (q_out % 8 == 0 && k_out % 8 == 0 && ff % 8 == 0 &&
+                              dim % 8 == 0 && dim % 32 == 0 && ff % 32 == 0) ? 1 : 0;
         }
+        g_st_q4_col  = (!cfg.is_moe && q_out % 32 == 0 && k_out % 32 == 0 &&
+                        ff % 32 == 0 && dim % 32 == 0) ? 1 : 0;
+        g_st_q4_lane = 0;
     }
 
     STModelWeights w; memset(&w, 0, sizeof(w));
@@ -1104,14 +1035,14 @@ static int run_convert_stream(const char *model_dir, const char *out) {
                     if (wm == 3) f32_to_q4i8(dst, tmp_lm, (int)nlm);
                     else if (wm == 4) f32_to_g256q8(dst, tmp_lm, (int)nlm);
                     else f32_to_q8_0(dst, tmp_lm, (int)nlm);
-                    if (g_st_q8_repack)
+                    if (g_st_q8_repack && (cfg.vocab_size % 8) == 0)
                         repack_q8_0_tiled_inplace(dst, (int)(nlm / cfg.dim), cfg.dim);
                 }
                 if (lm_map4) {
                     uint8_t *dst = lm_map4 + (size_t)(off / 32) * 18;
                     f32_to_q4_0(dst, tmp_lm, (int)nlm);
                     if (g_st_q4_repack)
-                        repack_q4_0_4x4_inplace(
+                        w.q4_lm_layout = q4_repack_choose(
                             lm_map4 + (size_t)(off / cfg.dim) *
                                 (((cfg.dim + 31) / 32) * 18),
                             (int)(nlm / cfg.dim), cfg.dim);
@@ -1153,6 +1084,10 @@ static int run_convert_stream(const char *model_dir, const char *out) {
 
     /* ---- flags 回填 + 尾部（明文 FNV / ENC HMAC-SM3）+ SM2 签名 + 头部回填 ---- */
     {
+        for (int i = 0; i < n; i++) {
+            VQFTensor *t = (VQFTensor *)(base + dir_off + (size_t)i * sizeof(VQFTensor));
+            t->layout = q4_layout_by_name(&w, e[i].name);
+        }
         uint32_t fflags = 0;
         fflags |= VQF_FLAG_EMB_F16;
         if (w.q8_buf_q4) fflags |= VQF_FLAG_Q8BUF_Q4;
@@ -1160,11 +1095,12 @@ static int run_convert_stream(const char *model_dir, const char *out) {
         if (wm == 4)     fflags |= VQF_FLAG_G256;
         if (vis_ok)      fflags |= VQF_FLAG_VISION;
         if (cfg.is_moe)  fflags |= VQF_FLAG_MOE;
-        if (g_st_q8_repack) {
-            const char *e8 = getenv("VLLM_Q8_8X8");
-            if (!(e8 && e8[0] == '0')) fflags |= VQF_FLAG_Q8_8X8;
-        }
+        if (g_st_q8_repack) fflags |= VQF_FLAG_Q8_8X8;
         if (g_st_q4_repack) fflags |= VQF_FLAG_Q4_4X4;
+        if (w.q4_q_layout >= 2 || w.q4_k_layout >= 2 || w.q4_v_layout >= 2 ||
+            w.q4_o_layout >= 2 || w.q4_gate_layout >= 2 || w.q4_up_layout >= 2 ||
+            w.q4_down_layout >= 2 || w.q4_lm_layout >= 2)
+            fflags |= VQF_FLAG_Q4_LANE;
         if (enc)  fflags |= VQF_FLAG_ENC;
         if (sign) fflags |= VQF_FLAG_SIGNED;
 
@@ -1175,6 +1111,8 @@ static int run_convert_stream(const char *model_dir, const char *out) {
         /* 头部 canonical：file_len=0、sig 全 0、flags 已含 ENC/SIGNED/enc_iv
          * （与引擎 vqf_load 复算口径逐字节一致）。 */
         VQFHeader hc = h;
+        hc.version = (fflags & VQF_FLAG_Q4_LANE) ? VQF_VERSION_LANE :
+                     (cfg.is_moe ? VQF_VERSION_MOE : VQF_VERSION);
         hc.flags = fflags;
         hc.file_len = 0;
         memset(&hc.sig, 0, sizeof(hc.sig));
@@ -1309,9 +1247,7 @@ int main(int argc, char **argv) {
                    "  env: VLLM_VQF_KEY=<pass>         输出 VQF-Enc 加密文件"
                    "（SM4-CTR + HMAC-SM3）\n"
                    "       VLLM_VQF_SIGN_PRIV=<64hex>  内嵌 SM2 供应链签名"
-                   "（可与加密并用）\n"
-                   "       VLLM_Q4_LANE=0              q4 写 4x4(72B) 而非 lane-major(576B)"
-                   "（A/B 对照用）\n");
+                   "（可与加密并用）\n");
             return 0;
         }
     }

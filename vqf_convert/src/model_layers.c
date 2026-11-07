@@ -21,28 +21,9 @@ void f32_to_q4_0(uint8_t *o, const float *i, int n);
 void f32_to_q4i8(uint8_t *o, const float *i, int n);
 void f32_to_g256q8(uint8_t *o, const float *i, int n);
 void f32_to_q2_1(uint8_t *o, const float *i, int n);
-/* C-1 精度实验：VLLM_Q4_ROWSCALE=1 时把 q4 权重改成 per-row scale（格式不变）
- * 注意：rowscale 只存在于转换器，引擎 vllm_safetensors.c 没有；重跑
- * tools/extract_quant.py 会抹掉本段与 quant_kernels.c 的 per-row 分支。
- * g_q4_rowcols 为一次性参数：f32_to_q4_0 用完即复位为 0。 */
-extern int g_q4_rowcols;
-static void q4_rowscale_set(int cols) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("VLLM_Q4_ROWSCALE"); on = (e && e[0] == '1') ? 1 : 0; }
-    g_q4_rowcols = on ? cols : 0;
-}
-/* d2 精度实验：VLLM_Q8_ROWSCALE=1 时 q8 权重改 per-row scale（格式不变，仅转换器）。 */
-extern int g_q8_rowcols;
-static void q8_rowscale_set(int cols) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("VLLM_Q8_ROWSCALE"); on = (e && e[0] == '1') ? 1 : 0; }
-    g_q8_rowcols = on ? cols : 0;
-}
 int repack_q4_0_4x4_inplace(uint8_t *b, int r, int c);
-int repack_q4_0_lane_inplace(uint8_t *b, int r, int c);
 int repack_q4_0_lane_col_inplace(uint8_t *b, int r, int c);
 int repack_q8_0_8x8_inplace(uint8_t *b, int r, int c);
-int repack_q8_0_4x4_inplace(uint8_t *b, int r, int c);
 int repack_q8_0_tiled_inplace(uint8_t *b, int r, int c);
 int repack_q4_0_8x8l(uint8_t *d, const uint8_t *s, int r, int c);
 int st_wmode_effective(void);
@@ -50,15 +31,12 @@ extern int g_st_q8_repack, g_st_q4_repack, g_st_q4_lane, g_st_q4_col, g_q2mix_ta
 extern int g_model_load_layer, g_model_load_total;
 extern int g_st_no_q4;
 
-/* M4d(v5): 选择 q4 布局。rows/cols 均 32 对齐 → lane-major(2)；
+/* 选择 q4 最优布局：rows/cols 均 32 对齐且允许 col-major 时 → col-major(3)；
  * 否则 4x4(1)；4x4 也失败则保持 legacy(0)。就地重排并返回实际 layout。 */
 int q4_repack_choose(uint8_t *buf, int rows, int cols) {
     if (g_st_q4_col && rows % 32 == 0 && cols % 32 == 0 &&
         repack_q4_0_lane_col_inplace(buf, rows, cols) == 0)
         return 3;
-    if (g_st_q4_lane && rows % 32 == 0 && cols % 32 == 0 &&
-        repack_q4_0_lane_inplace(buf, rows, cols) == 0)
-        return 2;
     if (repack_q4_0_4x4_inplace(buf, rows, cols) == 0)
         return 1;
     return 0;
@@ -226,17 +204,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_q_weight + Q8_BYTES((size_t)l * dim * q_out),
                                   tmp_attn, dim * q_out);
-                else {
-                    q8_rowscale_set(dim);
+                else
                     f32_to_q8_0(w->q8_q_weight + Q8_BYTES((size_t)l * dim * q_out),
                                 tmp_attn, dim * q_out);
-                }
             }
-            if (w->q4_q_weight) {
-                q4_rowscale_set(dim);
+            if (w->q4_q_weight)
                 f32_to_q4_0(w->q4_q_weight + Q4_BYTES((size_t)l * dim * q_out),
                             tmp_attn, dim * q_out);
-            }
 
             /* K projection */
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_proj.weight", l);
@@ -250,17 +224,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_k_weight + Q8_BYTES((size_t)l * dim * k_out),
                                   tmp_attn, dim * k_out);
-                else {
-                    q8_rowscale_set(dim);
+                else
                     f32_to_q8_0(w->q8_k_weight + Q8_BYTES((size_t)l * dim * k_out),
                                 tmp_attn, dim * k_out);
-                }
             }
-            if (w->q4_k_weight) {
-                q4_rowscale_set(dim);
+            if (w->q4_k_weight)
                 f32_to_q4_0(w->q4_k_weight + Q4_BYTES((size_t)l * dim * k_out),
                             tmp_attn, dim * k_out);
-            }
 
             /* V projection */
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.v_proj.weight", l);
@@ -274,17 +244,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_v_weight + Q8_BYTES((size_t)l * dim * k_out),
                                   tmp_attn, dim * k_out);
-                else {
-                    q8_rowscale_set(dim);
+                else
                     f32_to_q8_0(w->q8_v_weight + Q8_BYTES((size_t)l * dim * k_out),
                                 tmp_attn, dim * k_out);
-                }
             }
-            if (w->q4_v_weight) {
-                q4_rowscale_set(dim);
+            if (w->q4_v_weight)
                 f32_to_q4_0(w->q4_v_weight + Q4_BYTES((size_t)l * dim * k_out),
                             tmp_attn, dim * k_out);
-            }
 
             /* O projection */
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", l);
@@ -298,38 +264,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_o_weight + Q8_BYTES((size_t)l * q_out * dim),
                                   tmp_attn, q_out * dim);
-                else {
-                    q8_rowscale_set(q_out);
+                else
                     f32_to_q8_0(w->q8_o_weight + Q8_BYTES((size_t)l * q_out * dim),
                                 tmp_attn, q_out * dim);
-                }
             }
-            /* 权重 dump 自检（VLLM_Q8CHK=4）：O 第 0 层 F32 vs Q8 解包 */
-            if (getenv("VLLM_Q8CHK") && getenv("VLLM_Q8CHK")[0] == '4' && l == 0 && w->q8_o_weight) {
-                const uint8_t *o0 = w->q8_o_weight;
-                fprintf(stderr, "[Q8CHK4] O l0 F32[0..8]: ");
-                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", tmp_attn[i]);
-                fprintf(stderr, "\n");
-                for (int b = 0; b < 2; b++) {
-                    uint32_t fb = f16_to_f32_bits(*(const uint16_t *)(o0 + (size_t)b * 34));
-                    float d;
-                    memcpy(&d, &fb, 4);
-                    fprintf(stderr, "[Q8CHK4] O l0 block%d scale=%.6f qs:", b, d);
-                    for (int i = 0; i < 8; i++)
-                        fprintf(stderr, " %d", (int8_t)o0[(size_t)b * 34 + 2 + i]);
-                    fprintf(stderr, "\n");
-                    for (int i = 0; i < 8; i++) {
-                        double dv = (double)(int8_t)o0[(size_t)b * 34 + 2 + i] * (double)d;
-                        fprintf(stderr, "  [%d] F32=%.4f deq=%.4f\n", i, tmp_attn[(size_t)b * 32 + i], dv);
-                    }
-                }
-                fflush(stderr);
-            }
-            if (w->q4_o_weight) {
-                q4_rowscale_set(q_out);   /* o_proj: [dim, nh*hd]，行长 = q_out */
+            if (w->q4_o_weight)
                 f32_to_q4_0(w->q4_o_weight + Q4_BYTES((size_t)l * q_out * dim),
                             tmp_attn, q_out * dim);
-            }
         } else {
             /* No Q8_0: fallback to legacy scalar loading (needs F32 weights) */
             load_layer_tensor(cfg, w, l, "self_attn.q_proj.weight",
@@ -412,17 +353,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_gate_weight + (size_t)l * Q8_BYTES(ff * dim),
                                   tmp_ffn, ff * dim);
-                else {
-                    q8_rowscale_set(dim);
+                else
                     f32_to_q8_0(w->q8_gate_weight + (size_t)l * Q8_BYTES(ff * dim),
                                 tmp_ffn, ff * dim);
-                }
             }
-            if (w->q4_gate_weight && !q2_ffn) {
-                q4_rowscale_set(dim);
+            if (w->q4_gate_weight && !q2_ffn)
                 f32_to_q4_0(w->q4_gate_weight + (size_t)q4_ffn_off * Q4_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
-            }
             if (w->q2_gate_weight && q2_ffn)
                 f32_to_q2_1(w->q2_gate_weight + (size_t)l * Q2_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
@@ -439,17 +376,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_up_weight + (size_t)l * Q8_BYTES(ff * dim),
                                   tmp_ffn, ff * dim);
-                else {
-                    q8_rowscale_set(dim);
+                else
                     f32_to_q8_0(w->q8_up_weight + (size_t)l * Q8_BYTES(ff * dim),
                                 tmp_ffn, ff * dim);
-                }
             }
-            if (w->q4_up_weight && !q2_ffn) {
-                q4_rowscale_set(dim);
+            if (w->q4_up_weight && !q2_ffn)
                 f32_to_q4_0(w->q4_up_weight + (size_t)q4_ffn_off * Q4_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
-            }
             if (w->q2_up_weight && q2_ffn)
                 f32_to_q2_1(w->q2_up_weight + (size_t)l * Q2_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
@@ -466,17 +399,13 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 else if (st_wmode_effective() == 4)
                     f32_to_g256q8(w->q8_down_weight + (size_t)l * Q8_BYTES(dim * ff),
                                   tmp_ffn, dim * ff);
-                else {
-                    q8_rowscale_set(ff);
+                else
                     f32_to_q8_0(w->q8_down_weight + (size_t)l * Q8_BYTES(dim * ff),
                                 tmp_ffn, dim * ff);
-                }
             }
-            if (w->q4_down_weight && !q2_ffn) {
-                q4_rowscale_set(ff);
+            if (w->q4_down_weight && !q2_ffn)
                 f32_to_q4_0(w->q4_down_weight + (size_t)q4_ffn_off * Q4_BYTES(dim * ff),
                             tmp_ffn, dim * ff);
-            }
             if (w->q2_down_weight && q2_ffn)
                 f32_to_q2_1(w->q2_down_weight + (size_t)l * Q2_BYTES(dim * ff),
                             tmp_ffn, dim * ff);
@@ -515,8 +444,9 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
     if (w->has_q4) {
         int l;
         for (l = layer_start; l < layer_end; l++) {
-            /* q2mix allocates Q4 attention only; guard each projection so
-             * the absent FFN Q4 buffers (NULL) are skipped. */
+            /* Attention Q/K/V/O：无论稠密或 MoE 模型，只要 32 对齐统一采用最优 col-major(layout=3) */
+            int saved_col = g_st_q4_col;
+            g_st_q4_col = 1;
             if (w->q4_q_weight) {
                 w->q4_q_layout = q4_repack_choose(
                     w->q4_q_weight + (size_t)l * Q4_BYTES((size_t)dim * q_out), q_out, dim);
@@ -533,8 +463,8 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 w->q4_o_layout = q4_repack_choose(
                     w->q4_o_weight + (size_t)l * Q4_BYTES((size_t)q_out * dim), dim, q_out);
             }
-            /* q2mix uses a tail-only FFN Q4 segment (different stride), so the
-             * full-layer 4x4 repack below is skipped for it. */
+            g_st_q4_col = saved_col;
+            /* FFN gate/up/down：稠密用 col-major(3)，MoE 保持 4x4(1) */
             if (w->q4_gate_weight && !w->has_q2) {
                 w->q4_gate_layout = q4_repack_choose(
                     w->q4_gate_weight + (size_t)l * Q4_BYTES((size_t)ff * dim), ff, dim);

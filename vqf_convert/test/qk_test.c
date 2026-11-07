@@ -20,10 +20,16 @@ void f32_to_g256q8(uint8_t *out, const float *in, int n);
 
 /* ---- repack（x86 用标量 qk_repack.c / 板端用 NEON qk_ref_engine.c）---- */
 int repack_q4_0_4x4_inplace(uint8_t *buf, int rows, int cols);
+int repack_q4_0_lane_inplace(uint8_t *buf, int rows, int cols);
+int repack_q4_0_lane_col_inplace(uint8_t *buf, int rows, int cols);
 int repack_q8_0_8x8_inplace(uint8_t *buf, int rows, int cols);
 int repack_q8_0_4x4_inplace(uint8_t *buf, int rows, int cols);
 int repack_q8_0_tiled_inplace(uint8_t *buf, int rows, int cols);
 int repack_q4_0_8x8l(uint8_t *dst, const uint8_t *src, int rows, int cols);
+int repack_conv_q8_hwc_tap(int8_t *dst, const int8_t *src, int OC, int C, int KH, int KW);
+int unpack_conv_q8_hwc_tap(int8_t *dst, const int8_t *src, int OC, int C, int KH, int KW);
+int repack_conv_q8_ime_k1(int8_t *dst, const int8_t *src_hwc_kp, int OC, int Kp);
+int unpack_conv_q8_ime_k1(int8_t *dst_hwc_kp, const int8_t *src_ime, int OC, int Kp);
 
 #define Q8B(n) (((size_t)(n) + 31) / 32 * 34)
 #define Q4B(n) (((size_t)(n) + 31) / 32 * 18)
@@ -85,7 +91,7 @@ int main(void) {
     } else {
         printf("q8 4x4       %016llx\n", (unsigned long long)fnv(q8, Q8B(n)));
     }
-    /* 3) q4_0 量化 + 4x4 repack */
+    /* 3) q4_0 量化 + 4x4 / lane / col repack */
     f32_to_q4_0(q4, w, (int)n);
     printf("q4_0         %016llx\n", (unsigned long long)fnv(q4, Q4B(n)));
     f32_to_q4_0(q4, w, (int)n);
@@ -94,6 +100,20 @@ int main(void) {
         fail = 1;
     } else {
         printf("q4 4x4       %016llx\n", (unsigned long long)fnv(q4, Q4B(n)));
+    }
+    f32_to_q4_0(q4, w, (int)n);
+    if (repack_q4_0_lane_inplace(q4, rows, cols) != 0) {
+        printf("q4 lane      repack rc=-1\n");
+        fail = 1;
+    } else {
+        printf("q4 lane      %016llx\n", (unsigned long long)fnv(q4, Q4B(n)));
+    }
+    f32_to_q4_0(q4, w, (int)n);
+    if (repack_q4_0_lane_col_inplace(q4, rows, cols) != 0) {
+        printf("q4 col       repack rc=-1\n");
+        fail = 1;
+    } else {
+        printf("q4 col       %016llx\n", (unsigned long long)fnv(q4, Q4B(n)));
     }
     /* 4) q4_0 -> x8 8x8l 副本 */
     f32_to_q4_0(q4, w, (int)n);
@@ -109,6 +129,43 @@ int main(void) {
     /* 6) g256 */
     f32_to_g256q8(q8, w, (int)n);
     printf("g256         %016llx\n", (unsigned long long)fnv(q8, Q8B(n)));
+
+    /* 7) Conv Q8 HWC tap-major + 32B Kp 补零重排 & 双射逆变换恒等校验 */
+    {
+        const int coc = 48, cic = 20, ckh = 3, ckw = 3; /* K=180 -> Kp=192 */
+        const int ckp = (cic * ckh * ckw + 31) & ~31;
+        const size_t cn = (size_t)coc * cic * ckh * ckw;
+        const size_t hwc_bytes = (size_t)coc * ckp;
+        int8_t *csrc = (int8_t *)malloc(cn);
+        int8_t *chwc = (int8_t *)malloc(hwc_bytes);
+        int8_t *chwc2 = (int8_t *)malloc(hwc_bytes);
+        int8_t *cime = (int8_t *)malloc(hwc_bytes);
+        int8_t *crec = (int8_t *)malloc(cn);
+        for (size_t i = 0; i < cn; i++) csrc[i] = (int8_t)((int)(lcg() & 0xFFu) - 128);
+        if (repack_conv_q8_hwc_tap(chwc, csrc, coc, cic, ckh, ckw) != 0 ||
+            unpack_conv_q8_hwc_tap(crec, chwc, coc, cic, ckh, ckw) != 0 ||
+            memcmp(csrc, crec, cn) != 0) {
+            printf("conv hwc     roundtrip FAIL\n");
+            fail = 1;
+        } else {
+            printf("conv hwc     %016llx\n", (unsigned long long)fnv(chwc, hwc_bytes));
+        }
+
+        /* 8) Conv Q8 SpacemiT K1 IME pack_a 重排 & 双射逆变换恒等校验 */
+        memset(chwc2, 0, hwc_bytes);
+        memset(crec, 0, cn);
+        if (repack_conv_q8_ime_k1(cime, chwc, coc, ckp) != 0 ||
+            unpack_conv_q8_ime_k1(chwc2, cime, coc, ckp) != 0 ||
+            memcmp(chwc, chwc2, hwc_bytes) != 0 ||
+            unpack_conv_q8_hwc_tap(crec, chwc2, coc, cic, ckh, ckw) != 0 ||
+            memcmp(csrc, crec, cn) != 0) {
+            printf("conv ime     roundtrip FAIL\n");
+            fail = 1;
+        } else {
+            printf("conv ime     %016llx\n", (unsigned long long)fnv(cime, hwc_bytes));
+        }
+        free(csrc); free(chwc); free(chwc2); free(cime); free(crec);
+    }
 
     free(w); free(q8); free(q4); free(q4i); free(x8);
     printf(fail ? "QK FAIL\n" : "QK OK\n");

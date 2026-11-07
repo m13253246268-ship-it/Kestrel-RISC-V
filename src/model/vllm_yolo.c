@@ -50,6 +50,12 @@ static double ynow(void) {
 #define YOP_SOFTMAX   9
 #define YOP_ATTN_PSA  10
 #define YOP_DETECT    11
+/* ---- 阶段 P2：基于半环公理扩展的通用轻量图算子 ---- */
+#define YOP_MATMUL    12            /* 线性代数半环 (+, ×)：矩阵乘（F32 / Q8 per-channel） */
+#define YOP_RMSNORM   13            /* Bregman 流形归一化投影：RMSNorm */
+#define YOP_ROPE      14            /* 正交旋转群同构：旋转位置编码 RoPE */
+#define YOP_SWIGLU    15            /* 门控非线性合成：SwiGLU(gate, up) */
+#define YOP_MAX       15
 
 #define YGRAPH_MAGIC  0x50524759u   /* 'YGRP' */
 #define YACT_SILU     1
@@ -59,7 +65,7 @@ static double ynow(void) {
  * ================================================================ */
 typedef struct {
     char     name[32];
-    uint32_t qtype, rows, cols;
+    uint32_t qtype, rows, cols, layout;
     uint64_t off, bytes;
     const uint8_t *ptr;
 } YTens;
@@ -80,28 +86,32 @@ struct StYoloModel {
     int       n_ops;
     YOp      *ops;
     int       n_slots;
-    /* 卷积权重索引（按 cid 直查张量）：F32 或 int8 + per-channel scale */
+    /* 阶段 P3：静态生命周期区间终点 last_use[slot] 与持久化连续激活 Arena */
+    int      *slot_last_use;
+    float    *arena;
+    size_t    arena_cap;    /* float 元素容量 */
+    /* 卷积/矩阵权重索引（按 cid 直查张量）：F32 或 int8 + per-channel scale */
     const float  **cw;      /* F32 权重（Q8 模型为 NULL） */
     const int8_t **cq;      /* int8 权重（Q8） */
     const float  **cs;      /* per-channel scale [oc]（Q8） */
     const float  **cb;      /* bias（恒 F32；无则 NULL） */
     int          *crow, *ccol;   /* 权重几何（rows=oc, cols=ic*kh*kw） */
+    uint32_t     *clayout;       /* VQF_LAYOUT_*（0=legacy, 4=HWC_TAP, 5=IME_K1） */
+    int8_t      **cq_chw;        /* 当 clayout!=0 且回退标量 yconv_q8 时的逆向解包缓存 */
     int        max_cid;
-    /* CPU dotprod 卷积（K-YOLO-002）惰性缓存：补齐到 Kp 的 int8 权重 [OC][Kp] */
+    /* CPU dotprod 卷积（K-YOLO-002）缓存：补齐到 Kp 的 int8 权重 [OC][Kp] */
     int8_t     **nw;
-    /* V56：IME(vmadot) 路径的权重打包 [mt][kb][mv][32]（每层惰性构建一次） */
+    uint8_t     *nw_owned;  /* 阶段 P1：1=堆分配需 free，0=零拷贝直指 m->blob */
+    /* V56：IME(vmadot) 路径的权重打包 [mt][kb][mv][32] */
     int8_t     **iw;
+    uint8_t     *iw_owned;  /* 阶段 P1：1=堆分配需 free，0=零拷贝直指 m->blob */
     /* V56：IME 的激活打包 scratch（[nb][kb][t][r][8]，按需增长复用） */
     int8_t      *ib;
     size_t       ib_cap;
     /* V56：IME 路径的 rowsc scratch（跨层复用，避免每层 malloc 的首次触页） */
     float       *rsc;
     size_t       rsc_cap;
-    /* V50：im2col 输入侧 HWC 化。激活张量仍全程 CHW（GEMM 的 C[oc][p] 取向与
-     * p 向量化要求输出为 CHW，见 V50 分析），只在每次卷积前把输入按 8×8 分块
-     * 转成 HWC 存进本 scratch，使 3×3/1×1 的 im2col 读变成连续 C 个 float
-     * （vlse32 跨通道 gather → vle32 连续），实测 im2col 快 2.05×（含转置）。
-     * scratch 按需增长并复用，避免每层 malloc/free 的首次触页开销。 */
+    /* V50：im2col 输入侧 HWC 化 scratch */
     float      *hx;
     size_t      hx_cap;
     /* 类别名（names blob） */
@@ -114,8 +124,8 @@ struct StYoloModel {
     /* Phase-0（K-YOLO-002）CPU 分解计时（env VLLM_YOLO_CPU_TIMING 门控；默认不累加） */
     double    t_elem, t_lb, t_post, t_fwd;
     long      n_conv_ops, n_elem_ops;
-    double    t_opk[12];   /* Phase 2：逐算子类型耗时（index = opcode） */
-    long      n_opk[12];
+    double    t_opk[YOP_MAX + 1];   /* Phase 2：逐算子类型耗时（index = opcode） */
+    long      n_opk[YOP_MAX + 1];
 };
 
 /* ================================================================
@@ -212,6 +222,7 @@ StYoloModel *st_yolo_load(const char *path) {
         YTens *d = &m->tens[i];
         memcpy(d->name, t->name, 32); d->name[31] = 0;
         d->qtype = t->qtype; d->rows = t->rows; d->cols = t->cols;
+        d->layout = t->layout;
         d->off = t->offset; d->bytes = t->bytes;
         if (t->offset + t->bytes > m->size) {
             fprintf(stderr, "[YOLO] tensor %s out of range\n", d->name);
@@ -248,34 +259,73 @@ StYoloModel *st_yolo_load(const char *path) {
             o->ins = (const uint32_t *)p; p += 4 * o->nin;
             o->prm = (const uint32_t *)p; p += 4 * o->nparam;
             if ((int)o->out > maxslot) maxslot = (int)o->out;
-            if (o->op == YOP_CONV && o->nparam >= 1 && (int)o->prm[0] > maxcid)
+            for (uint32_t k = 0; k < o->nin; k++)
+                if ((int)o->ins[k] > maxslot) maxslot = (int)o->ins[k];
+            if ((o->op == YOP_CONV || o->op == YOP_MATMUL || o->op == YOP_RMSNORM) &&
+                o->nparam >= 1 && (int)o->prm[0] > maxcid)
                 maxcid = (int)o->prm[0];
             if (o->op == YOP_ATTN_PSA && o->nparam >= 6)
                 for (int k = 3; k < 6; k++)
                     if ((int)o->prm[k] > maxcid) maxcid = (int)o->prm[k];
         }
         m->n_slots = maxslot + 1;
+        /* 阶段 P3：离线/加载期计算每个 slot 的生命周期终点 last_use[s]
+         * [SHS 公理映射: set_5foperations_91154c82 (集合不交集公理)] */
+        m->slot_last_use = (int *)calloc((size_t)m->n_slots, sizeof(int));
+        for (int s = 0; s < m->n_slots; s++) m->slot_last_use[s] = -1;
+        for (int i = 0; i < m->n_ops; i++) {
+            const YOp *o = &m->ops[i];
+            if ((int)o->out < m->n_slots && m->slot_last_use[o->out] < i)
+                m->slot_last_use[o->out] = i;
+            for (uint32_t k = 0; k < o->nin; k++) {
+                uint32_t in_s = o->ins[k];
+                if ((int)in_s < m->n_slots && m->slot_last_use[in_s] < i)
+                    m->slot_last_use[in_s] = i;
+            }
+        }
+        /* 最终输出槽位保持存活至全图末尾 */
+        if (m->n_ops > 0) {
+            uint32_t last_out = m->ops[m->n_ops - 1].out;
+            if ((int)last_out < m->n_slots)
+                m->slot_last_use[last_out] = m->n_ops;
+        }
         m->max_cid = maxcid;
         m->cw = (const float **)calloc((size_t)maxcid + 1, sizeof(float *));
         m->cq = (const int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
         m->cs = (const float **)calloc((size_t)maxcid + 1, sizeof(float *));
         m->cb = (const float **)calloc((size_t)maxcid + 1, sizeof(float *));
-        m->crow = (int *)calloc((size_t)maxcid + 1, sizeof(int));
-        m->ccol = (int *)calloc((size_t)maxcid + 1, sizeof(int));
-        m->nw  = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
-        m->iw  = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
+        m->crow    = (int *)calloc((size_t)maxcid + 1, sizeof(int));
+        m->ccol    = (int *)calloc((size_t)maxcid + 1, sizeof(int));
+        m->clayout = (uint32_t *)calloc((size_t)maxcid + 1, sizeof(uint32_t));
+        m->cq_chw  = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
+        m->nw       = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
+        m->nw_owned = (uint8_t *)calloc((size_t)maxcid + 1, sizeof(uint8_t));
+        m->iw       = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
+        m->iw_owned = (uint8_t *)calloc((size_t)maxcid + 1, sizeof(uint8_t));
+        int n_prepack_hwc = 0, n_prepack_ime = 0;
         for (int c = 0; c <= maxcid; c++) {
             char nm[32];
             snprintf(nm, sizeof(nm), "c%04d_w", c);
             int wi = ytens_find(m, nm);
             if (wi >= 0) {
-                m->crow[c] = (int)m->tens[wi].rows;
-                m->ccol[c] = (int)m->tens[wi].cols;
+                m->crow[c]    = (int)m->tens[wi].rows;
+                m->ccol[c]    = (int)m->tens[wi].cols;
+                m->clayout[c] = m->tens[wi].layout;
                 if (m->tens[wi].qtype == VQF_QT_F32)
                     m->cw[c] = (const float *)m->tens[wi].ptr;
-                else if (m->tens[wi].qtype == VQF_QT_Q8_0)
+                else if (m->tens[wi].qtype == VQF_QT_Q8_0) {
                     m->cq[c] = (const int8_t *)m->tens[wi].ptr;
-                else
+                    /* 阶段 P1：离线预打包零拷贝直挂
+                     * layout == VQF_LAYOUT_CONV_HWC_TAP(4): ptr 已是 [OC][Kp] tap-major
+                     * layout == VQF_LAYOUT_CONV_IME_K1(5):  ptr 已是 [mt][kb][mv][32] IME pack_a */
+                    if (m->clayout[c] == VQF_LAYOUT_CONV_HWC_TAP) {
+                        n_prepack_hwc++;
+                    } else if (m->clayout[c] == VQF_LAYOUT_CONV_IME_K1) {
+                        m->iw[c] = (int8_t *)m->tens[wi].ptr;
+                        m->iw_owned[c] = 0;
+                        n_prepack_ime++;
+                    }
+                } else
                     fprintf(stderr, "[YOLO] conv %s qtype %u unsupported (M1: F32/Q8)\n",
                             nm, m->tens[wi].qtype);
             }
@@ -287,8 +337,8 @@ StYoloModel *st_yolo_load(const char *path) {
         {
             int nq8 = 0, nf32 = 0;
             for (int c = 0; c <= maxcid; c++) { if (m->cq[c]) nq8++; else if (m->cw[c]) nf32++; }
-            if (nq8) fprintf(stderr, "[YOLO] conv weights: F32=%d int8=%d (per-channel scale)\n",
-                             nf32, nq8);
+            if (nq8) fprintf(stderr, "[YOLO] conv weights: F32=%d int8=%d (per-channel scale, prepack hwc=%d ime=%d)\n",
+                             nf32, nq8, n_prepack_hwc, n_prepack_ime);
         }
     }
 
@@ -311,18 +361,29 @@ fail:
 void st_yolo_free(StYoloModel *m) {
     if (!m) return;
     free(m->tens); free(m->ops);
+    free(m->slot_last_use);
+    free(m->arena);
     free(m->cw); free(m->cq); free(m->cs); free(m->cb);
-    free(m->crow); free(m->ccol);
+    free(m->crow); free(m->ccol); free(m->clayout);
+    if (m->cq_chw) {
+        int nc = m->max_cid + 1;
+        for (int c = 0; c < nc; c++) free(m->cq_chw[c]);
+        free(m->cq_chw);
+    }
     if (m->nw) {
         int nc = m->max_cid + 1;
-        for (int c = 0; c < nc; c++) free(m->nw[c]);
+        for (int c = 0; c < nc; c++)
+            if (m->nw_owned && m->nw_owned[c]) free(m->nw[c]);
         free(m->nw);
     }
+    free(m->nw_owned);
     if (m->iw) {
         int nc = m->max_cid + 1;
-        for (int c = 0; c < nc; c++) free(m->iw[c]);
+        for (int c = 0; c < nc; c++)
+            if (m->iw_owned && m->iw_owned[c]) free(m->iw[c]);
         free(m->iw);
     }
+    free(m->iw_owned);
     free(m->ib);
     free(m->rsc);
     free(m->hx);
@@ -480,211 +541,17 @@ static void yconv_q8(const float *x, int C, int H, int W,
     }
 }
 
-#if ST_HAVE_RVV
-/* VLLM_YOLO_RVV=0 关闭 RVV 内核（逃生舱）：仅用于与标量路径做位级对拍。
- * 默认开 —— im2col 量化与 int8 点积全在整数/精确浮点域，与标量**逐位同值**。 */
-static int yolo_rvv_on(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("VLLM_YOLO_RVV"); v = (e && e[0] == '0') ? 0 : 1; }
-    return v;
-}
-#endif
-
-/* im2col + 逐像素（行）对称 int8 量化（K-YOLO-002 Phase 1）。
- * **单遍**：gather→per-thread 行缓冲（同时求行 max|·|），再从行缓冲量化 ⇒ x 只读一遍。
- * 1x1/s1/p0（无 padding）走无边界特化（YOLO 中约半数为 1×1）。
- * 输出：imc[P][Kp] int8（K..Kp 补 0），rowsc[P] 逐像素 scale（s = max|row|/127）。
- * 返回 0 成功，-1 失败（OOM）。 */
-static int yolo_im2col_q8_row(const float *x, int C, int H, int W,
-                              int KH, int KW, int sh, int sw, int ph, int pw,
-                              int OH, int OW, int K, int Kp,
-                              int8_t *imc, float *rowsc) {
-    const int is11 = (KH == 1 && KW == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0);
-#ifdef _OPENMP
-    int nth = omp_get_max_threads(); if (nth < 1) nth = 1;
-#else
-    int nth = 1;
-#endif
-    float **rb = (float **)calloc((size_t)nth, sizeof(float *));
-    if (!rb) return -1;
-    for (int i = 0; i < nth; i++) {
-        rb[i] = (float *)malloc((size_t)K * sizeof(float));
-        if (!rb[i]) { for (int j = 0; j < i; j++) free(rb[j]); free(rb); return -1; }
-    }
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if((long)OH * OW > 1024)
-#endif
-    for (int oy = 0; oy < OH; oy++) {
-#ifdef _OPENMP
-        float *row = rb[omp_get_thread_num()];
-#else
-        float *row = rb[0];
-#endif
-        for (int ox = 0; ox < OW; ox++) {
-            const int pp = oy * OW + ox;
-            int8_t *arow = imc + (size_t)pp * Kp;
-            float mx = 0.f;
-            if (is11) {
-                const int q0 = oy * W + ox;
-#if ST_HAVE_RVV
-                if (yolo_rvv_on()) {
-                    /* 1×1/s1/p0：NCHW 下固定空间位置、按 ic 跨通道取数 ⇒ 均匀 stride 的
-                     * 跨步 load（vlse32，stride = H*W*4）。逐通道写 row + 求 |·| 最大值。
-                     * max 是精确比较、无舍入 ⇒ 与标量逐位同值。 */
-                    const size_t vmax_f32m8 = __riscv_vsetvlmax_e32m8();
-                    const ptrdiff_t stride = (ptrdiff_t)((size_t)H * W * sizeof(float));
-                    vfloat32m1_t vacc = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-                    for (int ic = 0; ic < C; ic += (int)vmax_f32m8) {
-                        const size_t rem = (size_t)(C - ic);
-                        const size_t vl = __riscv_vsetvl_e32m8(rem < vmax_f32m8 ? rem : vmax_f32m8);
-                        vfloat32m8_t v = __riscv_vlse32_v_f32m8(
-                                             x + q0 + (size_t)ic * H * W, stride, vl);
-                        __riscv_vse32_v_f32m8(row + ic, v, vl);
-                        vacc = __riscv_vfredmax_vs_f32m8_f32m1(
-                                   __riscv_vfabs_v_f32m8(v, vl), vacc, vl);
-                    }
-                    mx = __riscv_vfmv_f_s_f32m1_f32(vacc);
-                } else
-#endif
-                {
-                    for (int ic = 0; ic < C; ic++) {
-                        float v = x[(size_t)ic * H * W + q0];
-                        row[ic] = v;
-                        float av = fabsf(v); if (av > mx) mx = av;
-                    }
-                }
-            } else {
-                int k = 0;
-                const int iy0 = oy * sh - ph, ix0 = ox * sw - pw;
-                const int interior = (iy0 >= 0 && iy0 + KH - 1 <= H - 1 &&
-                                      ix0 >= 0 && ix0 + KW - 1 <= W - 1);
-                if (interior) {                       /* 内部像素：无边界判断 */
-                    /* NOTE (K-YOLO-002 V49)：3×3 interior im2col 曾尝试 RVV 化
-                     * （跨 ic 用 vlse32 gather，stride=H*W*4；写回用 vsse32 scatter，
-                     * stride=36B；max 用 vfredmax），位级 BIT-EXACT 通过，但板端 320×320
-                     * im2col 103.5→127.4ms（慢 23%）、总 234→245ms。根因：跨 ic gather
-                     * stride=H*W*4 跨页（每元素 TLB/cache miss），且 36B 跨步 scatter 打散
-                     * 写 cache（部分 cache 行 RFO）；标量的「顺序写 row + 每通道 3 段连续读」
-                     * 反而最优（与 V42 列主序教训同源）。故回退标量，勿重犯此向量化方向。 */
-                    for (int ic = 0; ic < C; ic++) {
-                        const float *xc = x + (size_t)ic * H * W;
-                        for (int ky = 0; ky < KH; ky++) {
-                            const float *xr = xc + (size_t)(iy0 + ky) * W + ix0;
-                            for (int kx = 0; kx < KW; kx++, k++) {
-                                float v = xr[kx];
-                                row[k] = v;
-                                float av = fabsf(v); if (av > mx) mx = av;
-                            }
-                        }
-                    }
-                } else {
-                    for (int ic = 0; ic < C; ic++) {
-                        const float *xc = x + (size_t)ic * H * W;
-                        for (int ky = 0; ky < KH; ky++) {
-                            const int iy = iy0 + ky;
-                            const float *xr = (iy >= 0 && iy < H) ? xc + (size_t)iy * W : NULL;
-                            for (int kx = 0; kx < KW; kx++, k++) {
-                                float v = 0.f;
-                                if (xr) { const int ix = ix0 + kx; if (ix >= 0 && ix < W) v = xr[ix]; }
-                                row[k] = v;
-                                float av = fabsf(v); if (av > mx) mx = av;
-                            }
-                        }
-                    }
-                }
-            }
-            const float s = (mx > 0.f) ? (mx / 127.f) : 1.f;
-            const float inv = 1.f / s;
-            if (Kp > K) memset(arow + K, 0, (size_t)(Kp - K));
-            /* Quantise row -> int8. `(int)(f + 2^23) - 2^23` is bit-identical
-             * to lrintf() under the default FE_TONEAREST mode for |f| < 2^22
-             * (all our values: |f| <= 127) and avoids a per-element libm call
-             * (the im2col build is the single largest CPU cost of the int8 path,
-             * K-YOLO-002 Phase 1 #2). NOTE (K-YOLO-002 Phase 2): an explicit NEON
-             * version (vmul+vadd(magic)+vcvtq) measured 2% SLOWER than GCC's
-             * `omp simd` codegen, and plain `vcvtq_s32_f32` (FCVTZS = truncate)
-             * is WRONG here (breaks round-to-nearest -> detections collapse);
-             * the auto-vectorised scalar loop is kept. */
-            const float quant_magic = 12582912.0f;   /* 2^23 */
-#if ST_HAVE_RVV
-            /* RVV 量化：vfmul → float 域 clamp ±127 → vfcvt.x(RNE) → 两次窄化截断。
-             * 与标量 `(int)(f*inv + 2^23) - 2^23` 位级一致（后者靠 float 加法的 RNE
-             * 舍入实现 round-to-nearest；vfcvt.x 亦为 RNE）。板端最小测试 128/128 全等。
-             * clamp 放 float 域与放 int 域等价：超界值先被截到 ±127 再转整数。 */
-            if (yolo_rvv_on()) {
-                const size_t vmax4 = __riscv_vsetvlmax_e32m4();
-                for (int j = 0; j < K; j += (int)vmax4) {
-                    const size_t rem = (size_t)(K - j);
-                    const size_t vl = __riscv_vsetvl_e32m4(rem < vmax4 ? rem : vmax4);
-                    vfloat32m4_t f = __riscv_vle32_v_f32m4(row + j, vl);
-                    f = __riscv_vfmul_vf_f32m4(f, inv, vl);
-                    f = __riscv_vfmax_vf_f32m4(f, -127.0f, vl);
-                    f = __riscv_vfmin_vf_f32m4(f,  127.0f, vl);
-                    vint32m4_t q = __riscv_vfcvt_x_f_v_i32m4(f, vl);
-                    vint16m2_t q16 = __riscv_vncvt_x_x_w_i16m2(q, vl);
-                    vint8m1_t q8 = __riscv_vncvt_x_x_w_i8m1(q16, vl);
-                    __riscv_vse8_v_i8m1(arow + j, q8, vl);
-                }
-            } else
-#endif
-            {
-#pragma omp simd
-                for (int j = 0; j < K; j++) {
-                    int q = (int)(row[j] * inv + quant_magic) - 12582912;
-                    if (q > 127) q = 127; else if (q < -127) q = -127;
-                    arow[j] = (int8_t)q;
-                }
-            }
-            rowsc[pp] = s;
-        }
-    }
-    for (int i = 0; i < nth; i++) free(rb[i]);
-    free(rb);
-    return 0;
-}
-
 /* ================================================================
- * V50：im2col 输入侧 HWC 化
+ * V50：im2col 输入侧 HWC 化（唯一默认路径）
  *
- * 背景：CHW（channel-major）下 3×3 im2col 对每个输出像素要按 ic 跨通道取数，
- * stride = H*W*4 ⇒ 每次只读 12 B（kx=0/1/2）就跳到下一条通道。V49 试过直接
- * 向量化这条路（vlse32 gather + vsse32 scatter），位级正确但板端 im2col
- * 103.5→127.4 ms（慢 23%），因为跨通道 stride 跨页 + 36 B 散写打散 cache。
- *
- * 现在的做法：先把该层输入按 8×8 分块转成 HWC（buf[p*C+c]），再 im2col。
- * HWC 下固定 (ky,kx) 的 C 个通道是**连续**的，im2col 退化为 9 段连续拷贝
+ * 先把该层输入按 8×8 分块转成 HWC（buf[p*C+c]），再 im2col。
+ * HWC 下固定 (ky,kx) 的 C 个通道是连续的，im2col 退化为 9 段连续拷贝
  * + vfmax，全程 vle32/vse32 无 gather/scatter。
- *
- * 为什么不做「全管线 HWC」：GEMM 是 C[oc][p] = W[oc][k]·A[k][p] 取向，
- * p 方向向量化（32 lane）才有一份 imc 喂 4 个 oc 的复用；若输出要 HWC 就得
- * 在 epilogue 散写 y[p*OC+oc]（跨 OC 的 64 B 行只写 16 B，跨 oc 块又隔很远），
- * 或把 p 提到外层让同 p 块的所有 oc 连续写 —— 后者正是 V45 实测慢 27% 的 pblk。
- * 故激活张量仍全程 CHW，只付一次「输入转置」（实测 3×3 层 7.13 ms，占
- * im2col 总量 28%），换来 im2col 2.05×（含转置的净加速，微基准实测）。
- *
- * k 排列：HWC 下 k = (ky*KW+kx)*C + ic（tap-major）。GEMM 与 k 排列无关
- * （int32 加法可交换/结合），权重同步重排为同一顺序 ⇒ 逐位不变。
+ * k 排列：HWC 下 k = (ky*KW+kx)*C + ic（tap-major）。
  * ================================================================ */
 
-/* VLLM_YOLO_HWC=0 关闭 HWC 输入路径（逃生舱）：回到 V49 的 CHW im2col，
- * 两者必须位级一致（imc 逐字节 + rowsc 逐位）。 */
-static int yolo_hwc_on(void) {
-    static int g = -1;
-    if (g < 0) {
-        const char *e = getenv("VLLM_YOLO_HWC");
-        g = (!e || e[0] == '\0' || e[0] != '0');
-    }
-    return g;
-}
-
 /* CHW [C][H*W] → HWC [H*W][C]，8×8 分块：目的侧连续写、源侧 8 条流，
- * 使两侧都落在少数 cache 行内（朴素逐元素转置会两边都打穿）。
- *
- * NOTE (V56)：试过 RVV 版「每像素一条 vlse32 跨 8 通道 + 一条 vse32 连续写」，
- * 位级正确但板端 CHW→HWC 39.5ms vs 标量 25ms（**慢 58%**）⇒ 已回退。
- * 根因：vlse32 每 lane 落在不同 cache 行（8 条流/指令），硬件不合并；
- * 标量 8×8 块式读同一批行反而命中更好。勿重犯。 */
+ * 使两侧都落在少数 cache 行内（朴素逐元素转置会两边都打穿）。 */
 static void yolo_chw2hwc_blocked(const float *src, float *dst, int C, int H, int W) {
     const int P = H * W;
     const int TB = 8;
@@ -704,10 +571,8 @@ static void yolo_chw2hwc_blocked(const float *src, float *dst, int C, int H, int
 
 /* im2col（HWC 输入）→ int8，k = tap*C + ic。
  * 逐像素对 9 个 tap 各拷 C 个连续 float（vle32→vse32），同时求 |·| 最大值。
- * max 是精确比较、量化式与 CHW 路径完全相同 ⇒ 与 CHW 版 imc/rowsc 位级一致。
- *
- * V56：packed != NULL 时**不落 imc**，而是把量化结果直接按 IME 的 B 布局散写
- * （bpack[nb][kb][t][r][8]）。省掉「写 imc + 事后 repack」两遍 P×Kp 的读写。 */
+ * packed != NULL 时不落 imc，而是把量化结果直接按 IME 的 B 布局散写
+ * （bpack[nb][kb][t][r][8]）。 */
 static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
                               int KH, int KW, int sh, int sw, int ph, int pw,
                               int OH, int OW, int K, int Kp,
@@ -734,7 +599,9 @@ static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
             }
         }
     }
-    const float quant_magic = 12582912.0f;   /* 2^23，见 CHW 版注释 */
+#if !ST_HAVE_RVV
+    const float quant_magic = 12582912.0f;   /* 2^23 */
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if((long)OH * OW > 1024)
@@ -765,34 +632,28 @@ static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
                     const float *src = x + ((size_t)iy * W + ix) * C;
                     float t = 0.f;
 #if ST_HAVE_RVV
-                    if (yolo_rvv_on()) {
-                        const size_t vmaxf = __riscv_vsetvlmax_e32m1();
-                        /* 必须按 vmaxf 初始化全部 lane：vfmax 是逐 lane 运算，
-                         * 只写 lane0 会让其余 lane 的寄存器残留值混进 max
-                         * （曾导致 HWC 输出不可复现，见 V50）。 */
-                        vfloat32m1_t vm1 = __riscv_vfmv_v_f_f32m1(0.0f, vmaxf);
-                        size_t lastvl = 1;
-                        for (int ic = 0; ic < C; ic += (int)vmaxf) {
-                            const size_t rem = (size_t)(C - ic);
-                            const size_t vl = __riscv_vsetvl_e32m1(rem < vmaxf ? rem : vmaxf);
-                            lastvl = vl;
-                            vfloat32m1_t v = __riscv_vle32_v_f32m1(src + ic, vl);
-                            __riscv_vse32_v_f32m1(dst + ic, v, vl);
-                            vm1 = __riscv_vfmax_vv_f32m1(
-                                      vm1, __riscv_vfabs_v_f32m1(v, vl), vl);
-                        }
-                        t = __riscv_vfmv_f_s_f32m1_f32(
-                                __riscv_vfredmax_vs_f32m1_f32m1(
-                                    vm1, __riscv_vfmv_v_f_f32m1(0.0f, vmaxf), lastvl));
-                    } else
-#endif
-                    {
-                        for (int ic = 0; ic < C; ic++) {
-                            float v = src[ic];
-                            dst[ic] = v;
-                            float av = fabsf(v); if (av > t) t = av;
-                        }
+                    const size_t vmaxf = __riscv_vsetvlmax_e32m1();
+                    vfloat32m1_t vm1 = __riscv_vfmv_v_f_f32m1(0.0f, vmaxf);
+                    size_t lastvl = 1;
+                    for (int ic = 0; ic < C; ic += (int)vmaxf) {
+                        const size_t rem = (size_t)(C - ic);
+                        const size_t vl = __riscv_vsetvl_e32m1(rem < vmaxf ? rem : vmaxf);
+                        lastvl = vl;
+                        vfloat32m1_t v = __riscv_vle32_v_f32m1(src + ic, vl);
+                        __riscv_vse32_v_f32m1(dst + ic, v, vl);
+                        vm1 = __riscv_vfmax_vv_f32m1(
+                                  vm1, __riscv_vfabs_v_f32m1(v, vl), vl);
                     }
+                    t = __riscv_vfmv_f_s_f32m1_f32(
+                            __riscv_vfredmax_vs_f32m1_f32m1(
+                                vm1, __riscv_vfmv_v_f_f32m1(0.0f, vmaxf), lastvl));
+#else
+                    for (int ic = 0; ic < C; ic++) {
+                        float v = src[ic];
+                        dst[ic] = v;
+                        float av = fabsf(v); if (av > t) t = av;
+                    }
+#endif
                     if (t > mx) mx = t;
                 }
             }
@@ -800,30 +661,27 @@ static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
             const float inv = 1.f / s;
             if (Kp > K) memset(arow + K, 0, (size_t)(Kp - K));
 #if ST_HAVE_RVV
-            if (yolo_rvv_on()) {
-                const size_t vmax4 = __riscv_vsetvlmax_e32m4();
-                for (int j = 0; j < K; j += (int)vmax4) {
-                    const size_t rem = (size_t)(K - j);
-                    const size_t vl = __riscv_vsetvl_e32m4(rem < vmax4 ? rem : vmax4);
-                    vfloat32m4_t f = __riscv_vle32_v_f32m4(row + j, vl);
-                    f = __riscv_vfmul_vf_f32m4(f, inv, vl);
-                    f = __riscv_vfmax_vf_f32m4(f, -127.0f, vl);
-                    f = __riscv_vfmin_vf_f32m4(f,  127.0f, vl);
-                    vint32m4_t q = __riscv_vfcvt_x_f_v_i32m4(f, vl);
-                    vint16m2_t q16 = __riscv_vncvt_x_x_w_i16m2(q, vl);
-                    vint8m1_t q8 = __riscv_vncvt_x_x_w_i8m1(q16, vl);
-                    __riscv_vse8_v_i8m1(arow + j, q8, vl);
-                }
-            } else
-#endif
-            {
-#pragma omp simd
-                for (int j = 0; j < K; j++) {
-                    int q = (int)(row[j] * inv + quant_magic) - 12582912;
-                    if (q > 127) q = 127; else if (q < -127) q = -127;
-                    arow[j] = (int8_t)q;
-                }
+            const size_t vmax4 = __riscv_vsetvlmax_e32m4();
+            for (int j = 0; j < K; j += (int)vmax4) {
+                const size_t rem = (size_t)(K - j);
+                const size_t vl = __riscv_vsetvl_e32m4(rem < vmax4 ? rem : vmax4);
+                vfloat32m4_t f = __riscv_vle32_v_f32m4(row + j, vl);
+                f = __riscv_vfmul_vf_f32m4(f, inv, vl);
+                f = __riscv_vfmax_vf_f32m4(f, -127.0f, vl);
+                f = __riscv_vfmin_vf_f32m4(f,  127.0f, vl);
+                vint32m4_t q = __riscv_vfcvt_x_f_v_i32m4(f, vl);
+                vint16m2_t q16 = __riscv_vncvt_x_x_w_i16m2(q, vl);
+                vint8m1_t q8 = __riscv_vncvt_x_x_w_i8m1(q16, vl);
+                __riscv_vse8_v_i8m1(arow + j, q8, vl);
             }
+#else
+#pragma omp simd
+            for (int j = 0; j < K; j++) {
+                int q = (int)(row[j] * inv + quant_magic) - 12582912;
+                if (q > 127) q = 127; else if (q < -127) q = -127;
+                arow[j] = (int8_t)q;
+            }
+#endif
             if (packed) {
                 int8_t *dst = packed + (size_t)(pp >> 4) * kb_n * 128 +
                               ((pp >> 2) & 3) * 32 + (pp & 3) * 8;
@@ -854,33 +712,7 @@ static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
  * 返回 1 = 已处理；0 = 不适用（调用方回退标量 yconv_q8，J-CPU-4 显式）。 */
 
 #if ST_HAVE_RVV
-/* ---- V51：向量化 SiLU 用的快速 exp（近似，**非位级等价**） ----
- *
- * 背景：V51 实测点积内核 63.4ms 已是最优形态，但 epilogue 里 SiLU 用标量
- * `expf` 落栈逐元素算，占 29.6ms（端到端 156ms 的 19%）。RVV 无逐位等价于
- * libm `expf` 的指令，只能改用多项式近似 ⇒ **此路径放弃与标量实现的位级
- * 一致**（本项目此前所有内核都以位级对拍为验收门，这一处是唯一例外）。
- *
- * 实现：exp(x) = 2^n · 2^f，Cody-Waite 两段 ln2 归约 + 2^f 的 7 阶 Taylor。
- * 相对误差 ~1e-7（float32 已接近 1ulp）。参数先夹到 [-87, 88]，保证
- * n+127 ∈ [1, 254] 不溢出指数域（SiLU 里 x 是 -t，t 大负时 exp 本应为 +inf，
- * 夹紧后得到有限大值，最终 t/大数 → -0，与精确路径同向）。
- *
- * 逃生舱/开关：**默认 1 = 近似**（V56 起改为默认；256 稳态从 184.7→141.4ms，
- * 见 V56）。`VLLM_YOLO_SILU=0` 回到精确路径（标量 expf + 向量除法，与参考
- * 逐位一致；vfdiv.vv 与 fdiv.s 实测逐元素 0 差异，性能差异在噪声内）。
- * 注意：近似路径**放弃与标量参考的位级一致**，这是本项目唯一一处例外；
- * 误差门见 V52（整网输出会偏，detections 需另行验收）。
- */
-static int yolo_silu_fast(void) {
-    static int g = -1;
-    if (g < 0) {
-        const char *e = getenv("VLLM_YOLO_SILU");
-        g = !(e && e[0] == '0');   /* 缺省开；显式 VLLM_YOLO_SILU=0 关 */
-    }
-    return g;
-}
-
+/* ---- 向量化 SiLU 快速 exp（Cody-Waite 两段 ln2 归约 + 7 阶 Taylor，唯一默认） ---- */
 static inline vfloat32m4_t yolo_vexp_f32m4(vfloat32m4_t x, size_t vl) {
     const float LOG2E = 1.4426950408889634f;
     const float LN2HI = 6.93145751953125e-1f;    /* ln2 高位（尾数低 12 位为 0） */
@@ -891,9 +723,6 @@ static inline vfloat32m4_t yolo_vexp_f32m4(vfloat32m4_t x, size_t vl) {
     vfloat32m4_t nf = __riscv_vfcvt_f_x_v_f32m4(n, vl);
     vfloat32m4_t r = __riscv_vfnmsub_vf_f32m4(nf, LN2HI, x, vl);
     r = __riscv_vfnmsub_vf_f32m4(nf, LN2LO, r, vl);
-    /* 2^f ≈ 1 + r + r²/2 + ... + r⁷/5040，|r| ≤ ln2/2。
-     * 阶数依据（实测，见 tools/yolo/test_vexp.c）：5 阶时 max 相对误差
-     * 3.29e-6（= 截断项 r⁶/720），7 阶降到 ~1e-7（float32 的 1ulp 量级）。 */
     vfloat32m4_t p = __riscv_vfmv_v_f_f32m4(1.0f / 5040.0f, vl);
     p = __riscv_vfmadd_vv_f32m4(p, r, __riscv_vfmv_v_f_f32m4(1.0f / 720.0f, vl), vl);
     p = __riscv_vfmadd_vv_f32m4(p, r, __riscv_vfmv_v_f_f32m4(1.0f / 120.0f, vl), vl);
@@ -907,8 +736,6 @@ static inline vfloat32m4_t yolo_vexp_f32m4(vfloat32m4_t x, size_t vl) {
     return __riscv_vfmul_vv_f32m4(p, __riscv_vreinterpret_v_i32m4_f32m4(e), vl);
 }
 
-/* V56：yolo_vexp_f32m4 的 m2 版本（IME epilogue 一次只处理 16 lane）。
- * 逐元素运算与 m4 版完全相同（同顺序、同常量）⇒ 与 m4 版位级同值。 */
 static inline vfloat32m2_t yolo_vexp_f32m2(vfloat32m2_t x, size_t vl) {
     const float LOG2E = 1.4426950408889634f;
     const float LN2HI = 6.93145751953125e-1f;
@@ -932,22 +759,11 @@ static inline vfloat32m2_t yolo_vexp_f32m2(vfloat32m2_t x, size_t vl) {
     return __riscv_vfmul_vv_f32m2(p, __riscv_vreinterpret_v_i32m2_f32m2(e), vl);
 }
 
-/* RISC-V RVV：p 方向向量化 int8 GEMM（**无归约**）。
- *
- * 与既有「k 方向向量化 + vredsum 归约」的关键区别：
- *   - acc 的 lane 直接对应 32 个**空间位置** ⇒ 结束时无需水平归约；
- *   - 一次 vle8/vlse8 + 一次 vsext 被 4 个 oc 共享 ⇒ im2col 读次数降到 1/4；
- *   - 用 vwmacc.vx（i16×i16→i32 融合乘加）替掉 vwmul+vwadd 两条。
- * 对 Kp=32 的小层尤其关键：旧路径每 4 个位置要付 4 次 32-lane 树归约。
- *
- * 位级：int32 精确累加（整数加法可任意重排）+ 与标量逐字相同的反量化/SiLU 表达式
- *       ⇒ 输出与标量路径**逐位同值**（板端 on/off 对拍 FULL MATCH）。
- * OC4 必须是 4 的倍数；余数通道由调用方走标量。 */
+/* RISC-V RVV：p 方向向量化 int8 GEMM（无归约，OC 非 8 倍数或非 IME 时的最优 RVV 内核）。 */
 static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
                             const int8_t *imc, const float *rowsc,
                             int OC4, int Kp, int P, int act, float *y) {
     const size_t vmax = __riscv_vsetvlmax_e8m1();   /* VLEN/8 */
-    const int silu_fast = yolo_silu_fast();
     const long nb = (long)OC4 / 4;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(nb > 2)
@@ -973,8 +789,6 @@ static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
             vint32m4_t a1 = a0, a2 = a0, a3 = a0;
             const int8_t *base = imc + (size_t)p0 * Kp;
             for (int k = 0; k < Kp; k++) {
-                /* 行主序：p0 块（32 行 × Kp 字节）整体在 L1，跨步 load 命中率高；
-                 * 列主序实测反而更慢（k 循环每次跨 P 字节，大 Kp 层反复 cache miss）。 */
                 const vint8m1_t xv =
                     __riscv_vlse8_v_i8m1(base + k, (ptrdiff_t)Kp, vmax);
                 const vint16m2_t x16 = __riscv_vsext_vf2_i16m2(xv, vmax);
@@ -984,10 +798,6 @@ static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
                 a3 = __riscv_vwmacc_vx_i32m4(a3, (int16_t)w3[k], x16, vmax);
             }
             const vfloat32m4_t rs = __riscv_vle32_v_f32m4(rowsc + p0, vmax);
-            /* RVV 类型是 sizeless，不能放进数组 ⇒ 用宏逐个展开。
-             * 反量化表达式与标量路径逐字相同（含运算顺序）⇒ 位级同值。
-             * SiLU 两档：silu_fast=1 用 yolo_vexp_f32m4（向量多项式，**非位级等价**，
-             * 见函数头注释）；=0 落栈走标量 expf（与参考逐位一致，VLLM_YOLO_SILU=0）。 */
 #define YOLO_RVV_EPI(ACC, DSTP, SV, BV) do {                                  \
                 vfloat32m4_t f_ = __riscv_vfmul_vv_f32m4(                     \
                                       __riscv_vfcvt_f_x_v_f32m4(ACC, vmax),   \
@@ -995,24 +805,10 @@ static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
                                       vmax);                                  \
                 f_ = __riscv_vfadd_vf_f32m4(f_, BV, vmax);                    \
                 if (act == YACT_SILU) {                                       \
-                    float t_[vmax];                                           \
-                    if (silu_fast) {                                          \
-                        vfloat32m4_t e_ = yolo_vexp_f32m4(                    \
-                                              __riscv_vfneg_v_f32m4(f_, vmax), vmax); \
-                        f_ = __riscv_vfdiv_vv_f32m4(                          \
-                                 f_, __riscv_vfadd_vf_f32m4(e_, 1.0f, vmax), vmax); \
-                    } else {                                                  \
-                        /* 精确路径：expf 仍是标量（RVV 无逐位等价 exp），但把 32 次
-                         * 标量除法换成 vfdiv.vv —— 板端实测 vfdiv.vv 与 fdiv.s
-                         * **逐元素完全相同（0/100001 差异）**，故仍与参考位级一致。
-                         * 栈数组大小 = vmax = VLEN/8；VLEN=256 时为 32。 */    \
-                        __riscv_vse32_v_f32m4(t_, f_, vmax);                   \
-                        for (size_t i_ = 0; i_ < vmax; i_++)                  \
-                            t_[i_] = expf(-t_[i_]);                            \
-                        vfloat32m4_t e_ = __riscv_vle32_v_f32m4(t_, vmax);     \
-                        f_ = __riscv_vfdiv_vv_f32m4(                           \
-                                 f_, __riscv_vfadd_vf_f32m4(e_, 1.0f, vmax), vmax); \
-                    }                                                         \
+                    vfloat32m4_t e_ = yolo_vexp_f32m4(                        \
+                                          __riscv_vfneg_v_f32m4(f_, vmax), vmax); \
+                    f_ = __riscv_vfdiv_vv_f32m4(                              \
+                             f_, __riscv_vfadd_vf_f32m4(e_, 1.0f, vmax), vmax); \
                 }                                                             \
                 __riscv_vse32_v_f32m4(DSTP, f_, vmax);                        \
             } while (0)
@@ -1022,7 +818,7 @@ static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
             YOLO_RVV_EPI(a3, y3 + p0, s3, b3);
 #undef YOLO_RVV_EPI
         }
-        /* p 尾部（< VLMAX）：逐位置标量，表达式与参考实现相同 */
+        /* p 尾部（< VLMAX）：逐位置标量 */
         for (; p0 < P; p0++) {
             const int8_t *ir = imc + (size_t)p0 * Kp;
             float *dst[4] = { y0, y1, y2, y3 };
@@ -1041,25 +837,13 @@ static void yconv_dot_rvv_p(const int8_t *Wq, const float *cs, const float *b,
 }
 
 /* ================================================================
- * V56：IME（vmadot）卷积路径 —— K1 的 s8×s8 外积单元
- *
- * 语义（板端 ime_layout_probe / ime_signed_probe 实测反推，详见
- * tools/yolo/bench_ime_conv.c 头注释）：
- *   funct3=3 ⇒ s8×s8（有符号直通，**不需要** ORT 那套 u8 零点补偿）
- *   一条 vmadot = 4(M)×4(N)×8(K)，vd 为 m2，lane = q*4 + r
- *   8 条（2 个 A 向量 × 4 个 B 向量）= 8(M)×16(N)×8(K) = 1024 MAC
+ * V56：IME（vmadot）卷积路径 —— SpacemiT K1 的 s8×s8 外积单元（自动探测启用）
  *
  * 数据布局：
  *   A（权重）[mt][kb][mv][32]：byte[q*8+j] = W[mt*8+mv*4+q][kb*8+j]
  *   B（激活）[nb][kb][t][32] ：byte[r*8+j] = imc[nb*16+t*4+r][kb*8+j]
  *
- * 位级：acc 是精确 int32（与 vwmacc.vx 路径逐位同值），epilogue 用与生产
- *   逐字相同的表达式；-ffp-contract=off 由构建脚本保证（否则 fma 收缩会
- *   让 float 结果偏 1ulp，实测 model.0 有 123012/409600 处差异）。
- *
- * 硬约束：vmadot 只在 hart0-3 可用（hart4-7 执行直接 SIGILL）⇒ 必须绑核，
- *   且用完把调用线程的 affinity 还原，避免污染后续算子。
- * 开关：VLLM_YOLO_IME=1（默认关）。
+ * 硬约束：vmadot 只在 hart0-3 可用 ⇒ 必须绑核并在退出时还原。
  * ================================================================ */
 #define YIME_STR(x) #x
 #define YIME_VMADOT(vd, vs1, vs2)                                                \
@@ -1070,8 +854,18 @@ static int yolo_ime_on(void) {
     static int g = -1;
 #ifdef _OPENMP
     if (g < 0) {
-        const char *e = getenv("VLLM_YOLO_IME");
-        g = (e && e[0] == '1') ? 1 : 0;
+        g = 0;
+        FILE *fp = fopen("/proc/cpuinfo", "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "_ime") || strstr(line, "spacemit") || strstr(line, "SpacemiT")) {
+                    g = 1;
+                    break;
+                }
+            }
+            fclose(fp);
+        }
     }
     return g;
 #else
@@ -1170,7 +964,6 @@ static void yconv_ime(const int8_t *apack, const int8_t *bpack,
                       const float *cs, const float *b, const float *rowsc,
                       int OC, int Kp, int P, int act, float *y) {
     const int mt_n = OC / 8, kb_n = Kp / 8, nb_n = (P + 15) / 16;
-    const int silu_fast = yolo_silu_fast();
     int nt = 4;
 #ifdef _OPENMP
     { int v = omp_get_max_threads(); if (v < nt) nt = v; }
@@ -1214,20 +1007,10 @@ static void yconv_ime(const int8_t *apack, const int8_t *bpack,
                                 __riscv_vle32_v_f32m2(rowsc + px0, vl), cs[oc], vl), vl);
                         f = __riscv_vfadd_vf_f32m2(f, b ? b[oc] : 0.f, vl);
                         if (act == YACT_SILU) {
-                            float t_[16];
-                            if (silu_fast) {
-                                vfloat32m2_t e_ = yolo_vexp_f32m2(
-                                                      __riscv_vfneg_v_f32m2(f, vl), vl);
-                                f = __riscv_vfdiv_vv_f32m2(
-                                        f, __riscv_vfadd_vf_f32m2(e_, 1.0f, vl), vl);
-                            } else {
-                                __riscv_vse32_v_f32m2(t_, f, vl);
-                                for (size_t i_ = 0; i_ < vl; i_++)
-                                    t_[i_] = expf(-t_[i_]);
-                                vfloat32m2_t e_ = __riscv_vle32_v_f32m2(t_, vl);
-                                f = __riscv_vfdiv_vv_f32m2(
-                                        f, __riscv_vfadd_vf_f32m2(e_, 1.0f, vl), vl);
-                            }
+                            vfloat32m2_t e_ = yolo_vexp_f32m2(
+                                                  __riscv_vfneg_v_f32m2(f, vl), vl);
+                            f = __riscv_vfdiv_vv_f32m2(
+                                    f, __riscv_vfadd_vf_f32m2(e_, 1.0f, vl), vl);
                         }
                         __riscv_vse32_v_f32m2(y + (size_t)oc * P + px0, f, vl);
                     }
@@ -1244,6 +1027,54 @@ static void yconv_ime(const int8_t *apack, const int8_t *bpack,
 
 /* V56 诊断：im2col 拆成「CHW→HWC 转置」和「gather+量化」两段分别累计 */
 static double yacc_trans = 0.0, yacc_gather = 0.0;
+
+/* 阶段 P1：双向可逆权重布局转换辅助函数（保障任何 layout 与任何逃生舱组合 100% 兼容） */
+static void yconv_unpack_ime_to_hwc(int8_t *dst_hwc, const int8_t *src_ime, int OC, int Kp) {
+    const int mt_n = OC / 8, kb_n = Kp / 8;
+    for (int mt = 0; mt < mt_n; mt++)
+        for (int kb = 0; kb < kb_n; kb++)
+            for (int mv = 0; mv < 2; mv++)
+                for (int q = 0; q < 4; q++)
+                    memcpy(dst_hwc + (size_t)(mt * 8 + mv * 4 + q) * Kp + kb * 8,
+                           src_ime + ((size_t)mt * kb_n + kb) * 64 + mv * 32 + q * 8, 8);
+}
+
+static void yconv_unpack_hwc_to_chw(int8_t *dst_chw, const int8_t *src_hwc,
+                                    int OC, int C, int KH, int KW, int Kp) {
+    const int K = C * KH * KW, KHW = KH * KW;
+    for (int oc = 0; oc < OC; oc++) {
+        int8_t *do_row = dst_chw + (size_t)oc * K;
+        const int8_t *wo = src_hwc + (size_t)oc * Kp;
+        for (int ic = 0; ic < C; ic++)
+            for (int tap = 0; tap < KHW; tap++)
+                do_row[(size_t)ic * KHW + tap] = wo[(size_t)tap * C + ic];
+    }
+}
+
+/* 获取 CHW [OC, K] 布局的 int8 权重指针（供标量 yconv_q8 逃生舱或分组卷积回退） */
+static const int8_t *yconv_ensure_chw_q8(StYoloModel *m, uint32_t cid,
+                                         int OC, int C, int KH, int KW, int G) {
+    const uint32_t lay = m->clayout[cid];
+    if (lay == VQF_LAYOUT_LEGACY) return m->cq[cid];
+    if (m->cq_chw[cid]) return m->cq_chw[cid];
+    const int icg = C / (G > 0 ? G : 1);
+    const int K = icg * KH * KW;
+    const int Kp = (K + 31) & ~31;
+    int8_t *chw = (int8_t *)calloc((size_t)OC * K, 1);
+    if (!chw) return m->cq[cid];
+    if (lay == VQF_LAYOUT_CONV_HWC_TAP) {
+        yconv_unpack_hwc_to_chw(chw, m->cq[cid], OC, icg, KH, KW, Kp);
+    } else if (lay == VQF_LAYOUT_CONV_IME_K1) {
+        int8_t *hwc_tmp = (int8_t *)calloc((size_t)OC * Kp, 1);
+        if (hwc_tmp) {
+            yconv_unpack_ime_to_hwc(hwc_tmp, m->cq[cid], OC, Kp);
+            yconv_unpack_hwc_to_chw(chw, hwc_tmp, OC, icg, KH, KW, Kp);
+            free(hwc_tmp);
+        }
+    }
+    m->cq_chw[cid] = chw;
+    return chw;
+}
 
 /* V45 试过「p 外层 + oc 内层」GEMM 分块（pblk），想让 imc 的 32×Kp 块驻留 L1
  * 被所有 oc 共享。板端实测（gcc13，yolov8n/bus.jpg，8 线程）：oc-outer 609ms vs
@@ -1263,42 +1094,63 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
     if (K <= 0 || P <= 0 || OC <= 0) return 0;
     /* V50：im2col 走 HWC 输入（k = tap*C + ic）。Kp 补齐段两种排列都在尾部
      * （K 之后全 0），故 GEMM 侧无需区分。 */
-    const int hwc = yolo_hwc_on() ? 1 : 0;
+    const int hwc = 1;
+    const uint32_t lay = m->clayout[cid];
 
-    /* 惰性构建补齐到 Kp 的 int8 权重 [OC][Kp]（行主序，行距 Kp）。
-     * HWC 下重排为 tap-major：nw[oc][tap*C + ic] = src[oc][ic*KH*KW + tap]。 */
+    /* 阶段 P1：离线预打包零拷贝直挂 + 逃生舱全兼容构建 [OC][Kp]。
+     * [SHS 公理映射: blas_matrix_block_natural_isomorphism + tensor_5fcontraction_02096446]
+     * 当 hwc==1 且 lay == VQF_LAYOUT_CONV_HWC_TAP(4) 时，直接零拷贝挂载 m->cq[cid]！ */
     if (!m->nw[cid]) {
-        int8_t *w = (int8_t *)calloc((size_t)OC * Kp, 1);
-        if (!w) return 0;
-        const int8_t *src = m->cq[cid];
-        if (hwc) {
-            for (int oc = 0; oc < OC; oc++) {
-                int8_t *wo = w + (size_t)oc * Kp;
-                const int8_t *so = src + (size_t)oc * K;
-                for (int ic = 0; ic < C; ic++)
-                    for (int tap = 0; tap < KH * KW; tap++)
-                        wo[(size_t)tap * C + ic] = so[(size_t)ic * KH * KW + tap];
-            }
+        if (hwc && lay == VQF_LAYOUT_CONV_HWC_TAP) {
+            m->nw[cid] = (int8_t *)m->cq[cid];
+            m->nw_owned[cid] = 0;   /* 零拷贝直指 m->blob，禁止 free */
         } else {
-            for (int oc = 0; oc < OC; oc++)
-                memcpy(w + (size_t)oc * Kp, src + (size_t)oc * K, (size_t)K);
+            int8_t *w = (int8_t *)calloc((size_t)OC * Kp, 1);
+            if (!w) return 0;
+            if (lay == VQF_LAYOUT_CONV_IME_K1) {
+                /* 从 IME pack_a 逆向还原到 HWC [OC][Kp] */
+                yconv_unpack_ime_to_hwc(w, m->cq[cid], OC, Kp);
+                if (!hwc) {
+                    const int8_t *chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+                    memset(w, 0, (size_t)OC * Kp);
+                    for (int oc = 0; oc < OC; oc++)
+                        memcpy(w + (size_t)oc * Kp, chw + (size_t)oc * K, (size_t)K);
+                }
+            } else if (lay == VQF_LAYOUT_CONV_HWC_TAP) {
+                /* lay==4 但 hwc==0（逃生舱关闭 HWC）：逆向解包回 CHW 并补 0 到 Kp */
+                const int8_t *chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+                for (int oc = 0; oc < OC; oc++)
+                    memcpy(w + (size_t)oc * Kp, chw + (size_t)oc * K, (size_t)K);
+            } else {
+                /* lay==0 (legacy CHW [OC][K]) */
+                const int8_t *src = m->cq[cid];
+                if (hwc) {
+                    for (int oc = 0; oc < OC; oc++) {
+                        int8_t *wo = w + (size_t)oc * Kp;
+                        const int8_t *so = src + (size_t)oc * K;
+                        for (int ic = 0; ic < C; ic++)
+                            for (int tap = 0; tap < KH * KW; tap++)
+                                wo[(size_t)tap * C + ic] = so[(size_t)ic * KH * KW + tap];
+                    }
+                } else {
+                    for (int oc = 0; oc < OC; oc++)
+                        memcpy(w + (size_t)oc * Kp, src + (size_t)oc * K, (size_t)K);
+                }
+            }
+            m->nw[cid] = w;
+            m->nw_owned[cid] = 1;
         }
-        m->nw[cid] = w;
     }
 
-    /* V51 试过把 imc / rowsc 改为跨层复用（省每层 malloc 的首次触页）：
-     * 板端 im2col 48.8→41.5ms，但点积口径同步 +7ms、elem 11.5→14.0ms，
-     * image_total 190.5→192.8ms（略差）⇒ 净收益为零，已回退，勿重复。
-     * 残余耗时不在这些缓冲，见指导书 V51 的分项。 */
     const int8_t *Wq = m->nw[cid];
     const float  *cs = m->cs[cid];
 
     /* V56：先决定是否走 IME（要求 hwc 输入、OC 为 8 的倍数、scratch 就绪）。
-     * 走 IME 时 im2col 把量化结果直接写进打包缓冲（不落 imc），rowsc 用跨层
-     * scratch，两层都不再每层 malloc 首次触页。 */
+     * 走 IME 时：若 lay==VQF_LAYOUT_CONV_IME_K1(5)，st_yolo_load 已将 m->iw[cid]
+     * 零拷贝直挂到 m->blob（iw_owned=0），省去运行期 yime_pack_a 分配与重排！ */
     int use_ime = 0;
 #if ST_HAVE_RVV
-    if (hwc && yolo_rvv_on() && yolo_ime_on() && (OC & 7) == 0) {
+    if (yolo_ime_on() && (OC & 7) == 0) {
         const int nb_n = (P + 15) / 16;
         const size_t need = (size_t)nb_n * Kp * 16;   /* 每 nb 块 = kb_n*128 = Kp*16 */
         if (need > m->ib_cap) {
@@ -1309,7 +1161,10 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
             float *nrs = (float *)realloc(m->rsc, (size_t)P * sizeof(float));
             if (nrs) { m->rsc = nrs; m->rsc_cap = (size_t)P; }
         }
-        if (!m->iw[cid]) m->iw[cid] = yime_pack_a(Wq, OC, Kp);
+        if (!m->iw[cid]) {
+            m->iw[cid] = yime_pack_a(Wq, OC, Kp);
+            m->iw_owned[cid] = (m->iw[cid] != NULL) ? 1 : 0;
+        }
         if (m->ib && m->ib_cap >= need && m->rsc && m->rsc_cap >= (size_t)P && m->iw[cid]) {
             /* 最后一个不完整 nb 块（像素 P..nb_n*16-1）不会被写 ⇒ 先清零残留 */
             const size_t blk = (size_t)(P / 16) * Kp * 16;
@@ -1325,8 +1180,8 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
 
     double _t0 = ynow();
     int i2c_rc;
-    if (hwc) {
-        /* 输入 CHW → HWC（scratch 复用，避免每层 malloc/free 首次触页）。 */
+    /* 输入 CHW → HWC（scratch 复用，避免每层 malloc/free 首次触页）。 */
+    {
         const size_t need = (size_t)C * H * W;
         if (need > m->hx_cap) {
             float *nb = (float *)realloc(m->hx, need * sizeof(float));
@@ -1339,10 +1194,6 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
         i2c_rc = yolo_im2col_q8_hwc(m->hx, C, H, W, KH, KW, sh, sw, ph, pw,
                                     OH, OW, K, Kp, imc, rowsc, use_ime ? m->ib : NULL);
         yacc_gather += ynow() - _tt;
-    } else {
-        i2c_rc = yolo_im2col_q8_row(x, C, H, W, KH, KW, sh, sw, ph, pw,
-                                    OH, OW, K, Kp, imc, rowsc);
-        yacc_gather += ynow() - _t0;
     }
     if (i2c_rc != 0) {
         if (!use_ime) { free(imc); free(rowsc); }
@@ -1351,40 +1202,36 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
     m->t_i2c += ynow() - _t0;
 
 #if ST_HAVE_RVV
-    /* RISC-V：p 方向向量化路径（无归约）。VLLM_YOLO_RVV=0 时整段跳过，
-     * 落到下面的标量/NEON 参考实现 —— 两者位级同值，可逐字节对拍。 */
-    if (yolo_rvv_on()) {
-        if (use_ime) {
-            const double _t1 = ynow();
-            yconv_ime(m->iw[cid], m->ib, cs, b, rowsc, OC, Kp, P, act, y);
-            const double _t2 = ynow();
-            yime_acc_conv += _t2 - _t1;
-            if (yime_dbg())
-                fprintf(stderr, "[YIME] cid=%u OC=%d Kp=%d P=%d | conv=%.2fms | %.1f G MAC/s\n",
-                        cid, OC, Kp, P, (_t2 - _t1) * 1e3,
-                        (double)OC * P * Kp / ((_t2 - _t1) * 1e9));
-            return 1;   /* imc/rowsc 都是 scratch，无需释放 */
-        }
-        const int oc4 = OC & ~3;
-        if (oc4 > 0)
-            yconv_dot_rvv_p(Wq, cs, b, imc, rowsc, oc4, Kp, P, act, y);
-        for (int oc = oc4; oc < OC; oc++) {   /* OC 非 4 倍数时的余数通道 */
-            const int8_t *wrow = Wq + (size_t)oc * Kp;
-            const float oc_s = cs[oc];
-            const float bias = b ? b[oc] : 0.f;
-            float *yo = y + (size_t)oc * P;
-            for (int p = 0; p < P; p++) {
-                const int8_t *ir = imc + (size_t)p * Kp;
-                int32_t s = 0;
-                for (int k = 0; k < Kp; k++) s += (int32_t)wrow[k] * (int32_t)ir[k];
-                float r = (float)s * (oc_s * rowsc[p]) + bias;
-                if (act == YACT_SILU) r = r / (1.f + expf(-r));
-                yo[p] = r;
-            }
-        }
-        free(imc); free(rowsc);
-        return 1;
+    if (use_ime) {
+        const double _t1 = ynow();
+        yconv_ime(m->iw[cid], m->ib, cs, b, rowsc, OC, Kp, P, act, y);
+        const double _t2 = ynow();
+        yime_acc_conv += _t2 - _t1;
+        if (yime_dbg())
+            fprintf(stderr, "[YIME] cid=%u OC=%d Kp=%d P=%d | conv=%.2fms | %.1f G MAC/s\n",
+                    cid, OC, Kp, P, (_t2 - _t1) * 1e3,
+                    (double)OC * P * Kp / ((_t2 - _t1) * 1e9));
+        return 1;   /* imc/rowsc 都是 scratch，无需释放 */
     }
+    const int oc4 = OC & ~3;
+    if (oc4 > 0)
+        yconv_dot_rvv_p(Wq, cs, b, imc, rowsc, oc4, Kp, P, act, y);
+    for (int oc = oc4; oc < OC; oc++) {   /* OC 非 4 倍数时的余数通道 */
+        const int8_t *wrow = Wq + (size_t)oc * Kp;
+        const float oc_s = cs[oc];
+        const float bias = b ? b[oc] : 0.f;
+        float *yo = y + (size_t)oc * P;
+        for (int p = 0; p < P; p++) {
+            const int8_t *ir = imc + (size_t)p * Kp;
+            int32_t s = 0;
+            for (int k = 0; k < Kp; k++) s += (int32_t)wrow[k] * (int32_t)ir[k];
+            float r = (float)s * (oc_s * rowsc[p]) + bias;
+            if (act == YACT_SILU) r = r / (1.f + expf(-r));
+            yo[p] = r;
+        }
+    }
+    free(imc); free(rowsc);
+    return 1;
 #endif
 
     const int Kp16 = Kp & ~15;              /* Kp 为 32 倍数 ⇒ Kp16 == Kp（k=16 步长尾） */
@@ -1467,27 +1314,18 @@ static void yconv_dispatch(StYoloModel *m, const float *x, int C, int H, int W,
         yconv(x, C, H, W, m->cw[cid], b, OC, KH, KW, sh, sw, ph, pw, G, act, y, OH, OW);
         return;
     }
-    /* Phase 1（K-YOLO-002）：CPU int8 dotprod 卷积（env VLLM_YOLO_CPU_DOTPROD，默认 ON）。
+    /* Phase 1（K-YOLO-002）：CPU int8 dotprod 卷积。
      * 不适用（分组/无 int8 权重等）时显式回退标量 yconv_q8（公理
      * silent_fallback_false_pass，J-CPU-4）。 */
-    {
-        static int g_dp = -1;
-        if (g_dp < 0) {
-            const char *e = getenv("VLLM_YOLO_CPU_DOTPROD");
-            g_dp = (!e || e[0] == '\0' || e[0] != '0');
-        }
-        if (g_dp && yconv_cpu_dotprod(m, x, C, H, W, cid, b, OC, KH, KW, sh, sw,
-                                      ph, pw, G, act, y, OH, OW))
-            return;
-        if (getenv("VLLM_YOLO_CPU_DEBUG"))
-            fprintf(stderr, "[CPU] dotprod n/a cid=%u OC=%d C=%d K=%dx%d G=%d -> scalar\n",
-                    cid, OC, C, KH, KW, G);
-    }
+    if (yconv_cpu_dotprod(m, x, C, H, W, cid, b, OC, KH, KW, sh, sw,
+                          ph, pw, G, act, y, OH, OW))
+        return;
     /* V51 诊断：VLLM_YOLO_SCALAR_PROF=1 时打印回退到标量 yconv_q8 的层
      * （分组 depthwise 与 dotprod 不适用者）及其耗时，用于定位残余耗时归属。 */
     const int prof = getenv("VLLM_YOLO_SCALAR_PROF") != NULL;
     const double t0 = prof ? ynow() : 0.0;
-    yconv_q8(x, C, H, W, m->cq[cid], m->cs[cid], b, OC, KH, KW, sh, sw, ph, pw,
+    const int8_t *wq_chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+    yconv_q8(x, C, H, W, wq_chw, m->cs[cid], b, OC, KH, KW, sh, sw, ph, pw,
              G, act, y, OH, OW);
     if (prof)
         fprintf(stderr, "[SCALAR-CONV] %6.2fms cid=%u C=%d %dx%d k%d g%d oc=%d P=%d act=%d\n",
@@ -1562,14 +1400,200 @@ static void yattn_psa(StYoloModel *m, const float *x, int C, int H, int W,
     free(qkv); free(att); free(vbuf); free(vm); free(out);
 }
 
-/* ---- 槽位 ---- */
-typedef struct { float *buf; int c, h, w; } YSlot;
+/* ---- 槽位与阶段 P3 静态 Arena 规划器 ----
+ * [SHS 公理映射: set_5foperations_91154c82 (集合不交集公理)]
+ * 生命周期区间 L(s_i) ∩ L(s_j) = ∅ 时共享同一连续 Arena 偏移，
+ * 消除每帧 60+ 次独立 malloc/free 与首次触页开销。 */
+typedef struct { float *buf; int c, h, w; int owned; } YSlot;
+
+/* 依据输入尺寸 (ih, iw) 静态推导全图各 slot 形状与生命周期不交集 Arena 偏移 */
+static int yolo_plan_arena(StYoloModel *m, int ih, int iw, YSlot *S) {
+    if (!m->slot_last_use || m->n_slots <= 0) return 0;
+    const int ns = m->n_slots;
+    size_t *s_elems = (size_t *)calloc((size_t)ns, sizeof(size_t));
+    size_t *s_off   = (size_t *)calloc((size_t)ns, sizeof(size_t));
+    int    *s_def   = (int *)calloc((size_t)ns, sizeof(int));
+    if (!s_elems || !s_off || !s_def) {
+        free(s_elems); free(s_off); free(s_def); return 0;
+    }
+    for (int s = 0; s < ns; s++) s_def[s] = -1;
+
+    S[0].c = 3; S[0].h = ih; S[0].w = iw;
+    s_elems[0] = (((size_t)3 * ih * iw) + 15u) & ~15u;   /* 64B (16 float) 对齐 */
+    s_def[0] = 0;
+
+    for (int i = 0; i < m->n_ops; i++) {
+        const YOp *o = &m->ops[i];
+        const uint32_t *P = o->prm;
+        if ((int)o->out >= ns) continue;
+        int oc = 0, oh = 0, ow = 0;
+        switch (o->op) {
+        case YOP_CONV: {
+            uint32_t cid = P[0];
+            int sh = (int)P[2], sw = (int)P[3], ph = (int)P[4], pw = (int)P[5];
+            int KH = (int)P[8], KW = (int)P[9];
+            YSlot *x = &S[o->ins[0]];
+            oc = (cid <= (uint32_t)m->max_cid) ? m->crow[cid] : 0;
+            oh = (x->h + 2 * ph - KH) / sh + 1;
+            ow = (x->w + 2 * pw - KW) / sw + 1;
+            break;
+        }
+        case YOP_CONCAT: {
+            oh = S[o->ins[0]].h; ow = S[o->ins[0]].w;
+            for (uint32_t k = 0; k < o->nin; k++) oc += S[o->ins[k]].c;
+            break;
+        }
+        case YOP_MAXPOOL: {
+            YSlot *x = &S[o->ins[0]];
+            int k = (int)P[0], st = (int)P[1], p = (int)P[2];
+            oc = x->c;
+            oh = (x->h + 2 * p - k) / st + 1;
+            ow = (x->w + 2 * p - k) / st + 1;
+            break;
+        }
+        case YOP_UPSAMPLE: {
+            YSlot *x = &S[o->ins[0]];
+            int sc = (int)P[0];
+            oc = x->c; oh = x->h * sc; ow = x->w * sc;
+            break;
+        }
+        case YOP_SLICE: {
+            YSlot *x = &S[o->ins[0]];
+            oc = (int)P[2] - (int)P[1]; oh = x->h; ow = x->w;
+            break;
+        }
+        case YOP_DETECT: {
+            int nc = (int)P[0], A = 0;
+            for (int s = 0; s < 3; s++) A += S[o->ins[s]].h * S[o->ins[s]].w;
+            oc = 4 + nc; oh = A; ow = 1;
+            break;
+        }
+        case YOP_MATMUL: {
+            uint32_t cid = P[0];
+            YSlot *x = &S[o->ins[0]];
+            oc = (cid <= (uint32_t)m->max_cid) ? m->crow[cid] : 0;
+            oh = x->h; ow = x->w;
+            break;
+        }
+        case YOP_ADD:
+        case YOP_SIGMOID:
+        case YOP_MUL:
+        case YOP_SOFTMAX:
+        case YOP_ATTN_PSA:
+        case YOP_RMSNORM:
+        case YOP_ROPE:
+        case YOP_SWIGLU: {
+            YSlot *x = &S[o->ins[0]];
+            oc = x->c; oh = x->h; ow = x->w;
+            break;
+        }
+        default:
+            free(s_elems); free(s_off); free(s_def);
+            return 0;
+        }
+        if (oc <= 0 || oh <= 0 || ow <= 0) {
+            free(s_elems); free(s_off); free(s_def);
+            return 0;
+        }
+        S[o->out].c = oc; S[o->out].h = oh; S[o->out].w = ow;
+        s_elems[o->out] = (((size_t)oc * oh * ow) + 15u) & ~15u;
+        if (s_def[o->out] < 0) s_def[o->out] = i + 1;
+    }
+
+    /* 线性扫描不交集区间复用分配器（First-Fit Free List + Coalescing） */
+    typedef struct { size_t off, len; int free_at; int active_slot; } YBlk;
+    YBlk *blks = (YBlk *)calloc((size_t)ns * 2 + 4, sizeof(YBlk));
+    if (!blks) { free(s_elems); free(s_off); free(s_def); return 0; }
+    int nblk = 0;
+    size_t total_elems = 0, sum_raw = 0;
+
+    for (int step = 0; step <= m->n_ops; step++) {
+        /* 1. 释放所有在当前算子 (op_idx = step - 1) 之前已结束生命周期
+         *    (last_use < step - 1) 的块并合并相邻空闲块。
+         *    注意：last_use == step - 1 的槽位正是当前算子的输入，绝不可与当前输出重叠！ */
+        for (int b = 0; b < nblk; b++) {
+            if (blks[b].active_slot >= 0 && m->slot_last_use[blks[b].active_slot] < step - 1)
+                blks[b].active_slot = -1;
+        }
+        for (int b = 0; b + 1 < nblk; ) {
+            if (blks[b].active_slot < 0 && blks[b + 1].active_slot < 0 &&
+                blks[b].off + blks[b].len == blks[b + 1].off) {
+                blks[b].len += blks[b + 1].len;
+                memmove(&blks[b + 1], &blks[b + 2], (size_t)(nblk - b - 2) * sizeof(YBlk));
+                nblk--;
+            } else {
+                b++;
+            }
+        }
+        /* 2. 为在当前 step 定义的 slot 分配区间 */
+        int s = (step == 0) ? 0 : (int)m->ops[step - 1].out;
+        if (s < 0 || s >= ns || s_elems[s] == 0) continue;
+        size_t need = s_elems[s];
+        sum_raw += need;
+        int best_b = -1;
+        for (int b = 0; b < nblk; b++) {
+            if (blks[b].active_slot < 0 && blks[b].len >= need) {
+                if (best_b < 0 || blks[b].len < blks[best_b].len) best_b = b;
+            }
+        }
+        if (best_b >= 0) {
+            s_off[s] = blks[best_b].off;
+            if (blks[best_b].len > need) {
+                memmove(&blks[best_b + 2], &blks[best_b + 1],
+                        (size_t)(nblk - best_b - 1) * sizeof(YBlk));
+                blks[best_b + 1].off = blks[best_b].off + need;
+                blks[best_b + 1].len = blks[best_b].len - need;
+                blks[best_b + 1].active_slot = -1;
+                blks[best_b].len = need;
+                nblk++;
+            }
+            blks[best_b].active_slot = s;
+        } else {
+            s_off[s] = total_elems;
+            blks[nblk].off = total_elems;
+            blks[nblk].len = need;
+            blks[nblk].active_slot = s;
+            nblk++;
+            total_elems += need;
+        }
+    }
+    free(blks);
+
+    if (total_elems > m->arena_cap) {
+        float *na = (float *)realloc(m->arena, total_elems * sizeof(float));
+        if (!na) { free(s_elems); free(s_off); free(s_def); return 0; }
+        m->arena = na;
+        m->arena_cap = total_elems;
+        if (getenv("VLLM_YOLO_DEBUG"))
+            fprintf(stderr, "[YOLO-ARENA] planned %d slots: peak=%.2f MB vs raw=%.2f MB (saved %.1f%%)\n",
+                    ns, (double)(total_elems * sizeof(float)) / 1048576.0,
+                    (double)(sum_raw * sizeof(float)) / 1048576.0,
+                    sum_raw > 0 ? 100.0 * (1.0 - (double)total_elems / (double)sum_raw) : 0.0);
+    }
+    for (int s = 0; s < ns; s++) {
+        if (s_elems[s] > 0) {
+            S[s].buf = m->arena + s_off[s];
+            S[s].owned = 0;
+        }
+    }
+    free(s_elems); free(s_off); free(s_def);
+    return 1;
+}
 
 static float *slot_new(YSlot *S, uint32_t s, int c, int h, int w) {
+    S[s].c = c; S[s].h = h; S[s].w = w;
+    if (S[s].buf && !S[s].owned) return S[s].buf;   /* 阶段 P3：静态 Arena 已预分配 */
     size_t n = (size_t)c * h * w;
     S[s].buf = (float *)malloc(n * sizeof(float));
-    S[s].c = c; S[s].h = h; S[s].w = w;
+    S[s].owned = 1;
     return S[s].buf;
+}
+
+static void slots_free(YSlot *S, int n_slots) {
+    if (!S) return;
+    for (int i = 0; i < n_slots; i++)
+        if (S[i].owned && S[i].buf) free(S[i].buf);
+    free(S);
 }
 
 /* ================================================================
@@ -1583,13 +1607,16 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
       cpu_tim = (e && e[0] && e[0] != '0'); }
     m->t_conv = m->t_detect = m->t_attn = m->t_elem = 0.0;
     m->n_conv_ops = m->n_elem_ops = 0;
+#if ST_HAVE_RVV
     yime_acc_conv = 0.0;
+#endif
     yacc_trans = yacc_gather = 0.0;
     if (cpu_tim) {
         m->t_i2c = 0.0;
-        for (int k = 0; k < 12; k++) { m->t_opk[k] = 0.0; m->n_opk[k] = 0; }
+        for (int k = 0; k <= YOP_MAX; k++) { m->t_opk[k] = 0.0; m->n_opk[k] = 0; }
     }
     double _fwd0 = cpu_tim ? ynow() : 0.0;
+    yolo_plan_arena(m, ih, iw, S);
     slot_new(S, 0, 3, ih, iw);
     memcpy(S[0].buf, in, (size_t)3 * ih * iw * sizeof(float));
 
@@ -1725,12 +1752,143 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             for (long long i = 0; i < tot; i++) y[i] = src[i];
             break;
         }
+        case YOP_SOFTMAX: {
+            /* 热带/概率归一化映射：默认沿 channel 维（axis=0）执行数值稳定 Softmax */
+            YSlot *x = &S[o->ins[0]];
+            int axis = (o->nparam >= 1) ? (int)P[0] : 0;
+            float *y = slot_new(S, o->out, x->c, x->h, x->w);
+            if (!y) return -1;
+            const int C = x->c, HW = x->h * x->w;
+            if (axis == 0) {
+                for (int p = 0; p < HW; p++) {
+                    float mx = x->buf[p];
+                    for (int c = 1; c < C; c++) {
+                        float v = x->buf[(size_t)c * HW + p];
+                        if (v > mx) mx = v;
+                    }
+                    float sum = 0.f;
+                    for (int c = 0; c < C; c++) {
+                        float e = expf(x->buf[(size_t)c * HW + p] - mx);
+                        y[(size_t)c * HW + p] = e;
+                        sum += e;
+                    }
+                    float inv = 1.f / sum;
+                    for (int c = 0; c < C; c++) y[(size_t)c * HW + p] *= inv;
+                }
+            } else {
+                for (int c = 0; c < C; c++) {
+                    const float *xr = x->buf + (size_t)c * HW;
+                    float *yr = y + (size_t)c * HW;
+                    float mx = xr[0];
+                    for (int p = 1; p < HW; p++) if (xr[p] > mx) mx = xr[p];
+                    float sum = 0.f;
+                    for (int p = 0; p < HW; p++) { float e = expf(xr[p] - mx); yr[p] = e; sum += e; }
+                    float inv = 1.f / sum;
+                    for (int p = 0; p < HW; p++) yr[p] *= inv;
+                }
+            }
+            *final_slot = o->out; *final_c = x->c; *final_a = HW;
+            break;
+        }
         case YOP_ATTN_PSA: {
             YSlot *x = &S[o->ins[0]];
             int nh = (int)P[0], hd = (int)P[1], kd = (int)P[2];
             float *y = slot_new(S, o->out, x->c, x->h, x->w);
             yattn_psa(m, x->buf, x->c, x->h, x->w, nh, hd, kd,
                       P[3], P[4], P[5], y);
+            break;
+        }
+        case YOP_MATMUL: {
+            /* 阶段 P2：线性代数半环 (+, ×) 通用矩阵乘算子
+             * [SHS 公理映射: shs_axiom_tensor_graph_mapping_v1 + blas_matrix_block_natural_isomorphism]
+             * 复用 1×1/s1/p0/g1 yconv_dispatch，天然继承 F32 / Q8 dotprod / RVV / IME 零拷贝加速 */
+            uint32_t cid = P[0];
+            int hb  = (o->nparam >= 2) ? (int)P[1] : 0;
+            int act = (o->nparam >= 3) ? (int)P[2] : 0;
+            YSlot *x = &S[o->ins[0]];
+            int OC = (cid <= (uint32_t)m->max_cid) ? m->crow[cid] : 0;
+            if (OC <= 0) { fprintf(stderr, "[YOLO] matmul cid=%u weight missing\n", cid); return -1; }
+            float *y = slot_new(S, o->out, OC, x->h, x->w);
+            if (!y) return -1;
+            yconv_dispatch(m, x->buf, x->c, x->h, x->w, cid, hb, OC, 1, 1,
+                           1, 1, 0, 0, 1, act, y, x->h, x->w);
+            *final_slot = o->out; *final_c = OC; *final_a = x->h * x->w;
+            break;
+        }
+        case YOP_RMSNORM: {
+            /* 阶段 P2：Bregman 流形归一化投影算子 RMSNorm
+             * [SHS 公理映射: shs_axiom_bregman_divergence_v1]
+             * y[c, p] = x[c, p] * rsqrt(mean_c(x[:, p]^2) + eps) * w[c] */
+            uint32_t cid = P[0];
+            float eps = 1e-6f;
+            if (o->nparam >= 2 && P[1] != 0) memcpy(&eps, &P[1], sizeof(float));
+            YSlot *x = &S[o->ins[0]];
+            const float *w = (cid <= (uint32_t)m->max_cid) ? m->cw[cid] : NULL;
+            float *y = slot_new(S, o->out, x->c, x->h, x->w);
+            if (!y) return -1;
+            const int C = x->c, P_len = x->h * x->w;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(P_len > 256)
+#endif
+            for (int p = 0; p < P_len; p++) {
+                float ss = 0.f;
+                for (int c = 0; c < C; c++) {
+                    float v = x->buf[(size_t)c * P_len + p];
+                    ss += v * v;
+                }
+                float scale = 1.f / sqrtf(ss / (float)C + eps);
+                for (int c = 0; c < C; c++) {
+                    float wc = w ? w[c] : 1.f;
+                    y[(size_t)c * P_len + p] = x->buf[(size_t)c * P_len + p] * scale * wc;
+                }
+            }
+            *final_slot = o->out; *final_c = x->c; *final_a = P_len;
+            break;
+        }
+        case YOP_ROPE: {
+            /* 阶段 P2：正交旋转群 SO(2)^d 同构算子 RoPE
+             * 对每个空间/序列位置 p 与每个注意力头，对半拆分通道 (d, d + hd/2) 施加旋转 */
+            YSlot *x = &S[o->ins[0]];
+            int hd = (o->nparam >= 1 && P[0] > 0) ? (int)P[0] : x->c;
+            float theta = 10000.0f;
+            if (o->nparam >= 2 && P[1] != 0) memcpy(&theta, &P[1], sizeof(float));
+            int pos_off = (o->nparam >= 3) ? (int)P[2] : 0;
+            float *y = slot_new(S, o->out, x->c, x->h, x->w);
+            if (!y) return -1;
+            const int C = x->c, P_len = x->h * x->w;
+            const int nh = C / hd, half = hd / 2;
+            for (int d = 0; d < half; d++) {
+                float freq = powf(theta, -2.0f * (float)d / (float)hd);
+                for (int p = 0; p < P_len; p++) {
+                    float ang = (float)(pos_off + p) * freq;
+                    float cs_v = cosf(ang), sn_v = sinf(ang);
+                    for (int h = 0; h < nh; h++) {
+                        int c0 = h * hd + d;
+                        int c1 = c0 + half;
+                        float x0 = x->buf[(size_t)c0 * P_len + p];
+                        float x1 = x->buf[(size_t)c1 * P_len + p];
+                        y[(size_t)c0 * P_len + p] = x0 * cs_v - x1 * sn_v;
+                        y[(size_t)c1 * P_len + p] = x1 * cs_v + x0 * sn_v;
+                    }
+                }
+            }
+            *final_slot = o->out; *final_c = x->c; *final_a = P_len;
+            break;
+        }
+        case YOP_SWIGLU: {
+            /* 阶段 P2：门控非线性合成算子 SwiGLU(gate, up) = SiLU(gate) * up */
+            YSlot *gate = &S[o->ins[0]], *up = &S[o->ins[1]];
+            long long n = (long long)gate->c * gate->h * gate->w;
+            float *y = slot_new(S, o->out, gate->c, gate->h, gate->w);
+            if (!y) return -1;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(n > 65536)
+#endif
+            for (long long k = 0; k < n; k++) {
+                float g = gate->buf[k];
+                y[k] = (g / (1.f + expf(-g))) * up->buf[k];
+            }
+            *final_slot = o->out; *final_c = gate->c; *final_a = gate->h * gate->w;
             break;
         }
         case YOP_DETECT: {
@@ -1793,11 +1951,11 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
         }
         if (cpu_tim) {
             const double dt = ynow() - _op0;
-            if (o->op == YOP_CONV)      { m->t_conv  += dt; m->n_conv_ops++; }
+            if (o->op == YOP_CONV || o->op == YOP_MATMUL) { m->t_conv += dt; m->n_conv_ops++; }
             else if (o->op == YOP_DETECT){ m->t_detect += dt; }
             else if (o->op == YOP_ATTN_PSA) { m->t_attn += dt; }
             else                        { m->t_elem  += dt; m->n_elem_ops++; }
-            if (o->op <= YOP_DETECT) { m->t_opk[o->op] += dt; m->n_opk[o->op]++; }
+            if (o->op <= YOP_MAX) { m->t_opk[o->op] += dt; m->n_opk[o->op]++; }
         }
     }
     if (cpu_tim) {
@@ -1807,17 +1965,22 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
                 m->t_fwd * 1e3, m->t_conv * 1e3, m->n_conv_ops, m->t_i2c * 1e3,
                 m->t_elem * 1e3, m->n_elem_ops, m->t_attn * 1e3, m->t_detect * 1e3,
                 (m->t_fwd - m->t_conv - m->t_elem - m->t_attn - m->t_detect) * 1e3);
+#if ST_HAVE_RVV
         if (yime_acc_conv > 0.0)
             fprintf(stderr, "[YOLO-CPU] IME: kernel+epi=%.1fms（打包已并入 im2col）\n",
                     yime_acc_conv * 1e3);
+#endif
         fprintf(stderr, "[YOLO-CPU] im2col 拆分: CHW→HWC=%.1fms  gather+量化=%.1fms\n",
                 yacc_trans * 1e3, yacc_gather * 1e3);
         {   /* 逐算子类型（Phase 2 定位） */
-            static const char *nm[12] = { "-", "CONV", "ADD", "CONCAT", "MAXPOOL",
-                                          "UPSAMPLE", "SIGMOID", "MUL", "SLICE",
-                                          "SOFTMAX", "ATTN_PSA", "DETECT" };
+            static const char *nm[YOP_MAX + 1] = {
+                "-", "CONV", "ADD", "CONCAT", "MAXPOOL",
+                "UPSAMPLE", "SIGMOID", "MUL", "SLICE",
+                "SOFTMAX", "ATTN_PSA", "DETECT",
+                "MATMUL", "RMSNORM", "ROPE", "SWIGLU"
+            };
             fprintf(stderr, "[YOLO-CPU] ops:");
-            for (int k = 1; k <= 11; k++)
+            for (int k = 1; k <= YOP_MAX; k++)
                 if (m->n_opk[k])
                     fprintf(stderr, " %s=%.1fms/%ld", nm[k], m->t_opk[k] * 1e3, m->n_opk[k]);
             fprintf(stderr, "\n");
@@ -1838,8 +2001,7 @@ int st_yolo_forward_raw(StYoloModel *m, const float *nchw,
         if (out_c) *out_c = fc;
         if (out_a) *out_a = fa;
     }
-    for (int i = 0; i < m->n_slots; i++) free(S[i].buf);
-    free(S);
+    slots_free(S, m->n_slots);
     return rc;
 }
 
@@ -1963,7 +2125,7 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
     uint32_t fs = 0; int fc = 0, A = 0;
     int rc = yolo_forward(m, in, ow, oh, S, &fs, &fc, &A);
     free(in);
-    if (rc != 0) { free(S); return -1; }
+    if (rc != 0) { slots_free(S, m->n_slots); return -1; }
     double _p0 = cpu_tim ? ynow() : 0.0;
     const float *Y = S[fs].buf;
 
@@ -2022,8 +2184,7 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
         d->cls = clsv[ia];
     }
     free(cand); free(boxes); free(clsv); free(dead);
-    for (int i = 0; i < m->n_slots; i++) free(S[i].buf);
-    free(S);
+    slots_free(S, m->n_slots);
     if (cpu_tim) {
         m->t_post = ynow() - _p0;
         fprintf(stderr, "[YOLO-CPU] letterbox=%.1fms post(NMS)=%.1fms | fwd_total=%.1fms "
