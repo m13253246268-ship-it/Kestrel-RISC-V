@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型协同测试 · vLLM-Kestrel</title>
+<style>
+/* ============ 设计令牌（暗色控制台统一规范，与 laya.html 同源）============ */
+:root{
+  --bg:#0f1419;--panel:#1a212b;--panel2:#202a36;--panel3:#283442;--bd:#2c3a4a;--bd-hi:#3e5468;
+  --tx:#d7e0ea;--tx2:#8ea0b4;--tx3:#63758a;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#ffb020;
+  --pur:#b48cff;--cy:#3fd0d0;
+  --acc-soft:rgba(77,163,255,.13);
+  --focus:0 0 0 3px rgba(77,163,255,.22);
+  --tr:.16s ease;
+  --m-check:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+  --m-alert:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3'/%3E%3Cpath d='M12 9v4'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E");
+  --i-zap:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13 2 3 14h9l-1 8 10-12h-9l1-8z'/%3E%3C/svg%3E");
+  --i-back:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 19-7-7 7-7'/%3E%3Cpath d='M19 12H5'/%3E%3C/svg%3E");
+  --i-send:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m22 2-7 20-4-9-9-4Z'/%3E%3Cpath d='M22 2 11 13'/%3E%3C/svg%3E");
+  --i-rotate:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3C/svg%3E");
+  --i-shuffle:url("data:image/svg+xml,%3Csvg xmlns='h%74tp://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.8-1.1 2-1.7 3.3-1.7H22'/%3E%3Cpath d='m18 2 4 4-4 4'/%3E%3Cpath d='M2 6h1.9c1.5 0 2.9.9 3.6 2.2'/%3E%3Cpath d='M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8'/%3E%3Cpath d='m18 14 4 4-4 4'/%3E%3C/svg%3E");
+}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#2c3a4a transparent}
+::selection{background:rgba(77,163,255,.32)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2c3a4a;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#3e5468}
+::-webkit-scrollbar-track{background:transparent}
+body{margin:0;color:var(--tx);
+  background:
+    radial-gradient(1100px 480px at 85% -10%,rgba(77,163,255,.06),transparent 60%),
+    radial-gradient(900px 420px at -10% 110%,rgba(62,207,142,.04),transparent 60%),
+    var(--bg);
+  font:14px/1.6 ui-monospace,"SF Mono","Cascadia Code",Consolas,"Microsoft YaHei",monospace;
+  -webkit-font-smoothing:antialiased}
+header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:14px;padding:13px 24px;
+  background:rgba(26,33,43,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--bd)}
+.brand{display:inline-flex;align-items:center;gap:11px;min-width:0}
+.brand .mark{flex:none;width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:#e8f3ff;
+  background:linear-gradient(135deg,#2e7fe0,#1b4d8f);border:1px solid rgba(77,163,255,.5);
+  box-shadow:0 2px 12px rgba(46,127,224,.35)}
+.brand .mark::before{content:"";width:17px;height:17px;background-color:currentColor;
+  -webkit-mask:var(--i-shuffle) center/contain no-repeat;mask:var(--i-shuffle) center/contain no-repeat}
+.brand h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand .sub{display:block;font-size:10.5px;color:var(--tx2);letter-spacing:.6px;margin-top:1px}
+.navlink{display:inline-flex;align-items:center;gap:6px;color:var(--tx2);font-size:12px;text-decoration:none;
+  border:1px solid var(--bd);border-radius:8px;padding:5px 12px;transition:color var(--tr),border-color var(--tr),background var(--tr)}
+.navlink:hover{color:var(--acc);border-color:var(--acc);background:var(--acc-soft)}
+[class^="ic-"]::before,[class*=" ic-"]::before{
+  content:"";display:inline-block;width:14px;height:14px;flex:none;
+  background-color:currentColor;
+  -webkit-mask:var(--icon) center/contain no-repeat;mask:var(--icon) center/contain no-repeat}
+.ic-back{--icon:var(--i-back)}
+.ic-send{--icon:var(--i-send)}
+.ic-rotate{--icon:var(--i-rotate)}
+.ic-shuffle{--icon:var(--i-shuffle)}
+main{display:grid;grid-template-columns:1fr;gap:16px;padding:20px 24px 32px;max-width:1200px;margin:0 auto}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.015),rgba(255,255,255,0) 46px),var(--panel);
+  border:1px solid var(--bd);border-radius:13px;padding:16px 18px;display:flex;flex-direction:column;gap:8px;
+  box-shadow:0 12px 32px -26px rgba(0,0,0,.95);min-width:0;transition:border-color var(--tr)}
+.card:hover{border-color:#35485e}
+.card h2{display:flex;align-items:center;gap:9px;font-size:12.5px;margin:0 0 10px;padding-bottom:10px;
+  border-bottom:1px solid rgba(44,58,74,.6);color:#c3d1e1;font-weight:700;text-transform:uppercase;letter-spacing:.8px;flex-wrap:wrap}
+label.fld{display:block;margin:10px 0}
+label.fld .t{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:11.5px;color:var(--tx2);margin-bottom:5px;letter-spacing:.2px}
+input[type=text],input[type=number],textarea{width:100%;background:#141b24;border:1px solid var(--bd);color:var(--tx);border-radius:8px;
+  padding:8px 11px;font-size:13px;font-family:inherit;transition:border-color var(--tr),box-shadow var(--tr)}
+input:hover,textarea:hover{border-color:var(--bd-hi)}
+input:focus,textarea:focus{outline:none;border-color:var(--acc);box-shadow:var(--focus)}
+::placeholder{color:#5d7086}
+textarea{min-height:200px;resize:vertical;line-height:1.6}
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--panel2);color:var(--tx);
+  border:1px solid var(--bd);border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;font-family:inherit;
+  white-space:nowrap;transition:color var(--tr),border-color var(--tr),background-color var(--tr),box-shadow var(--tr),transform var(--tr)}
+button:hover{border-color:var(--bd-hi);background:var(--panel3);color:#cfe4ff}
+button:active{transform:translateY(1px)}
+button:focus-visible{outline:none;box-shadow:var(--focus)}
+button.primary{background:linear-gradient(180deg,#57a7ff,#3d8bee);border-color:#3d8bee;color:#07131f;font-weight:600}
+button.primary:hover{filter:brightness(1.09);color:#07131f;border-color:#5aa0f5}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed rgba(44,58,74,.55)}
+.msg{display:none;align-items:flex-start;gap:9px;padding:9px 13px;border-radius:8px;margin-top:10px;font-size:12px;line-height:1.55}
+.msg.show{display:flex}
+.msg.ok{background:#142c21;color:var(--ok);border:1px solid #1f4a30}
+.msg.err{background:#33191c;color:var(--bad);border:1px solid #5c2c30}
+.msg.show::before{content:"";flex:none;width:14px;height:14px;margin-top:2px;background-color:currentColor;
+  -webkit-mask:var(--m-alert) center/contain no-repeat;mask:var(--m-alert) center/contain no-repeat}
+.msg.ok.show::before{-webkit-mask-image:var(--m-check);mask-image:var(--m-check)}
+pre{background:#0a0e13;border:1px solid var(--bd);border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-all;margin:8px 0 0;max-height:420px;overflow:auto}
+.small{font-size:11.5px;color:var(--tx2)}
+/* ============ 路由模式 tabs ============ */
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.tabs button{background:var(--panel2);border-color:var(--bd);color:var(--tx2);padding:7px 14px;font-size:12px}
+.tabs button.on{background:var(--acc-soft);border-color:var(--acc);color:var(--acc);font-weight:600}
+.mode-flds{display:none}
+.mode-flds.show{display:block}
+/* ============ 结果展示 ============ */
+.route-badge{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:700;padding:6px 14px;border-radius:20px;border:1px solid}
+.route-chat{background:#12233c;color:#6fb4ff;border-color:#2b5f96}
+.route-rag{background:#12291c;color:#56e29a;border-color:#1f5a3a}
+.route-decide{background:#241638;color:#c49aff;border-color:#53368c}
+.route-scene{background:#33240f;color:#ffb848;border-color:#6b4b1a}
+.route-local{background:#0f2e2e;color:#54d6d6;border-color:#1c5a5a}
+.route-escalate{background:#3a1417;color:#ff8585;border-color:#7c2c30}
+.route-unknown{background:#1c232d;color:#9fb2c7;border-color:#35485e}
+.route-meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.route-meta .pill{font-size:11.5px;color:var(--tx2);background:var(--panel2);border:1px solid var(--bd);
+  border-radius:6px;padding:3px 9px}
+.route-meta .pill b{color:var(--tx);font-weight:600}
+.sect{margin-top:12px;padding-top:12px;border-top:1px dashed rgba(44,58,74,.55)}
+.sect .h{font-size:11px;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
+.answer-box{background:#0a0e13;border:1px solid var(--bd);border-radius:10px;padding:12px 14px;font-size:13px;
+  line-height:1.7;white-space:pre-wrap;word-break:break-word;color:var(--tx)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:6px 9px;border-bottom:1px solid rgba(44,58,74,.5);vertical-align:top}
+th{color:var(--tx3);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+td code{color:var(--acc)}
+.kv{display:grid;grid-template-columns:160px 1fr;gap:6px 12px;font-size:12px}
+.kv .k{color:var(--tx3)}
+.kv .v{color:var(--tx);word-break:break-word}
+.kv .v code{color:var(--acc)}
+.img-preview{max-width:320px;max-height:220px;border-radius:8px;border:1px solid var(--bd);display:none;margin-top:8px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="mark"></span>
+    <div><h1>模型协同测试</h1><span class="sub">vLLM-KESTREL · COLLAB CONSOLE</span></div>
+  </div>
+  <span style="flex:1"></span>
+  <a class="navlink ic-back" href="/admin/">返回管理页 /admin/</a>
+</header>
+<main>
+  <div class="card">
+    <h2 class="ic-shuffle">协同推理请求<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（POST /v1/ask 单入口 · 按字段自动路由）</span></h2>
+    <div class="tabs" id="tabs">
+      <button class="on" data-mode="chat" type="button">纯 LLM（chat）</button>
+      <button data-mode="rag" type="button">RAG 检索（rag）</button>
+      <button data-mode="decide" type="button">Laya 决策（decide）</button>
+      <button data-mode="scene" type="button">YOLO 场景（scene）</button>
+    </div>
+
+    <div class="mode-flds show" data-flds="chat">
+      <label class="fld"><span class="t"><span>查询文本（query）</span></span>
+        <textarea id="q_chat" placeholder="输入任意问题…（若引擎配置了 VLLM_ROUTE_POLICY，将先做语义路由）"></textarea></label>
+    </div>
+
+    <div class="mode-flds" data-flds="rag">
+      <label class="fld"><span class="t"><span>查询文本（query）</span></span>
+        <textarea id="q_rag" placeholder="基于知识库检索增强回答…"></textarea></label>
+      <label class="fld"><span class="t"><span>向量库路径（kb_dir，.vkb）</span></span>
+        <input type="text" id="f_kb_dir" placeholder="/mnt/VQF/kb/faq.vkb"></label>
+      <label class="fld"><span class="t"><span>检索条数（top_k，1~16）</span></span>
+        <input type="number" id="f_top_k" min="1" max="16" value="3"></label>
+    </div>
+
+    <div class="mode-flds" data-flds="decide">
+      <label class="fld"><span class="t"><span>请求 JSON（state + questions，同 /v1/systemone）</span></span>
+        <textarea id="q_decide"></textarea></label>
+      <div class="row">
+        <button class="ic-rotate" onclick="resetDecide()" type="button">恢复示例</button>
+      </div>
+    </div>
+
+    <div class="mode-flds" data-flds="scene">
+      <label class="fld"><span class="t"><span>问题（query，缺省「请描述图中场景」）</span></span>
+        <input type="text" id="q_scene" placeholder="图中有哪些目标？"></label>
+      <label class="fld"><span class="t"><span>图片（image，YOLO 感知 → 场景叙事 → LLM）</span></span>
+        <input type="file" id="f_image" accept="image/*"></label>
+      <img class="img-preview" id="imgPreview" alt="">
+    </div>
+
+    <label class="fld"><span class="t"><span>最大生成 token（max_tokens）</span></span>
+      <input type="number" id="f_max_tokens" min="1" max="4096" value="256"></label>
+
+    <div class="row">
+      <button class="primary ic-send" id="btnSend" onclick="sendAsk()" type="button">发送协同请求</button>
+      <span class="small">/v1/ask 依据显式字段路由：image→scene，kb_dir→rag，questions→decide，否则→chat；配置语义路由策略时对纯 query 先做 Laya 决策。</span>
+    </div>
+    <div class="msg" id="askMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>路由结果<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--tx2)">（自描述 route 字段）</span></h2>
+    <div id="routeBadge"><span class="route-badge route-unknown">（尚未发送）</span></div>
+    <div class="route-meta hidden" id="routeMeta"></div>
+    <div class="sect hidden" id="sectAnswer">
+      <div class="h">回答 / answer</div>
+      <div class="answer-box" id="answerBox"></div>
+    </div>
+    <div class="sect hidden" id="sectScene">
+      <div class="h">场景叙事 / scene</div>
+      <div class="answer-box" id="sceneBox"></div>
+    </div>
+    <div class="sect hidden" id="sectRetrieved">
+      <div class="h">检索证据 / retrieved</div>
+      <div id="retrievedBox"></div>
+    </div>
+    <div class="sect hidden" id="sectAnswers">
+      <div class="h">决策答案 / answers</div>
+      <div id="answersBox"></div>
+    </div>
+    <div class="sect hidden" id="sectDetections">
+      <div class="h">目标检测 / detections</div>
+      <div id="detectionsBox"></div>
+    </div>
+    <div class="sect">
+      <div class="h">原始响应 / raw</div>
+      <pre id="raw">（尚未发送）</pre>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function showMsg(text, ok){
+  const m = $("askMsg");
+  m.textContent = text; m.className = "msg show " + (ok ? "ok" : "err");
+}
+function show(el, on){ el.classList.toggle("hidden", !on); }
+
+/* ---------- 路由模式切换 ---------- */
+let mode = "chat";
+$("tabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-mode]");
+  if (!b) return;
+  mode = b.dataset.mode;
+  document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".mode-flds").forEach(x =>
+    x.classList.toggle("show", x.dataset.flds === mode));
+});
+
+/* ---------- decide 链示例（同 laya.html 模板） ---------- */
+const DECIDE_TEMPLATE = {
+  state: "Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan.",
+  questions: {
+    department: {type:"choice", instructions:"Which department should handle this?",
+                 criteria:{billing:"invoices, payments, refunds", technical:"bugs, outages, system errors", other:"everything else"}},
+    urgency: {type:"score", instructions:"How urgent is this?", criteria:["not urgent","soon","blocking"]},
+    churn_risk: {type:"noul", instructions:"Does the user threaten to cancel or leave?"}
+  }
+};
+function resetDecide(){ $("q_decide").value = JSON.stringify(DECIDE_TEMPLATE, null, 2); }
+resetDecide();
+
+/* ---------- scene 链图片预览 ---------- */
+let imgDataUrl = null;
+$("f_image").addEventListener("change", function(){
+  const f = this.files && this.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    imgDataUrl = rd.result;
+    $("imgPreview").src = imgDataUrl;
+    $("imgPreview").style.display = "block";
+  };
+  rd.readAsDataURL(f);
+});
+
+/* ---------- 构建请求体（与 /v1/ask 路由优先级对齐） ---------- */
+function buildBody(){
+  const max_tokens = parseInt($("f_max_tokens").value, 10) || 256;
+  if (mode === "chat"){
+    return { query: $("q_chat").value.trim(), max_tokens };
+  }
+  if (mode === "rag"){
+    return { query: $("q_rag").value.trim(),
+             kb_dir: $("f_kb_dir").value.trim(),
+             top_k: parseInt($("f_top_k").value, 10) || 3,
+             max_tokens };
+  }
+  if (mode === "decide"){
+    const body = { max_tokens };
+    try {
+      const j = JSON.parse($("q_decide").value);
+      if (j.state != null) body.state = j.state;
+      if (j.questions != null) body.questions = j.questions;
+    } catch (e) { return null; }
+    return body;
+  }
+  if (mode === "scene"){
+    return { query: $("q_scene").value.trim(), image: imgDataUrl, max_tokens };
+  }
+  return null;
+}
+
+/* ---------- 发送 ---------- */
+async function sendAsk(){
+  const body = buildBody();
+  if (body === null){
+    showMsg("decide 请求 JSON 解析失败，请检查格式", false);
+    return;
+  }
+  if (!body.query && !body.image && !body.questions && mode !== "decide"){
+    showMsg("请填写查询文本", false);
+    return;
+  }
+  if (mode === "decide" && !body.questions){
+    showMsg("decide 链需要 questions 字段", false);
+    return;
+  }
+  if (mode === "scene" && !body.image){
+    showMsg("scene 链需要上传图片", false);
+    return;
+  }
+  $("btnSend").disabled = true;
+  showMsg("协同请求发送中…", true);
+  try {
+    const r = await fetch("/v1/ask", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    const j = await r.json().catch(() => ({}));
+    renderResult(j, r.status);
+    if (!r.ok) showMsg("HTTP " + r.status + "：" + ((j.error && j.error.message) || JSON.stringify(j.error) || "请求失败"), false);
+    else showMsg("路由 " + (j.route || "?") + " · 完成", true);
+  } catch (e) {
+    showMsg("请求失败: " + e, false);
+    $("routeBadge").innerHTML = '<span class="route-badge route-escalate">网络错误</span>';
+    $("raw").textContent = String(e);
+  } finally {
+    $("btnSend").disabled = false;
+  }
+}
+
+/* ---------- 结果渲染 ---------- */
+function renderResult(j, status){
+  const route = j.route || "unknown";
+  const cls = ["chat","rag","decide","scene","local","escalate"].indexOf(route) >= 0 ? route : "unknown";
+  $("routeBadge").innerHTML = '<span class="route-badge route-' + cls + '">route = ' + esc(route) + '</span>';
+  $("raw").textContent = JSON.stringify(j, null, 2);
+
+  /* 语义路由字段（route_source=policy） */
+  const meta = $("routeMeta");
+  meta.innerHTML = "";
+  if (j.route_source === "policy"){
+    const pills = [];
+    if (j.department) pills.push(['department', j.department]);
+    if (j.confidence != null) pills.push(['confidence', Number(j.confidence).toFixed(3)]);
+    if (j.churn_risk != null) pills.push(['churn_risk', Number(j.churn_risk).toFixed(3)]);
+    if (j.urgency != null) pills.push(['urgency', Number(j.urgency).toFixed(2)]);
+    if (j.low_conf) pills.push(['low_conf', 'true']);
+    if (j.decision_failed) pills.push(['decision_failed', 'true']);
+    pills.forEach(p => {
+      const s = document.createElement("span");
+      s.className = "pill";
+      s.innerHTML = esc(p[0]) + ' <b>' + esc(p[1]) + '</b>';
+      meta.appendChild(s);
+    });
+  }
+  show(meta, j.route_source === "policy");
+
+  /* answer */
+  show($("sectAnswer"), j.answer != null && j.answer !== "");
+  $("answerBox").textContent = j.answer || "";
+
+  /* scene 叙事 */
+  show($("sectScene"), j.scene != null && j.scene !== "");
+  $("sceneBox").textContent = j.scene || "";
+
+  /* retrieved（rag） */
+  const retrieved = j.retrieved || [];
+  show($("sectRetrieved"), Array.isArray(retrieved) && retrieved.length > 0);
+  if (Array.isArray(retrieved) && retrieved.length){
+    let h = "<table><tr><th>#</th><th>score</th><th>文档</th></tr>";
+    retrieved.forEach(it => {
+      h += "<tr><td>" + esc(it.index) + "</td><td>" +
+        (it.score != null ? Number(it.score).toFixed(4) : "-") + "</td><td>" +
+        esc(it.meta || "") + "</td></tr>";
+    });
+    $("retrievedBox").innerHTML = h + "</table>";
+  }
+
+  /* answers（decide） */
+  const answers = j.answers;
+  show($("sectAnswers"), answers && typeof answers === "object" && Object.keys(answers).length > 0);
+  if (answers && typeof answers === "object"){
+    const kv = $("answersBox");
+    kv.innerHTML = "";
+    kv.className = "kv";
+    Object.keys(answers).forEach(qid => {
+      const a = answers[qid];
+      let val = "";
+      if (a && typeof a === "object"){
+        const parts = [];
+        if (a.choice != null) parts.push("choice=" + a.choice);
+        if (a.score != null) parts.push("score=" + Number(a.score).toFixed(3));
+        if (a.noul != null) parts.push("noul=" + Number(a.noul).toFixed(3));
+        if (a.confidence != null) parts.push("confidence=" + Number(a.confidence).toFixed(3));
+        val = parts.join("  ");
+      } else {
+        val = String(a);
+      }
+      const k = document.createElement("div");
+      k.className = "k"; k.textContent = qid;
+      const v = document.createElement("div");
+      v.className = "v"; v.textContent = val;
+      kv.appendChild(k); kv.appendChild(v);
+    });
+  }
+
+  /* detections（scene） */
+  const dets = j.detections || [];
+  show($("sectDetections"), Array.isArray(dets) && dets.length > 0);
+  if (Array.isArray(dets) && dets.length){
+    let h = "<table><tr><th>类别</th><th>置信度</th><th>框 [x1,y1,x2,y2]</th></tr>";
+    dets.forEach(d => {
+      const b = d.box || [];
+      h += "<tr><td>" + esc(d.name || ("class_" + d.cls)) + "</td><td>" +
+        (d.score != null ? Number(d.score).toFixed(3) : "-") + "</td><td>" +
+        esc(b.map(v => Math.round(v)).join(", ")) + "</td></tr>";
+    });
+    $("detectionsBox").innerHTML = h + "</table>";
+  }
+}
+</script>
+</body>
+</html>

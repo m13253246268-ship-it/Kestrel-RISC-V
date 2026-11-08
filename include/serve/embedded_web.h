@@ -4,10 +4,10 @@
 
 #include <stddef.h>
 
-/* embedded admin.html (127599 bytes) */
+/* embedded admin.html (128088 bytes) */
 const char *embedded_admin_html(size_t *len);
 
-/* embedded chat.html (54690 bytes) */
+/* embedded chat.html (55048 bytes) */
 const char *embedded_chat_html(size_t *len);
 
 /* embedded review.html (45095 bytes) */
@@ -24,5 +24,8 @@ const char *embedded_yolo_html(size_t *len);
 
 /* embedded cloud.html (14343 bytes) */
 const char *embedded_cloud_html(size_t *len);
+
+/* embedded ask.html (22821 bytes) */
+const char *embedded_ask_html(size_t *len);
 
 #endif /* VLLM_EMBEDDED_WEB_H */

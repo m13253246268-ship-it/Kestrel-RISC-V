@@ -140,6 +140,14 @@ static const char *cloud_html_path(void) {
     if (f) { fclose(f); return "./cloud.html"; }
     return "/NewVLLM/cloud.html";
 }
+/* 模型协同测试页（/v1/ask 单入口）的磁盘候选路径；VLLM_ASK_HTML 可覆盖。 */
+static const char *ask_html_path(void) {
+    const char *e = getenv("VLLM_ASK_HTML");
+    if (e && e[0]) return e;
+    FILE *f = fopen("./ask.html", "rb");
+    if (f) { fclose(f); return "./ask.html"; }
+    return "/NewVLLM/ask.html";
+}
 
 /* ---------- system readings (Linux /proc; null elsewhere) ---------- */
 
@@ -318,6 +326,10 @@ static VJson *build_config_json(const VLLMServerCtx *ctx) {
     vjson_obj_set(o, "prefill_q8", vjson_new_bool(g_st_prefill_q8));
     vjson_obj_set(o, "sparse_attn", vjson_new_bool(g_sparse_attn));
     vjson_obj_set(o, "sparse_k", vjson_new_number((double)g_sparse_k));
+    /* 稀疏 prefill 两个旋钮（--sparse-pf-k / --sparse-pf-group）：管理页有
+     * 输入框，必须回填运行态，否则刷新后回默认值、再保存会静默覆盖。 */
+    vjson_obj_set(o, "sparse_pf_k", vjson_new_number((double)g_sparse_pf_k));
+    vjson_obj_set(o, "sparse_pf_group", vjson_new_number((double)g_sparse_pf_group));
     vjson_obj_set(o, "l3_evict", vjson_new_bool(g_l3_evict));
     vjson_obj_set(o, "l3_ratio", vjson_new_number((double)g_l3_ratio));
     vjson_obj_set(o, "l3_min_seq", vjson_new_number((double)g_l3_min_seq));
@@ -397,6 +409,9 @@ static VJson *build_config_json(const VLLMServerCtx *ctx) {
         /* 可验证推理开关（管理页有勾选框，需回填）：VLLM_ATTEST=1 时引擎对
          * 每条响应附 SM2 出证凭证；VLLM_ATTEST_DIR 为其密钥/工作目录。 */
         "VLLM_ATTEST", "VLLM_ATTEST_DIR",
+        /* 稀疏 prefill 门 / VQF 预热 / VQF 分层驻留（管理页均有勾选框，
+         * 由 supervisor 按 config.json 的 env 注入，必须回填否则刷新即丢）。 */
+        "VLLM_SPARSE_PREFILL", "VLLM_VQF_PREWARM", "VLLM_VQF_STREAM",
         NULL
     };
     for (int i = 0; opt_envs[i]; i++) {
@@ -796,7 +811,28 @@ static void handle_admin_device(const VHttpRequest *req, VHttpResponse *resp) {
 
 static void handle_admin_config(const VLLMServerCtx *ctx, VHttpResponse *resp) {
     VJson *o = vjson_new_object();
-    vjson_obj_set(o, "config", build_config_json(ctx));
+    VJson *cfg = build_config_json(ctx);
+    /* auto_start 由 supervisor（tools/ops/vllm_mgr.py）消费，引擎运行态无法
+     * 感知；从持久化 config.json 回填，否则管理页刷新后按默认 false 显示，
+     * 再保存就把用户的「自动启动」静默抹掉。 */
+    {
+        char *buf = (char *)malloc(256 * 1024);
+        if (buf) {
+            size_t n = read_file_bounded(admin_config_path(ctx), buf, 256 * 1024);
+            if (n > 0) {
+                VJson *saved = vjson_parse(buf);
+                if (saved && saved->type == VJ_OBJECT) {
+                    const VJson *as = vjson_obj_get(saved, "auto_start");
+                    if (as && as->type == VJ_BOOL)
+                        vjson_obj_set(cfg, "auto_start",
+                                      vjson_new_bool(as->u.boolean ? 1 : 0));
+                }
+                vjson_free(saved);
+            }
+            free(buf);
+        }
+    }
+    vjson_obj_set(o, "config", cfg);
     add_device_info(o, ctx);
     json_put_str(o, "config_path", admin_config_path(ctx));
     admin_json_reply(resp, o);
@@ -1333,6 +1369,10 @@ static void handle_yolo_page(VHttpResponse *resp) {
 /* 云端模型（可选）配置页：独立成页，云端为可选能力。 */
 static void handle_cloud_page(VHttpResponse *resp) {
     serve_html_page(resp, embedded_cloud_html, cloud_html_path(), "cloud.html", "VLLM_CLOUD_HTML");
+}
+/* 模型协同测试页：独立成页，测试 /v1/ask 单入口四链路由（数据走同源 /v1/ask）。 */
+static void handle_ask_page(VHttpResponse *resp) {
+    serve_html_page(resp, embedded_ask_html, ask_html_path(), "ask.html", "VLLM_ASK_HTML");
 }
 
 /* ================================================================
@@ -2628,6 +2668,9 @@ void vllm_admin_route(VLLMServerCtx *ctx, const VHttpRequest *req,
     } else if (strcmp(req->method, "GET") == 0 &&
                strcmp(req->path, "/admin/cloud") == 0) {
         handle_cloud_page(resp);
+    } else if (strcmp(req->method, "GET") == 0 &&
+               strcmp(req->path, "/admin/ask") == 0) {
+        handle_ask_page(resp);
     } else if (strcmp(req->method, "GET") == 0 &&
                strcmp(req->path, "/admin/api/kb/list") == 0) {
         handle_admin_kb_list(ctx, req, resp);

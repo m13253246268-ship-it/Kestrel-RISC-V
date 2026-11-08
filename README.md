@@ -87,6 +87,13 @@ vllm_kestrel 是一个从零自研、面向 RISC-V 边缘设备的纯 C 模型**
 响应回带 `route` 字段（`chat` / `rag` / `scene` / `decide` 之一），标明本次由哪条链作答。多模型
 协同使「感知 → 决策 → 生成」整条链在单板单进程内闭环，无需为每类模型各带一套运行时。
 
+**可选语义路由**：置 `VLLM_ROUTE_POLICY=<policy>` 后，纯查询请求（无 `image` / `kb_dir` / `questions`）
+先经 Laya 决策分流，产出 `local`（本地 chat）/ `escalate`（上报）/ `kb`（RAG 检索）三种路由，
+响应中附带 `department`、`confidence`、`churn_risk`、`urgency`、`low_conf`、`decision_failed`
+六个决策元数据字段；显式字段路由（image / kb_dir / questions）不受影响。
+
+可在协同测试页 `/admin/ask` 用浏览器可视化构造上述四链请求并查看路由结果（含语义路由的全部元数据字段与原始响应）。
+
 ---
 
 ## 性能
@@ -508,7 +515,8 @@ python tools/gen_merges_bin.py <tokenizer.json> <out/merges.bin>
 ```
 
 服务入口：`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、
-`/v1/systemone`、`/v1/detect`、`/v1/ask`，以及管理页 `/admin/`、对话页 `/chat/`。
+`/v1/systemone`、`/v1/detect`、`/v1/ask`，以及管理页 `/admin/`、对话页 `/chat/`、
+协同测试页 `/admin/ask`。
 
 ### 4) 验证就绪
 

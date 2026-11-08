@@ -30,6 +30,7 @@ FILES = [
     ("laya", "laya.html"),
     ("yolo", "yolo.html"),
     ("cloud", "cloud.html"),
+    ("ask", "ask.html"),
 ]
 
 
