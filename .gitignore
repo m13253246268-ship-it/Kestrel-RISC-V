@@ -1,5 +1,6 @@
 # ---- 构建产物 ----
 build-riscv/
+build-riscv-ime-candidate/
 build-x64/
 *.exe
 *.dll

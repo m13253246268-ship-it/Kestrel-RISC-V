@@ -67,8 +67,8 @@ int main(int argc, char** argv){
     printf("magic=%08x ver=%u flags=0x%x nt=%u data_off=%llu file_len=%llu size=%lld\n",
         magic,ver,flags,nt,(unsigned long long)data_off,(unsigned long long)file_len,(long long)st.st_size);
     if((flags & 0x80u)){ printf("encrypted VQF, refuse\n"); return 5; }
-    if (ver != 3 || !(flags & 0x200u)) {   /* VQF_VERSION_MOE=3, VQF_FLAG_MOE=1<<9 */
-        printf("not a MoE v3 VQF (ver=%u flags=0x%x), refuse\n", ver, flags);
+    if ((ver != 3 && ver != 5) || !(flags & 0x200u)) {   /* VQF_VERSION_MOE=3 / VQF_VERSION_LANE=5, VQF_FLAG_MOE=1<<9 */
+        printf("not a MoE VQF (ver=%u flags=0x%x), refuse\n", ver, flags);
         return 5;
     }
     if(nt==0 || nt>64){ printf("bad nt\n"); return 5; }

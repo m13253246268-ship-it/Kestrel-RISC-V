@@ -108,7 +108,7 @@ int main(int argc, char **argv){
     VQFHeader H; memcpy(&H,hb,sizeof(H));
     if(H.magic!=VQF_MAGIC){ fprintf(stderr,"bad magic\n"); return 3; }
     if(H.flags&VQF_FLAG_ENC){ fprintf(stderr,"encrypted VQF not supported\n"); return 3; }
-    if(H.version!=VQF_VERSION_MOE){ fprintf(stderr,"version %u != MOE(%u)\n",H.version,VQF_VERSION_MOE); return 3; }
+    if(H.version!=VQF_VERSION_MOE && H.version!=VQF_VERSION_LANE){ fprintf(stderr,"version %u != MOE(%u)/LANE(%u)\n",H.version,VQF_VERSION_MOE,VQF_VERSION_LANE); return 3; }
     if(!(H.flags&VQF_FLAG_MOE)||!(H.flags&VQF_FLAG_Q4_4X4)){ fprintf(stderr,"need MOE|Q4_4X4 flags (0x%x)\n",H.flags); return 3; }
     uint32_t nt=H.n_tensors;
     if(nt<1||nt>64){ fprintf(stderr,"n_tensors %u out of range\n",nt); return 3; }

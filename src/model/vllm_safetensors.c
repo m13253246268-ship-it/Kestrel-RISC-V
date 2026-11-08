@@ -2826,7 +2826,10 @@ static void rv_q4_colbt_worker(void *c_, int it) {
  * 权重：mode3 576B/32 行 → IME 288B/16 行，首次使用时重排并按权重指针缓存（4B 约 +2.3GB）。
  * 浮点顺序与 colbt 相同：F=+0；每块 F = F + ((s*d)*xd)；最后 + resid。块内整数和精确（P1 24 形状 0 失配）。 */
 #include <sched.h>
-static int rv_q4_ime_mode(void) { return 0; }  /* K1 IME 混合路径收口：默认关 */
+static int rv_q4_ime_mode(void) {
+    const char *e = getenv("VLLM_Q4_IME");
+    return (e && e[0] >= '0' && e[0] <= '2' && e[1] == '\0') ? e[0] - '0' : 0;
+}  /* 默认 mode 0 */
 
 typedef struct {
     int8_t *xp;

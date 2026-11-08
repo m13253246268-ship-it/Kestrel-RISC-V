@@ -102,6 +102,7 @@ vllm_kestrel 是一个从零自研、面向 RISC-V 边缘设备的纯 C 模型**
 3. **跨引擎对照**——与本仓库同源的主机（x86-64，MinGW）仅做**数值一致性自检，不作性能基准**。
 
 **测量环境**：SpacemiT K1（8 核 RISC-V，`rv64gcv`，VLEN=256，Cluster 0 含 4 个 IME `vmadot` 核）。
+**当前设备**：`192.168.1.227`（RAM ~7.8 GB），集合 ①④⑤⑥ 性能数据均来自本机（2026-11-08 串行实测）。
 本地约 8 GB 与云端约 15~16 GB 的机器分别记录，**尤其不能混用 MoE 成绩**。
 
 **正确性判据**：量化 / KV 量化 / 稀疏注意力 / 近似算子各自独立验证；「生成 token 相同」与「中间浮点逐位
@@ -163,17 +164,17 @@ cp -f ./Qwen3-0.6B/config.json ./out/config.json
   --stream-ctx 32 --stream-n 16 --threads 8
 ```
 
-期望（col-major + DEC，云端 K1 8 核历史值）：
+期望（col-major + DEC，本地 K1 8 核实测，192.168.1.227，2026-11-08）：
 
 | 模型 | VQF 布局/内核 | Prefill 耗时 | Prefill 吞吐 | Decode 延迟 | Decode 吞吐 | 峰值 RSS |
 |---|---|---:|---:|---:|---:|---:|
-| Qwen2.5-0.5B | col-major + DEC | 302.9 ms | 97 tok/s | 48 ms/tok | 20.83 tok/s | 293 MB |
-| Qwen3-0.6B | lane-major（默认 RVV） | 879.8 ms | 35 tok/s | 70 ms/tok | 14.30 tok/s | 356 MB |
-| Qwen3-0.6B | col-major + DEC | 414.0 ms | 72 tok/s | 58 ms/tok | 17.13 tok/s | 356 MB |
-| Qwen3-1.7B | col-major + DEC | 1,178.7 ms | 25 tok/s | 148 ms/tok | 6.74 tok/s | 971 MB |
-| Qwen3-4B | col-major + DEC | 3,000.8 ms | 10 tok/s | 341 ms/tok | 2.94 tok/s | 2,240 MB |
+| Qwen2.5-0.5B | col-major + DEC | 367 ms | 87 tok/s | 47 ms/tok | 21.17 tok/s | 294 MB |
+| Qwen3-0.6B | lane-major（RVV，历史参考） | 879.8 ms | 35 tok/s | 70 ms/tok | 14.30 tok/s | 356 MB |
+| Qwen3-0.6B | col-major + DEC | 470 ms | 68 tok/s | 59 ms/tok | 16.89 tok/s | 357 MB |
+| Qwen3-1.7B | col-major + DEC | 1,313 ms | 24 tok/s | 147 ms/tok | 6.80 tok/s | 972 MB |
+| Qwen3-4B | col-major + DEC | 3,014 ms | 11 tok/s | 336 ms/tok | 2.97 tok/s | 2,240 MB |
 
-> 同批 DEC 关→开：0.6B **75→58**、1.7B **195→148**、4B **428→341 ms/tok**。
+> DEC 关→开（DEC 关为历史参考，DEC 开为当前实测）：0.6B **75→59**、1.7B **195→147**、4B **428→336 ms/tok**。
 
 **布局默认化修复**：`layout=2`（lane-major）张量默认启用 RVV（修复原标量退化，曾致 Qwen3-0.6B prefill
 98,441 ms / 0.3 tok/s）；修复后默认 879.8 ms（prefill **111.9×**、decode **59.8×**）。
@@ -181,12 +182,12 @@ cp -f ./Qwen3-0.6B/config.json ./out/config.json
 **对照官方 llama-bench（历史）**：官方为 SpacemiT 预装、**4 线程、Q4_0 GGUF**（`-t 8` 报错），Kestrel 用
 **8 核、col-major VQF**；两者线程/权重不同，不能单独归因内核效率。
 
-| 模型 / 指标 | 官方历史值 | Kestrel 历史值 | 比 |
+| 模型 / 指标 | 官方历史值 | Kestrel 实测值（本地，2026-11-08） | 比 |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B prefill（pp32） | 58.94 tok/s | 72.00 tok/s | 1.22× |
-| Qwen3-0.6B decode（tg16） | 10.68 tok/s | 17.13 tok/s | 1.60× |
-| Qwen3-1.7B decode（tg16） | 4.71 tok/s | 6.74 tok/s | 1.43× |
-| Qwen3-4B decode（tg16） | 2.28 tok/s | 2.94 tok/s | 1.29× |
+| Qwen3-0.6B prefill（pp32） | 58.94 tok/s | 68.09 tok/s | 1.15× |
+| Qwen3-0.6B decode（tg16） | 10.68 tok/s | 16.89 tok/s | 1.58× |
+| Qwen3-1.7B decode（tg16） | 4.71 tok/s | 6.80 tok/s | 1.44× |
+| Qwen3-4B decode（tg16） | 2.28 tok/s | 2.97 tok/s | 1.30× |
 
 ---
 
@@ -290,6 +291,8 @@ python tools/client/vllm_client.py --url http://127.0.0.1:8080 chat \
 正确性：`VLLM_VIS_ATTN_CHK=1`（每层 head0 标量对拍）**24 层 0 失配**；多模式贪心输出逐字一致。
 代价：视觉 8×8 重排权重启动额外占 **≈306 MB**（K1 上总 RSS 约 2.0 GB）。
 
+> 注：上表基准输入为合成几何图；真实自然图片当前存在挂死问题，处理暂缓（VL 专项）。
+
 ---
 
 ### 集合 ④：向量嵌入 Qwen3-Embedding
@@ -323,6 +326,20 @@ curl http://127.0.0.1:8080/v1/embeddings \
 
 > 引擎通过 `st_embed_request()` 一次性取值钩子复用 prefill 内核，未登记时对 chat 路径零行为改变。
 
+**3. 复现基准（`192.168.1.227`，K1 8 线程，`Qwen3-Embedding-0.6B-q4`，2026-11-08 串行实测）**：
+
+| 输入 | 条数 | 单条 token | 引擎内总耗时 | 端到端 Wall | 峰值 RSS |
+|---|---:|---:|---:|---:|---:|
+| 短文本 | 4 | 3 / 7 / 17 / 4 | 4.34 s | 5,230 ms | 494,232 KB |
+| 中英长文本 | 4 | 126 / 171 / 131 / 149 | 27.60 s | 28,371 ms | 520,344 KB |
+
+输出 `dim=1024`，每行 L2 归一化范数 = 1.000000。单条 prefill：短文本首条含预热 2.83 s、其后
+0.25~0.81 s；长文本 5.95~7.96 s。日志 `[EMB] vqf_load OK: dim=1024 layers=28 heads=16 kv=8
+vocab=151669 max_seq=8192`，并输出 `[EMB-SKIP] waste-skip engaged (imp_head=NULL lmhead=skip kvq8=0)`。
+
+> 权重为 `--wmode q4` 转换；设备探测建议 `recommended_wmode=q8`（`src/common/vllm_device.c`），
+> 若改用 q8 转换需重测本表。串行独占运行，与并行跑 bench 相比不会出现 5~7 倍 CPU 争抢失真。
+
 ---
 
 ### 集合 ⑤：决策 Laya（ModernBERT）
@@ -346,7 +363,9 @@ python tools/laya_pack.py <model_dir> ./out                               # laya
 curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '{"question":"..."}'
 ```
 
-**3. 复现基准（历史云端 K1，ModernBERT-large 206 张量）**：
+**3. 复现基准**：
+
+历史云端 K1（ModernBERT-large 206 张量）：
 
 | 执行路径 | 原加载耗时 | 首次构建缓存 | 已有缓存加载 | 加载加速 |
 |---|---:|---:|---:|---:|
@@ -356,8 +375,24 @@ curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '
 n=59 峰值 RSS：RVV **1210.6 → 410.8 MB（−66.1%）**，IME **1210.6 → 763.4 MB（−36.9%）**；K1 IME 首请求
 n=59 **5134.2 → 3037.7 ms（1.69×）**。门禁 `laya_gate.sh` 报告 `SAME=42 DIFF=0`。
 
-> 开启优化用环境变量 `VLLM_LAYA_PREPACK=1 VLLM_LAYA_ARENA=1`（默认开启 8×8 预打包零拷贝加载 +
-> 生命周期不交集静态 Arena 复用，`LQ8V` 魔数缓存）。
+当前真机（`192.168.1.227`，K1 8 线程，`cases.txt` 首行单 case，n=59，2026-11-08 串行实测）：
+
+| 执行路径 | 端到端 Wall | 峰值 RSS | 加载分项 |
+|---|---:|---:|---:|
+| 首次（冷启动，无缓存，`prepack=0` 在线量化） | 12,796 ms | 1,600,000 KB（≈1.53 GB） | `load=9199.9 ms` |
+| 已有缓存（`prepack=1` 零拷贝直读） | 6,695 ms | 781,312 KB（≈0.75 GB） | `load=3149.2 ms` |
+
+冷→热：Wall **1.91×**、加载 **2.92×**、峰值 RSS **−51%**；单 case 前向计算本身几乎不变
+（冷 3,280.2 ms / 热 3,195.3 ms），差异全部来自加载。全 6 case 批量口径为冷 **72,345 ms**、
+热 **59,768 ms**（峰值 RSS 1,600,000 / 808,576 KB）。
+
+热缓存 n=59 的 `[LAYA-TIME]` 分项：`total=3195.3ms | mm=2724.0 (85.3%) attn=179.7 norm=81.0
+act=80.4 resid=73.0 rope=50.3 emb=3.3 sco=2.1`，其中 `ime_gemm=866.9 ms`。
+
+> 预打包与 Arena 已**恒开**（源码收口，`VLLM_LAYA_PREPACK` / `VLLM_LAYA_ARENA` 环境变量已删除）：
+> 8×8 预打包零拷贝加载 + 生命周期不交集静态 Arena 复用，缓存文件为 `LQ8V` 魔数
+> （`laya_q8_qb512_ime.vqf`，`LAYA_QB=512`）。K1 IME 路径由 `/proc/cpuinfo` 自动探测
+> （`_ime` / `spacemit` / `SpacemiT`），无需手动 `VLLM_LAYA_IME=1`。
 
 ---
 
@@ -381,7 +416,22 @@ python tools/yolo/yolo_to_vqf.py --pt yolov8n.pt --out yolov8n.vqf --check   # �
 # 或 serve 下 POST /v1/detect
 ```
 
-版本差异：v5 anchor-based、v8 anchor-free + DFL、v11 含 C2PSA 注意力，按版分别适配。
+版本差异：本项目「v5」指 ultralytics-native `yolov5nu`（anchor-free + DFL + cv3 检测头），
+传统 v7.0 anchor-based `yolov5n` 不受当前 `YOP_DETECT` 支持；v8 为 anchor-free + DFL；
+v11 含 C2PSA 注意力，按版分别适配。
+
+**3. 复现基准（`192.168.1.227`，K1 8 线程，`bus.jpg`，端到端 Wall 含模型加载，2026-11-08 串行实测）**：
+
+| 模型 | F32 Wall | F32 峰值 RSS | Q8 Wall | Q8 峰值 RSS |
+|---|---:|---:|---:|---:|
+| yolov5nu | 14,815 ms | 26,996 KB | 650 ms | 38,796 KB |
+| yolov8n  | 15,321 ms | 29,140 KB | 646 ms | 34,292 KB |
+| yolo11n  | 15,364 ms | 31,664 KB | 649 ms | 35,848 KB |
+
+> F32 为未量化参考路径（单图约 15 s），Q8 走 per-channel int8 优化路径（约 0.65 s）。
+> 三个模型均返回 bus.jpg 约 5 个 `person/bus` 框（v8n 额外 1 个低分 `stop sign`）；新生成的
+> v5/v11 Q8 采用 `--conv-layout legacy`（与真机既有 yolov8n_q8 的 `layout=0` 一致）。
+> 日志形如 `[YOLO] conv weights: F32=0 int8=63 (per-channel scale, prepack hwc=0 ime=0)`。
 
 ---
 
