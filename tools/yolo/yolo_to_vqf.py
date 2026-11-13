@@ -759,7 +759,7 @@ def main():
             if gp == 1 and args.conv_layout == "hwc":
                 q_bytes = repack_conv_q8_hwc(q)
                 lay = LAYOUT_CONV_HWC_TAP
-            elif gp == 1 and args.conv_layout == "ime":
+            elif gp == 1 and args.conv_layout == "ime" and (int(q.shape[0]) % 8) == 0:
                 q_bytes = repack_conv_q8_ime(q)
                 lay = LAYOUT_CONV_IME_K1
             else:

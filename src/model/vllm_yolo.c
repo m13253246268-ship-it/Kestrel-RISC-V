@@ -76,6 +76,12 @@ typedef struct {
     const uint32_t *prm;
 } YOp;
 
+typedef struct {
+    size_t len, off;
+    int def, first, last, layout;
+    int planned_first, planned_last, planned_layout;
+} YViewPlan;
+
 struct StYoloModel {
     uint8_t  *blob;
     size_t    size;
@@ -90,6 +96,12 @@ struct StYoloModel {
     int      *slot_last_use;
     float    *arena;
     size_t    arena_cap;    /* float 元素容量 */
+    size_t   *arena_offsets; /* 最近成功的主表示计划；SIZE_MAX 表示未分配 */
+    int       arena_ih, arena_iw;
+    size_t    arena_plan_hits, arena_plan_builds;
+    YViewPlan *views;
+    int view_step, view_complete, view_ready;
+    size_t arena_main_elems, arena_view_elems;
     /* 卷积/矩阵权重索引（按 cid 直查张量）：F32 或 int8 + per-channel scale */
     const float  **cw;      /* F32 权重（Q8 模型为 NULL） */
     const int8_t **cq;      /* int8 权重（Q8） */
@@ -161,6 +173,7 @@ StYoloModel *st_yolo_load(const char *path) {
     fseek(f, 0, SEEK_SET);
     if (sz <= (long)sizeof(VQFHeader)) { fclose(f); return NULL; }
     StYoloModel *m = (StYoloModel *)calloc(1, sizeof(*m));
+    if (!m) { fclose(f); return NULL; }
     m->blob = (uint8_t *)malloc((size_t)sz);
     if (!m->blob || fread(m->blob, 1, (size_t)sz, f) != (size_t)sz) {
         free(m->blob); free(m); fclose(f); return NULL;
@@ -200,7 +213,8 @@ StYoloModel *st_yolo_load(const char *path) {
     if (m->size < data_off + 8) goto fail;
 
     /* FNV-1a（目录 + 数据区）对照尾部 8B —— 与 python 写出侧同规 */
-    {
+    /* fix 2a: file_len==0 表示"不校验"，跳过整个块；否则 file_len-data_off 会 uint64 下溢 */
+    if (file_len != 0) {
         size_t dir_off = 448, dn = (size_t)h->n_tensors * 64;
         if (dir_off + dn > m->size) { fprintf(stderr, "[YOLO] dir overflow\n"); goto fail; }
         uint64_t sum = 0xCBF29CE484222325ull;
@@ -217,6 +231,7 @@ StYoloModel *st_yolo_load(const char *path) {
     /* 目录 */
     m->n_tens = (int)h->n_tensors;
     m->tens = (YTens *)calloc((size_t)m->n_tens, sizeof(YTens));
+    if (!m->tens) goto fail;
     for (int i = 0; i < m->n_tens; i++) {
         const VQFTensor *t = (const VQFTensor *)(m->blob + 448 + (size_t)i * 64);
         YTens *d = &m->tens[i];
@@ -224,7 +239,7 @@ StYoloModel *st_yolo_load(const char *path) {
         d->qtype = t->qtype; d->rows = t->rows; d->cols = t->cols;
         d->layout = t->layout;
         d->off = t->offset; d->bytes = t->bytes;
-        if (t->offset + t->bytes > m->size) {
+        if (t->offset > m->size || t->bytes > m->size - t->offset) {
             fprintf(stderr, "[YOLO] tensor %s out of range\n", d->name);
             goto fail;
         }
@@ -237,6 +252,7 @@ StYoloModel *st_yolo_load(const char *path) {
         if (gi < 0 || m->tens[gi].qtype != VQF_QT_BLOB) {
             fprintf(stderr, "[YOLO] graph tensor missing\n"); goto fail;
         }
+        if (m->tens[gi].bytes < 12) { fprintf(stderr, "[YOLO] graph tensor too small\n"); goto fail; }
         m->graph = m->tens[gi].ptr;
         uint32_t magic, gver, nops;
         memcpy(&magic, m->graph, 4); memcpy(&gver, m->graph + 4, 4);
@@ -245,6 +261,7 @@ StYoloModel *st_yolo_load(const char *path) {
         if (gver != 1) { fprintf(stderr, "[YOLO] graph version %u\n", gver); goto fail; }
         m->n_ops = (int)nops;
         m->ops = (YOp *)calloc((size_t)m->n_ops, sizeof(YOp));
+        if (!m->ops && m->n_ops) goto fail;
         const uint8_t *p = m->graph + 12, *end = m->graph + m->tens[gi].bytes;
         int maxslot = 0, maxcid = -1;
         for (int i = 0; i < m->n_ops; i++) {
@@ -253,6 +270,10 @@ StYoloModel *st_yolo_load(const char *path) {
             memcpy(&o->op, p, 4); memcpy(&o->nin, p + 4, 4);
             memcpy(&o->nparam, p + 8, 4); memcpy(&o->out, p + 12, 4);
             p += 16;
+            /* Arena planning requires one definition per slot. */
+            if (o->out == 0) goto fail;
+            for (int j = 0; j < i; j++)
+                if (m->ops[j].out == o->out) goto fail;
             if (p + 4 * ((size_t)o->nin + o->nparam) > end) {
                 fprintf(stderr, "[YOLO] graph op %d overflow\n", i); goto fail;
             }
@@ -272,6 +293,7 @@ StYoloModel *st_yolo_load(const char *path) {
         /* 阶段 P3：离线/加载期计算每个 slot 的生命周期终点 last_use[s]
          * [SHS 公理映射: set_5foperations_91154c82 (集合不交集公理)] */
         m->slot_last_use = (int *)calloc((size_t)m->n_slots, sizeof(int));
+        if (!m->slot_last_use) goto fail;
         for (int s = 0; s < m->n_slots; s++) m->slot_last_use[s] = -1;
         for (int i = 0; i < m->n_ops; i++) {
             const YOp *o = &m->ops[i];
@@ -286,6 +308,12 @@ StYoloModel *st_yolo_load(const char *path) {
         /* 最终输出槽位保持存活至全图末尾 */
         if (m->n_ops > 0) {
             uint32_t last_out = m->ops[m->n_ops - 1].out;
+            for (int i = 0; i < m->n_ops; i++) {
+                uint32_t op = m->ops[i].op;
+                if (op == YOP_DETECT || op == YOP_SOFTMAX || op == YOP_MATMUL ||
+                    op == YOP_RMSNORM || op == YOP_ROPE || op == YOP_SWIGLU)
+                    last_out = m->ops[i].out;
+            }
             if ((int)last_out < m->n_slots)
                 m->slot_last_use[last_out] = m->n_ops;
         }
@@ -302,6 +330,9 @@ StYoloModel *st_yolo_load(const char *path) {
         m->nw_owned = (uint8_t *)calloc((size_t)maxcid + 1, sizeof(uint8_t));
         m->iw       = (int8_t **)calloc((size_t)maxcid + 1, sizeof(int8_t *));
         m->iw_owned = (uint8_t *)calloc((size_t)maxcid + 1, sizeof(uint8_t));
+        if (maxcid >= 0 && (!m->cw || !m->cq || !m->cs || !m->cb ||
+            !m->crow || !m->ccol || !m->clayout || !m->cq_chw ||
+            !m->nw || !m->nw_owned || !m->iw || !m->iw_owned)) goto fail;
         int n_prepack_hwc = 0, n_prepack_ime = 0;
         for (int c = 0; c <= maxcid; c++) {
             char nm[32];
@@ -363,6 +394,8 @@ void st_yolo_free(StYoloModel *m) {
     free(m->tens); free(m->ops);
     free(m->slot_last_use);
     free(m->arena);
+    free(m->arena_offsets);
+    free(m->views);
     free(m->cw); free(m->cq); free(m->cs); free(m->cb);
     free(m->crow); free(m->ccol); free(m->clayout);
     if (m->cq_chw) {
@@ -589,7 +622,13 @@ static int yolo_im2col_q8_hwc(const float *x, int C, int H, int W,
     if (!rb || (packed && !qb)) { free(rb); free(qb); return -1; }
     for (int i = 0; i < nth; i++) {
         rb[i] = (float *)malloc((size_t)K * sizeof(float));
-        if (!rb[i]) { for (int j = 0; j < i; j++) free(rb[j]); free(rb); free(qb); return -1; }
+        if (!rb[i]) {
+            for (int j = 0; j < i; j++) free(rb[j]);
+            free(rb);
+            if (packed) { for (int j = 0; j < i; j++) free(qb[j]); }  /* fix: release already-allocated qb[j] */
+            free(qb);
+            return -1;
+        }
         if (packed) {
             qb[i] = (int8_t *)malloc((size_t)Kp);
             if (!qb[i]) {
@@ -882,6 +921,8 @@ static void yime_pin_hart(int h) {
 
 /* V56 诊断：VLLM_YOLO_IME_DEBUG=1 时逐层打印内核+epilogue 耗时 */
 static double yime_acc_conv = 0.0;
+static int yime_timing;
+static double yime_kernel_sum, yime_epi_sum, yime_wall;
 static int yime_dbg(void) {
     static int g = -1;
     if (g < 0) { const char *e = getenv("VLLM_YOLO_IME_DEBUG"); g = (e && e[0] == '1'); }
@@ -962,8 +1003,10 @@ static int8_t *yime_pack_a(const int8_t *Wq, int OC, int Kp) {
 /* 整层：nb 方向并行（绑 hart0-3），epilogue 与生产逐字相同 */
 static void yconv_ime(const int8_t *apack, const int8_t *bpack,
                       const float *cs, const float *b, const float *rowsc,
-                      int OC, int Kp, int P, int act, float *y) {
+                      int OC, int Kp, int P, int act, float *y, int out_hwc) {
     const int mt_n = OC / 8, kb_n = Kp / 8, nb_n = (P + 15) / 16;
+    double kt[4] = {0}, et[4] = {0};
+    const double wall0 = yime_timing ? ynow() : 0.0;
     int nt = 4;
 #ifdef _OPENMP
     { int v = omp_get_max_threads(); if (v < nt) nt = v; }
@@ -980,13 +1023,17 @@ static void yconv_ime(const int8_t *apack, const int8_t *bpack,
 #pragma omp for schedule(static)
 #endif
         for (int nb = 0; nb < nb_n; nb++) {
+            double kernel_local = 0.0, epi_local = 0.0;
             const int px0 = nb * 16;
             const size_t left = (size_t)(P - px0);
             const size_t npx = left < 16 ? left : 16;
             const int8_t *bp = bpack + (size_t)nb * kb_n * 128;
             for (int mt = 0; mt < mt_n; mt++) {
                 int32_t acc[8][16];
+                double t0 = yime_timing ? ynow() : 0.0;
                 yime_kernel(apack + (size_t)mt * kb_n * 64, bp, kb_n, acc);
+                double t1 = yime_timing ? ynow() : 0.0;
+                if (yime_timing) kernel_local += t1 - t0;
                 for (int mv = 0; mv < 2; mv++) {
                     for (int q = 0; q < 4; q++) {
                         const int oc = mt * 8 + mv * 4 + q;
@@ -1012,15 +1059,29 @@ static void yconv_ime(const int8_t *apack, const int8_t *bpack,
                             f = __riscv_vfdiv_vv_f32m2(
                                     f, __riscv_vfadd_vf_f32m2(e_, 1.0f, vl), vl);
                         }
-                        __riscv_vse32_v_f32m2(y + (size_t)oc * P + px0, f, vl);
+                        if (out_hwc)
+                            __riscv_vsse32_v_f32m2(y + (size_t)px0 * OC + oc, (ptrdiff_t)OC * sizeof(float), f, vl);
+                        else __riscv_vse32_v_f32m2(y + (size_t)oc * P + px0, f, vl);
                     }
                 }
+                if (yime_timing) epi_local += ynow() - t1;
+            }
+            if (yime_timing) {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                kt[tid] += kernel_local; et[tid] += epi_local;
             }
         }
 #ifdef _OPENMP
         if (have_old) sched_setaffinity(0, sizeof(old), &old);
     }
 #endif
+    if (yime_timing) {
+        for (int t = 0; t < 4; t++) { yime_kernel_sum += kt[t]; yime_epi_sum += et[t]; }
+        yime_wall += ynow() - wall0;
+    }
 }
 
 #endif
@@ -1061,17 +1122,16 @@ static const int8_t *yconv_ensure_chw_q8(StYoloModel *m, uint32_t cid,
     const int K = icg * KH * KW;
     const int Kp = (K + 31) & ~31;
     int8_t *chw = (int8_t *)calloc((size_t)OC * K, 1);
-    if (!chw) return m->cq[cid];
+    if (!chw) return NULL;
     if (lay == VQF_LAYOUT_CONV_HWC_TAP) {
         yconv_unpack_hwc_to_chw(chw, m->cq[cid], OC, icg, KH, KW, Kp);
     } else if (lay == VQF_LAYOUT_CONV_IME_K1) {
         int8_t *hwc_tmp = (int8_t *)calloc((size_t)OC * Kp, 1);
-        if (hwc_tmp) {
-            yconv_unpack_ime_to_hwc(hwc_tmp, m->cq[cid], OC, Kp);
-            yconv_unpack_hwc_to_chw(chw, hwc_tmp, OC, icg, KH, KW, Kp);
-            free(hwc_tmp);
-        }
-    }
+        if (!hwc_tmp) { free(chw); return NULL; }
+        yconv_unpack_ime_to_hwc(hwc_tmp, m->cq[cid], OC, Kp);
+        yconv_unpack_hwc_to_chw(chw, hwc_tmp, OC, icg, KH, KW, Kp);
+        free(hwc_tmp);
+    } else { free(chw); return NULL; }
     m->cq_chw[cid] = chw;
     return chw;
 }
@@ -1085,7 +1145,8 @@ static const int8_t *yconv_ensure_chw_q8(StYoloModel *m, uint32_t cid,
 static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W,
                              uint32_t cid, const float *b, int OC, int KH, int KW,
                              int sh, int sw, int ph, int pw, int G, int act,
-                             float *y, int OH, int OW) {
+                             float *y, int OH, int OW, int in_hwc, int *out_hwc) {
+    if (out_hwc) *out_hwc = 0;
     if (G != 1) return 0;                              /* 分组卷积：回退标量 */
     if ((int)cid > m->max_cid || !m->cq[cid] || !m->cs[cid]) return 0;  /* 需 int8 权重 */
     const int K = C * KH * KW;
@@ -1112,6 +1173,7 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
                 yconv_unpack_ime_to_hwc(w, m->cq[cid], OC, Kp);
                 if (!hwc) {
                     const int8_t *chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+                    if (!chw) { free(w); return 0; }
                     memset(w, 0, (size_t)OC * Kp);
                     for (int oc = 0; oc < OC; oc++)
                         memcpy(w + (size_t)oc * Kp, chw + (size_t)oc * K, (size_t)K);
@@ -1119,6 +1181,7 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
             } else if (lay == VQF_LAYOUT_CONV_HWC_TAP) {
                 /* lay==4 但 hwc==0（逃生舱关闭 HWC）：逆向解包回 CHW 并补 0 到 Kp */
                 const int8_t *chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+                if (!chw) { free(w); return 0; }
                 for (int oc = 0; oc < OC; oc++)
                     memcpy(w + (size_t)oc * Kp, chw + (size_t)oc * K, (size_t)K);
             } else {
@@ -1183,15 +1246,15 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
     /* 输入 CHW → HWC（scratch 复用，避免每层 malloc/free 首次触页）。 */
     {
         const size_t need = (size_t)C * H * W;
-        if (need > m->hx_cap) {
+        if (!in_hwc && need > m->hx_cap) {
             float *nb = (float *)realloc(m->hx, need * sizeof(float));
-            if (!nb) { free(imc); free(rowsc); return 0; }
+            if (!nb) { free(imc); if (!use_ime) free(rowsc); return 0; }
             m->hx = nb; m->hx_cap = need;
         }
-        yolo_chw2hwc_blocked(x, m->hx, C, H, W);
+        if (!in_hwc) yolo_chw2hwc_blocked(x, m->hx, C, H, W);
         const double _tt = ynow();
         yacc_trans += _tt - _t0;
-        i2c_rc = yolo_im2col_q8_hwc(m->hx, C, H, W, KH, KW, sh, sw, ph, pw,
+        i2c_rc = yolo_im2col_q8_hwc(in_hwc ? x : m->hx, C, H, W, KH, KW, sh, sw, ph, pw,
                                     OH, OW, K, Kp, imc, rowsc, use_ime ? m->ib : NULL);
         yacc_gather += ynow() - _tt;
     }
@@ -1204,7 +1267,8 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
 #if ST_HAVE_RVV
     if (use_ime) {
         const double _t1 = ynow();
-        yconv_ime(m->iw[cid], m->ib, cs, b, rowsc, OC, Kp, P, act, y);
+        yconv_ime(m->iw[cid], m->ib, cs, b, rowsc, OC, Kp, P, act, y, out_hwc != NULL);
+        if (out_hwc) *out_hwc = 1;
         const double _t2 = ynow();
         yime_acc_conv += _t2 - _t1;
         if (yime_dbg())
@@ -1303,7 +1367,7 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
     return 1;
 }
 
-static void yconv_dispatch(StYoloModel *m, const float *x, int C, int H, int W,
+static int yconv_dispatch(StYoloModel *m, const float *x, int C, int H, int W,
                            uint32_t cid, int hb, int OC, int KH, int KW,
                            int sh, int sw, int ph, int pw, int G, int act,
                            float *y, int OH, int OW) {
@@ -1312,27 +1376,29 @@ static void yconv_dispatch(StYoloModel *m, const float *x, int C, int H, int W,
     if (m->cw[cid]) {
         /* F32 权重：标量 F32 卷积（F32 模型无 int8 权重，dotprod 不适用）。 */
         yconv(x, C, H, W, m->cw[cid], b, OC, KH, KW, sh, sw, ph, pw, G, act, y, OH, OW);
-        return;
+        return 0;
     }
     /* Phase 1（K-YOLO-002）：CPU int8 dotprod 卷积。
      * 不适用（分组/无 int8 权重等）时显式回退标量 yconv_q8（公理
      * silent_fallback_false_pass，J-CPU-4）。 */
     if (yconv_cpu_dotprod(m, x, C, H, W, cid, b, OC, KH, KW, sh, sw,
-                          ph, pw, G, act, y, OH, OW))
-        return;
+                          ph, pw, G, act, y, OH, OW, 0, NULL))
+        return 0;
     /* V51 诊断：VLLM_YOLO_SCALAR_PROF=1 时打印回退到标量 yconv_q8 的层
      * （分组 depthwise 与 dotprod 不适用者）及其耗时，用于定位残余耗时归属。 */
     const int prof = getenv("VLLM_YOLO_SCALAR_PROF") != NULL;
     const double t0 = prof ? ynow() : 0.0;
     const int8_t *wq_chw = yconv_ensure_chw_q8(m, cid, OC, C, KH, KW, G);
+    if (!wq_chw) return -1;
     yconv_q8(x, C, H, W, wq_chw, m->cs[cid], b, OC, KH, KW, sh, sw, ph, pw,
              G, act, y, OH, OW);
     if (prof)
         fprintf(stderr, "[SCALAR-CONV] %6.2fms cid=%u C=%d %dx%d k%d g%d oc=%d P=%d act=%d\n",
                 (ynow() - t0) * 1e3, cid, C, H, W, KH, G, OC, OH * OW, act);
+    return 0;
 }
 
-static void yattn_psa(StYoloModel *m, const float *x, int C, int H, int W,
+static int yattn_psa(StYoloModel *m, const float *x, int C, int H, int W,
                       int nh, int hd, int kd,
                       uint32_t cqkv, uint32_t cproj, uint32_t cpe, float *y) {
     const int N = H * W;
@@ -1342,10 +1408,8 @@ static void yattn_psa(StYoloModel *m, const float *x, int C, int H, int W,
     float *vbuf = (float *)malloc((size_t)C * N * sizeof(float));   /* 连续 v（pe 输入） */
     float *vm  = (float *)malloc((size_t)C * N * sizeof(float));    /* 注意力输出 o */
     float *out = (float *)malloc((size_t)C * N * sizeof(float));
-    if (!qkv || !att || !vbuf || !vm || !out) {
-        free(qkv); free(att); free(vbuf); free(vm); free(out); return;
-    }
-    yconv_dispatch(m, x, C, H, W, cqkv, m->cb[cqkv] != NULL, hq, 1, 1, 1, 1, 0, 0, 1, 0, qkv, H, W);
+    if (!qkv || !att || !vbuf || !vm || !out) goto fail;
+    if (yconv_dispatch(m, x, C, H, W, cqkv, m->cb[cqkv] != NULL, hq, 1, 1, 1, 1, 0, 0, 1, 0, qkv, H, W) != 0) goto fail;
     const float scale = 1.f / sqrtf((float)kd);
     /* qkv[c][p], 每头块内布局 [q(kd) k(kd) v(hd)]；v 拷成连续 [nh,hd,N] */
     for (int h = 0; h < nh; h++) {
@@ -1390,26 +1454,137 @@ static void yattn_psa(StYoloModel *m, const float *x, int C, int H, int W,
         }
     }
     /* o += pe(v)（pe 为 depthwise 3×3 分组卷积） */
-    yconv_dispatch(m, vbuf, C, H, W, cpe, m->cb[cpe] != NULL, C, 3, 3, 1, 1, 1, 1, C, 0, out, H, W);
+    if (yconv_dispatch(m, vbuf, C, H, W, cpe, m->cb[cpe] != NULL, C, 3, 3, 1, 1, 1, 1, C, 0, out, H, W) != 0) goto fail;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if((long long)C * N > 65536)
 #endif
     for (long long i = 0; i < (long long)C * N; i++) vm[i] += out[i];
-    yconv_dispatch(m, vm, C, H, W, cproj, m->cb[cproj] != NULL, C, 1, 1, 1, 1, 0, 0, 1, 0, out, H, W);
+    if (yconv_dispatch(m, vm, C, H, W, cproj, m->cb[cproj] != NULL, C, 1, 1, 1, 1, 0, 0, 1, 0, out, H, W) != 0) goto fail;
     memcpy(y, out, (size_t)C * N * sizeof(float));
     free(qkv); free(att); free(vbuf); free(vm); free(out);
+    return 0;
+fail:
+    free(qkv); free(att); free(vbuf); free(vm); free(out);
+    return -1;
 }
 
 /* ---- 槽位与阶段 P3 静态 Arena 规划器 ----
  * [SHS 公理映射: set_5foperations_91154c82 (集合不交集公理)]
  * 生命周期区间 L(s_i) ∩ L(s_j) = ∅ 时共享同一连续 Arena 偏移，
  * 消除每帧 60+ 次独立 malloc/free 与首次触页开销。 */
-typedef struct { float *buf; int c, h, w; int owned; } YSlot;
+typedef struct {
+    float *buf; int c, h, w; int owned; int layout; float *other;
+    int other_owned, other_valid;
+    StYoloModel *model;
+    YViewPlan *view;
+} YSlot;
+
+static size_t slot_idx(const YSlot *s, int c, size_t p) {
+    return s->layout ? p * s->c + c : (size_t)c * s->h * s->w + p;
+}
+
+static int slot_view(YSlot *s, int layout, YSlot *v) {
+    *v = *s;
+    v->owned = 0;
+    v->other = NULL;
+    if (s->layout != layout) {
+        YViewPlan *p = s->view;
+        if (p) {
+            int step = s->model->view_step;
+            if (p->first < 0 || step < p->first) p->first = step;
+            if (step > p->last) p->last = step;
+            p->layout = s->layout;
+            if (s->other && !s->other_owned &&
+                (step < p->planned_first || step > p->planned_last ||
+                 s->layout != p->planned_layout)) {
+                s->other = NULL;
+                s->other_valid = 0;
+            }
+        }
+        if (!s->other_valid) {
+            size_t n = (size_t)s->c * s->h * s->w;
+            if (!s->other) {
+                s->other = (float *)malloc(n * sizeof(float));
+                if (!s->other) return -1;
+                s->other_owned = 1;
+            }
+            if (layout) yolo_chw2hwc_blocked(s->buf, s->other, s->c, s->h, s->w);
+            else for (int c = 0; c < s->c; c++)
+                for (size_t p = 0; p < (size_t)s->h * s->w; p++)
+                    s->other[(size_t)c * s->h * s->w + p] = s->buf[p * s->c + c];
+            s->other_valid = 1;
+        }
+        v->buf = s->other;
+        v->layout = layout;
+    }
+    return 0;
+}
+
+/* Keep main offsets fixed; place recorded views against all intersecting intervals. */
+static void yolo_plan_views(StYoloModel *m) {
+    if (!m->views || !m->view_complete || m->view_ready) return;
+    size_t peak = m->arena_main_elems;
+    for (int s = 0; s < m->n_slots; s++) {
+        YViewPlan *p = &m->views[s];
+        p->off = SIZE_MAX;
+        if (p->first < 0) continue;
+        size_t off = 0;
+        for (;;) {
+            size_t next = off;
+            for (int j = 0; j < m->n_slots; j++) {
+                YViewPlan *q = &m->views[j];
+                if (q->len && q->def <= p->last && m->slot_last_use[j] >= p->first &&
+                    off < m->arena_offsets[j] + q->len && m->arena_offsets[j] < off + p->len)
+                    if (next < m->arena_offsets[j] + q->len) next = m->arena_offsets[j] + q->len;
+                if (j < s && q->off != SIZE_MAX && q->first <= p->last && q->last >= p->first &&
+                    off < q->off + q->len && q->off < off + p->len)
+                    if (next < q->off + q->len) next = q->off + q->len;
+            }
+            if (next == off) break;
+            off = next;
+        }
+        p->off = off;
+        p->planned_first = p->first; p->planned_last = p->last;
+        p->planned_layout = p->layout;
+        if (peak < off + p->len) peak = off + p->len;
+    }
+    if (peak > m->arena_cap) {
+        float *a = (float *)realloc(m->arena, peak * sizeof(float));
+        if (!a) return;
+        m->arena = a; m->arena_cap = peak;
+    }
+    m->arena_view_elems = peak - m->arena_main_elems;
+    m->view_ready = 1;
+}
+
+static void yolo_bind_views(StYoloModel *m, YSlot *S) {
+    m->view_complete = 0;
+    if (!m->views) return;
+    for (int s = 0; s < m->n_slots; s++) {
+        YViewPlan *p = &m->views[s];
+        S[s].model = m; S[s].view = p;
+        S[s].other_valid = 0;
+        if (m->view_ready && p->off != SIZE_MAX) S[s].other = m->arena + p->off;
+    }
+}
 
 /* 依据输入尺寸 (ih, iw) 静态推导全图各 slot 形状与生命周期不交集 Arena 偏移 */
 static int yolo_plan_arena(StYoloModel *m, int ih, int iw, YSlot *S) {
     if (!m->slot_last_use || m->n_slots <= 0) return 0;
     const int ns = m->n_slots;
+    /* 主表示计划仅由不可变图和输入尺寸决定，与后端/layout 无关。 */
+    if (m->arena_offsets && m->arena_ih == ih && m->arena_iw == iw) {
+        yolo_plan_views(m);
+        yolo_bind_views(m, S);
+        for (int s = 0; s < ns; s++) {
+            if (m->arena_offsets[s] != SIZE_MAX) {
+                S[s].buf = m->arena + m->arena_offsets[s];
+                S[s].owned = 0;
+            }
+        }
+        m->arena_plan_hits++;
+        return 1;
+    }
     size_t *s_elems = (size_t *)calloc((size_t)ns, sizeof(size_t));
     size_t *s_off   = (size_t *)calloc((size_t)ns, sizeof(size_t));
     int    *s_def   = (int *)calloc((size_t)ns, sizeof(int));
@@ -1574,15 +1749,36 @@ static int yolo_plan_arena(StYoloModel *m, int ih, int iw, YSlot *S) {
         if (s_elems[s] > 0) {
             S[s].buf = m->arena + s_off[s];
             S[s].owned = 0;
+        } else {
+            s_off[s] = SIZE_MAX;
         }
     }
-    free(s_elems); free(s_off); free(s_def);
+    free(m->arena_offsets);
+    m->arena_offsets = s_off;
+    m->arena_ih = ih; m->arena_iw = iw;
+    m->arena_plan_builds++;
+    free(m->views);
+    m->views = (YViewPlan *)calloc((size_t)ns, sizeof(YViewPlan));
+    m->view_ready = m->view_complete = 0;
+    m->arena_main_elems = total_elems; m->arena_view_elems = 0;
+    if (m->views) for (int s = 0; s < ns; s++) {
+        m->views[s].len = s_elems[s];
+        m->views[s].def = s_def[s] - 1;
+        m->views[s].first = m->views[s].last = -1;
+        m->views[s].off = SIZE_MAX;
+    }
+    yolo_bind_views(m, S);
+    free(s_elems); free(s_def);
     return 1;
 }
 
 static float *slot_new(YSlot *S, uint32_t s, int c, int h, int w) {
+    if (S[s].other_owned) { free(S[s].other); S[s].other = NULL; }
+    S[s].other_owned = S[s].other_valid = 0;
+    S[s].layout = 0;
     S[s].c = c; S[s].h = h; S[s].w = w;
     if (S[s].buf && !S[s].owned) return S[s].buf;   /* 阶段 P3：静态 Arena 已预分配 */
+    if (S[s].owned) free(S[s].buf);
     size_t n = (size_t)c * h * w;
     S[s].buf = (float *)malloc(n * sizeof(float));
     S[s].owned = 1;
@@ -1591,8 +1787,10 @@ static float *slot_new(YSlot *S, uint32_t s, int c, int h, int w) {
 
 static void slots_free(YSlot *S, int n_slots) {
     if (!S) return;
-    for (int i = 0; i < n_slots; i++)
-        if (S[i].owned && S[i].buf) free(S[i].buf);
+    for (int i = 0; i < n_slots; i++) {
+        if (S[i].owned) free(S[i].buf);
+        if (S[i].other_owned) free(S[i].other);
+    }
     free(S);
 }
 
@@ -1609,6 +1807,9 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
     m->n_conv_ops = m->n_elem_ops = 0;
 #if ST_HAVE_RVV
     yime_acc_conv = 0.0;
+    { const char *e = getenv("VLLM_YOLO_IME_TIMING");
+      yime_timing = e && e[0] && e[0] != '0'; }
+    yime_kernel_sum = yime_epi_sum = yime_wall = 0.0;
 #endif
     yacc_trans = yacc_gather = 0.0;
     if (cpu_tim) {
@@ -1617,12 +1818,13 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
     }
     double _fwd0 = cpu_tim ? ynow() : 0.0;
     yolo_plan_arena(m, ih, iw, S);
-    slot_new(S, 0, 3, ih, iw);
+    if (!slot_new(S, 0, 3, ih, iw)) return -1;
     memcpy(S[0].buf, in, (size_t)3 * ih * iw * sizeof(float));
 
     for (int i = 0; i < m->n_ops; i++) {
         const YOp *o = &m->ops[i];
         const uint32_t *P = o->prm;
+        m->view_step = i;
         double _op0 = cpu_tim ? ynow() : 0.0;
         switch (o->op) {
         case YOP_CONV: {
@@ -1636,14 +1838,25 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             if (OC <= 0) { fprintf(stderr, "[YOLO] conv cid=%u weight missing\n", cid); return -1; }
             float *y = slot_new(S, o->out, OC, OH, OW);
             if (!y) return -1;
-            yconv_dispatch(m, x->buf, x->c, x->h, x->w, cid, hb, OC, KH, KW,
-                           sh, sw, ph, pw, G, act, y, OH, OW);
+            if (!m->cw[cid] &&
+                yconv_cpu_dotprod(m, x->buf, x->c, x->h, x->w, cid, hb ? m->cb[cid] : NULL,
+                    OC, KH, KW, sh, sw, ph, pw, G, act, y, OH, OW, x->layout, &S[o->out].layout)) {
+                m->cpu_convs++;
+            } else {
+                YSlot v;
+                if (slot_view(x, 0, &v) != 0) return -1;
+                if (yconv_dispatch(m, v.buf, v.c, v.h, v.w, cid, hb, OC, KH, KW,
+                                   sh, sw, ph, pw, G, act, y, OH, OW) != 0) return -1;
+            }
             break;
         }
         case YOP_ADD: {
-            YSlot *a = &S[o->ins[0]], *b = &S[o->ins[1]];
+            YSlot *a = &S[o->ins[0]], bv, *b = &bv;
+            if (slot_view(&S[o->ins[1]], a->layout, &bv) != 0) return -1;
             long long n = (long long)a->c * a->h * a->w;
             float *y = slot_new(S, o->out, a->c, a->h, a->w);
+            if (!y) return -1;
+            S[o->out].layout = a->layout;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(n > 65536)
 #endif
@@ -1654,7 +1867,25 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             int C = 0, h = S[o->ins[0]].h, w = S[o->ins[0]].w;
             for (uint32_t k = 0; k < o->nin; k++) C += S[o->ins[k]].c;
             float *y = slot_new(S, o->out, C, h, w);
+            if (!y) return -1;
             const size_t hw = (size_t)h * w;
+            int layout = 0;
+            for (uint32_t k = 0; k < o->nin; k++) layout |= S[o->ins[k]].layout;
+            if (layout) {
+                S[o->out].layout = 1;
+                int off = 0;
+                for (uint32_t k = 0; k < o->nin; k++) {
+                    YSlot v;
+                    if (slot_view(&S[o->ins[k]], 1, &v) != 0) return -1;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(hw * C > 65536)
+#endif
+                    for (size_t p = 0; p < hw; p++)
+                        memcpy(y + p * C + off, v.buf + p * v.c, (size_t)v.c * sizeof(float));
+                    off += v.c;
+                }
+                break;
+            }
             /* 各输入写入 y 的不相交区间 ⇒ 可并行（K-YOLO-002 Phase 2；前缀偏移先算）。 */
             if (o->nin <= 32) {
                 size_t off[32];
@@ -1685,6 +1916,8 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             int k = (int)P[0], st = (int)P[1], p = (int)P[2];
             int OH = (x->h + 2 * p - k) / st + 1, OW = (x->w + 2 * p - k) / st + 1;
             float *y = slot_new(S, o->out, x->c, OH, OW);
+            if (!y) return -1;
+            S[o->out].layout = x->layout;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(x->c > 2)
 #endif
@@ -1696,11 +1929,11 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
                             int iy = oy * st - p + ky; if (iy < 0 || iy >= x->h) continue;
                             for (int kx = 0; kx < k; kx++) {
                                 int ix = ox * st - p + kx; if (ix < 0 || ix >= x->w) continue;
-                                float v = x->buf[((size_t)c * x->h + iy) * x->w + ix];
+                                float v = x->buf[slot_idx(x, c, (size_t)iy * x->w + ix)];
                                 if (v > mx) mx = v;
                             }
                         }
-                        y[((size_t)c * OH + oy) * OW + ox] = mx;
+                        y[slot_idx(&S[o->out], c, (size_t)oy * OW + ox)] = mx;
                     }
             break;
         }
@@ -1709,6 +1942,24 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             int sc = (int)P[0];
             int OH = x->h * sc, OW = x->w * sc;
             float *y = slot_new(S, o->out, x->c, OH, OW);
+            if (!y) return -1;
+            S[o->out].layout = x->layout;
+            if (x->layout) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(x->h > 1)
+#endif
+                for (int iy = 0; iy < x->h; iy++) {
+                    float *row = y + (size_t)iy * sc * OW * x->c;
+                    const float *src = x->buf + (size_t)iy * x->w * x->c;
+                    for (int ix = 0; ix < x->w; ix++)
+                        for (int k = 0; k < sc; k++)
+                            memcpy(row + ((size_t)ix * sc + k) * x->c,
+                                   src + (size_t)ix * x->c, (size_t)x->c * sizeof(float));
+                    for (int k = 1; k < sc; k++)
+                        memcpy(row + (size_t)k * OW * x->c, row, (size_t)OW * x->c * sizeof(float));
+                }
+                break;
+            }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(x->c > 2)
 #endif
@@ -1723,6 +1974,8 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             YSlot *x = &S[o->ins[0]];
             long long n = (long long)x->c * x->h * x->w;
             float *y = slot_new(S, o->out, x->c, x->h, x->w);
+            if (!y) return -1;
+            S[o->out].layout = x->layout;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(n > 65536)
 #endif
@@ -1730,9 +1983,12 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             break;
         }
         case YOP_MUL: {
-            YSlot *a = &S[o->ins[0]], *b = &S[o->ins[1]];
+            YSlot *a = &S[o->ins[0]], bv, *b = &bv;
+            if (slot_view(&S[o->ins[1]], a->layout, &bv) != 0) return -1;
             long long n = (long long)a->c * a->h * a->w;
             float *y = slot_new(S, o->out, a->c, a->h, a->w);
+            if (!y) return -1;
+            S[o->out].layout = a->layout;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(n > 65536)
 #endif
@@ -1744,6 +2000,16 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             int a = (int)P[1], b2 = (int)P[2];
             int C = b2 - a;
             float *y = slot_new(S, o->out, C, x->h, x->w);
+            if (!y) return -1;
+            S[o->out].layout = x->layout;
+            if (x->layout) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if((size_t)C * x->h * x->w > 65536)
+#endif
+                for (size_t p = 0; p < (size_t)x->h * x->w; p++)
+                    memcpy(y + p * C, x->buf + p * x->c + a, (size_t)C * sizeof(float));
+                break;
+            }
             const float *src = x->buf + (size_t)a * x->h * x->w;
             long long tot = (long long)C * x->h * x->w;
 #ifdef _OPENMP
@@ -1754,7 +2020,8 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
         }
         case YOP_SOFTMAX: {
             /* 热带/概率归一化映射：默认沿 channel 维（axis=0）执行数值稳定 Softmax */
-            YSlot *x = &S[o->ins[0]];
+            YSlot xv, *x = &xv;
+            if (slot_view(&S[o->ins[0]], 0, &xv) != 0) return -1;
             int axis = (o->nparam >= 1) ? (int)P[0] : 0;
             float *y = slot_new(S, o->out, x->c, x->h, x->w);
             if (!y) return -1;
@@ -1791,11 +2058,13 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             break;
         }
         case YOP_ATTN_PSA: {
-            YSlot *x = &S[o->ins[0]];
+            YSlot xv, *x = &xv;
+            if (slot_view(&S[o->ins[0]], 0, &xv) != 0) return -1;
             int nh = (int)P[0], hd = (int)P[1], kd = (int)P[2];
             float *y = slot_new(S, o->out, x->c, x->h, x->w);
-            yattn_psa(m, x->buf, x->c, x->h, x->w, nh, hd, kd,
-                      P[3], P[4], P[5], y);
+            if (!y) return -1;
+            if (yattn_psa(m, x->buf, x->c, x->h, x->w, nh, hd, kd,
+                          P[3], P[4], P[5], y) != 0) return -1;
             break;
         }
         case YOP_MATMUL: {
@@ -1805,13 +2074,14 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             uint32_t cid = P[0];
             int hb  = (o->nparam >= 2) ? (int)P[1] : 0;
             int act = (o->nparam >= 3) ? (int)P[2] : 0;
-            YSlot *x = &S[o->ins[0]];
+            YSlot xv, *x = &xv;
+            if (slot_view(&S[o->ins[0]], 0, &xv) != 0) return -1;
             int OC = (cid <= (uint32_t)m->max_cid) ? m->crow[cid] : 0;
             if (OC <= 0) { fprintf(stderr, "[YOLO] matmul cid=%u weight missing\n", cid); return -1; }
             float *y = slot_new(S, o->out, OC, x->h, x->w);
             if (!y) return -1;
-            yconv_dispatch(m, x->buf, x->c, x->h, x->w, cid, hb, OC, 1, 1,
-                           1, 1, 0, 0, 1, act, y, x->h, x->w);
+            if (yconv_dispatch(m, x->buf, x->c, x->h, x->w, cid, hb, OC, 1, 1,
+                               1, 1, 0, 0, 1, act, y, x->h, x->w) != 0) return -1;
             *final_slot = o->out; *final_c = OC; *final_a = x->h * x->w;
             break;
         }
@@ -1822,7 +2092,8 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             uint32_t cid = P[0];
             float eps = 1e-6f;
             if (o->nparam >= 2 && P[1] != 0) memcpy(&eps, &P[1], sizeof(float));
-            YSlot *x = &S[o->ins[0]];
+            YSlot xv, *x = &xv;
+            if (slot_view(&S[o->ins[0]], 0, &xv) != 0) return -1;
             const float *w = (cid <= (uint32_t)m->max_cid) ? m->cw[cid] : NULL;
             float *y = slot_new(S, o->out, x->c, x->h, x->w);
             if (!y) return -1;
@@ -1848,7 +2119,8 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
         case YOP_ROPE: {
             /* 阶段 P2：正交旋转群 SO(2)^d 同构算子 RoPE
              * 对每个空间/序列位置 p 与每个注意力头，对半拆分通道 (d, d + hd/2) 施加旋转 */
-            YSlot *x = &S[o->ins[0]];
+            YSlot xv, *x = &xv;
+            if (slot_view(&S[o->ins[0]], 0, &xv) != 0) return -1;
             int hd = (o->nparam >= 1 && P[0] > 0) ? (int)P[0] : x->c;
             float theta = 10000.0f;
             if (o->nparam >= 2 && P[1] != 0) memcpy(&theta, &P[1], sizeof(float));
@@ -1877,7 +2149,9 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
         }
         case YOP_SWIGLU: {
             /* 阶段 P2：门控非线性合成算子 SwiGLU(gate, up) = SiLU(gate) * up */
-            YSlot *gate = &S[o->ins[0]], *up = &S[o->ins[1]];
+            YSlot gv, uv, *gate = &gv, *up = &uv;
+            if (slot_view(&S[o->ins[0]], 0, &gv) != 0 ||
+                slot_view(&S[o->ins[1]], 0, &uv) != 0) return -1;
             long long n = (long long)gate->c * gate->h * gate->w;
             float *y = slot_new(S, o->out, gate->c, gate->h, gate->w);
             if (!y) return -1;
@@ -1903,6 +2177,7 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             }
             int C = 4 + nc;
             float *y = slot_new(S, o->out, C, A, 1);
+            if (!y) return -1;
             int base = 0;
             for (int s = 0; s < 3; s++) {
                 YSlot *bx = &S[o->ins[s]];
@@ -1917,12 +2192,13 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
                     float ax = px + 0.5f, ay = py + 0.5f;
                     float d4[4];
                     for (int d = 0; d < 4; d++) {
-                        const float *bin = bx->buf + (size_t)d * rm * h * w + p;
+                        const float *bin = bx->buf + slot_idx(bx, d * rm, (size_t)p);
+                        size_t bstep = bx->layout ? 1 : (size_t)h * w;
                         float mx = bin[0], sum = 0.f;
-                        for (int j = 1; j < rm; j++) { float v = bin[(size_t)j * h * w]; if (v > mx) mx = v; }
+                        for (int j = 1; j < rm; j++) { float v = bin[(size_t)j * bstep]; if (v > mx) mx = v; }
                         float acc = 0.f;
                         for (int j = 0; j < rm; j++) {
-                            float e = expf(bin[(size_t)j * h * w] - mx);
+                            float e = expf(bin[(size_t)j * bstep] - mx);
                             acc += e * (float)j; sum += e;
                         }
                         d4[d] = acc / sum;
@@ -1936,7 +2212,7 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
                     y[(size_t)2 * A + q] = bw * st[s];
                     y[(size_t)3 * A + q] = bh * st[s];
                     for (int c = 0; c < nc; c++) {
-                        float v = cl->buf[(size_t)c * h * w + p];
+                        float v = cl->buf[slot_idx(cl, c, (size_t)p)];
                         y[(size_t)(4 + c) * A + q] = 1.f / (1.f + expf(-v));
                     }
                 }
@@ -1958,6 +2234,13 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             if (o->op <= YOP_MAX) { m->t_opk[o->op] += dt; m->n_opk[o->op]++; }
         }
     }
+    m->view_step = m->n_ops;
+    m->view_complete = 1;
+#if ST_HAVE_RVV
+    if (yime_timing)
+        fprintf(stderr, "[YOLO-IME] kernel_sum=%.3fms epi_sum=%.3fms wall=%.3fms\n",
+                yime_kernel_sum * 1e3, yime_epi_sum * 1e3, yime_wall * 1e3);
+#endif
     if (cpu_tim) {
         m->t_fwd = ynow() - _fwd0;
         fprintf(stderr, "[YOLO-CPU] forward breakdown: total=%.1fms | conv=%.1fms (%ld ops, "
@@ -1993,11 +2276,14 @@ int st_yolo_forward_raw(StYoloModel *m, const float *nchw,
                         float *out, int *out_c, int *out_a) {
     if (!m || !nchw || !out) return -1;
     YSlot *S = (YSlot *)calloc((size_t)m->n_slots, sizeof(YSlot));
+    if (!S) return -1;
     uint32_t fs = 0; int fc = 0, fa = 0;
     int rc = yolo_forward(m, nchw, (int)m->det.input_w, (int)m->det.input_h,
                           S, &fs, &fc, &fa);
+    YSlot v;
+    if (rc == 0) rc = slot_view(&S[fs], 0, &v);
     if (rc == 0) {
-        memcpy(out, S[fs].buf, (size_t)fc * fa * sizeof(float));
+        memcpy(out, v.buf, (size_t)fc * fa * sizeof(float));
         if (out_c) *out_c = fc;
         if (out_a) *out_a = fa;
     }
@@ -2122,6 +2408,7 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
     }
 
     YSlot *S = (YSlot *)calloc((size_t)m->n_slots, sizeof(YSlot));
+    if (!S) { free(in); return -1; }
     uint32_t fs = 0; int fc = 0, A = 0;
     int rc = yolo_forward(m, in, ow, oh, S, &fs, &fc, &A);
     free(in);
@@ -2134,6 +2421,9 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
     int ncan = 0;
     float *boxes = (float *)malloc((size_t)A * 4 * sizeof(float));
     int *clsv = (int *)malloc((size_t)A * sizeof(int));
+    if (!cand || !boxes || !clsv) {
+        free(cand); free(boxes); free(clsv); slots_free(S, m->n_slots); return -1;
+    }
     for (int q = 0; q < A; q++) {
         float best = -1.f; int bc = 0;
         for (int c = 0; c < nc; c++) {
@@ -2163,6 +2453,9 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
 
     /* class-wise NMS（按 score 降序） */
     char *dead = (char *)calloc((size_t)(ncan > 0 ? ncan : 1), 1);
+    if (!dead) {
+        free(cand); free(boxes); free(clsv); slots_free(S, m->n_slots); return -1;
+    }
     int nout = 0;
     for (int a = ncan - 1; a >= 0 && nout < max_out; a--) {
         int ia = cand[a].i;
