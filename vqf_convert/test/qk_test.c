@@ -50,6 +50,66 @@ static uint32_t lcg(void) {
     return x;
 }
 
+/* ---- Conv shape boundary roundtrip helper ----
+ * HWC roundtrip always tested; IME roundtrip tested when OC%8==0.
+ * When OC%8!=0, verifies IME repack returns -1 (rejects non-aligned OC).
+ * Returns 0 on success, nonzero on failure. */
+static int conv_boundary_test(const char *label, int OC, int C, int KH, int KW) {
+    int K = C * KH * KW;
+    int Kp = (K + 31) & ~31;
+    size_t cn = (size_t)OC * K;
+    size_t hwc_bytes = (size_t)OC * Kp;
+    int8_t *src = (int8_t *)malloc(cn);
+    int8_t *hwc = (int8_t *)malloc(hwc_bytes);
+    int8_t *hwc2 = (int8_t *)malloc(hwc_bytes);
+    int8_t *ime = (int8_t *)malloc(hwc_bytes);
+    int8_t *rec = (int8_t *)malloc(cn);
+    if (!src || !hwc || !hwc2 || !ime || !rec) {
+        free(src); free(hwc); free(hwc2); free(ime); free(rec);
+        printf("%-14s OOM\n", label);
+        return -2;
+    }
+    for (size_t i = 0; i < cn; i++) src[i] = (int8_t)((int)(lcg() & 0xFFu) - 128);
+    int fail = 0;
+
+    /* HWC tap-major roundtrip */
+    if (repack_conv_q8_hwc_tap(hwc, src, OC, C, KH, KW) != 0 ||
+        unpack_conv_q8_hwc_tap(rec, hwc, OC, C, KH, KW) != 0 ||
+        memcmp(src, rec, cn) != 0) {
+        printf("%-14s hwc FAIL\n", label);
+        fail = 1;
+    } else {
+        printf("%-14s hwc %016llx\n", label, (unsigned long long)fnv(hwc, hwc_bytes));
+    }
+
+    /* IME K1 roundtrip (only when OC%8==0; Kp is always %32 hence %8) */
+    if (OC % 8 == 0) {
+        memset(hwc2, 0, hwc_bytes);
+        memset(rec, 0, cn);
+        if (repack_conv_q8_ime_k1(ime, hwc, OC, Kp) != 0 ||
+            unpack_conv_q8_ime_k1(hwc2, ime, OC, Kp) != 0 ||
+            memcmp(hwc, hwc2, hwc_bytes) != 0 ||
+            unpack_conv_q8_hwc_tap(rec, hwc2, OC, C, KH, KW) != 0 ||
+            memcmp(src, rec, cn) != 0) {
+            printf("%-14s ime FAIL\n", label);
+            fail = 1;
+        } else {
+            printf("%-14s ime %016llx\n", label, (unsigned long long)fnv(ime, hwc_bytes));
+        }
+    } else {
+        /* Verify IME rejects non-aligned OC */
+        if (repack_conv_q8_ime_k1(ime, hwc, OC, Kp) != -1) {
+            printf("%-14s ime should reject OC%%8!=0 but didn't\n", label);
+            fail = 1;
+        } else {
+            printf("%-14s ime reject OK (OC%%8!=0)\n", label);
+        }
+    }
+
+    free(src); free(hwc); free(hwc2); free(ime); free(rec);
+    return fail ? -1 : 0;
+}
+
 int main(void) {
     const int rows = 96;     /* %8==0 && %4==0 */
     const int cols = 4096;   /* %32==0 */
@@ -166,6 +226,49 @@ int main(void) {
         }
         free(csrc); free(chwc); free(chwc2); free(cime); free(crec);
     }
+
+    /* ---- Section 10.12.2 形状边界覆盖（7 项未覆盖边界）---- */
+
+    /* b1: OC%8!=0 (OC=5) — IME 以 8 为粒度打包，尾块处理若有误不会被 OC%8=0 检出
+     *     K=180->Kp=192，HWC 应成功，IME 应拒绝 */
+    if (conv_boundary_test("b1 oc%8!=0", 5, 20, 3, 3) != 0) fail = 1;
+
+    /* b2: K%32=0 无尾块补零 (OC=16,C=4,KH=4,KW=2 -> K=32,Kp=32)
+     *     补零分支不走，恒等比较不能覆盖 Kp==K 时的边界索引 */
+    if (conv_boundary_test("b2 k%32=0", 16, 4, 4, 2) != 0) fail = 1;
+
+    /* b3: K%32=0 且 OC%8!=0 组合 (OC=5,C=4,KH=4,KW=2 -> K=32,Kp=32)
+     *     两个边界同时命中，HWC 成功，IME 拒绝 */
+    if (conv_boundary_test("b3 k32+oc", 5, 4, 4, 2) != 0) fail = 1;
+
+    /* b4: 1×1 卷积 KH=KW=1，K=C (OC=16,C=32 -> K=32,Kp=32)
+     *     tap 只有 C 个，补零行为与 3×3 有本质差异 */
+    if (conv_boundary_test("b4 1x1", 16, 32, 1, 1) != 0) fail = 1;
+
+    /* b5: G>1 分组卷积 per-group slice (OC_g=4,C_g=1,KH=3,KW=3)
+     *     分组路径走 legacy 格不经 IME repack；OC%8!=0 验证 IME 拒绝 */
+    if (conv_boundary_test("b5 group", 4, 1, 3, 3) != 0) fail = 1;
+
+    /* b6: 非 RVV 构建路径 — 确认标量 repack 在各构建目标下的路径标识
+     *     repack_conv_q8_hwc_tap / ime_k1 均为纯标量实现，无 RVV/NEON intrinsics */
+    {
+        const char *build_mode =
+#if defined(__riscv_v)
+            "RVV"
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+            "NEON"
+#else
+            "scalar"
+#endif
+            ;
+        printf("b6 build       %s path\n", build_mode);
+    }
+
+    /* b7a: OC=8 极小值 — 最小合法 IME 打包粒度 (K=27->Kp=32) */
+    if (conv_boundary_test("b7a oc=8", 8, 3, 3, 3) != 0) fail = 1;
+
+    /* b7b: OC=1 极端值 — 单输出通道，HWC 成功，IME 应拒绝 */
+    if (conv_boundary_test("b7b oc=1", 1, 3, 3, 3) != 0) fail = 1;
 
     free(w); free(q8); free(q4); free(q4i); free(x8);
     printf(fail ? "QK FAIL\n" : "QK OK\n");

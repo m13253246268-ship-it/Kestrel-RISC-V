@@ -55,6 +55,32 @@ HDR_ARCH_OFF, HDR_ARCH_LEN = 16, 180
 HDR_DATAOFF, HDR_FILELEN = 200, 208
 HDR_BYTES = 448
 
+CONV_LAYOUT_HELP = (
+    "Q8 卷积权重请求布局：legacy(0) / hwc(4) / ime(5,SpacemiT K1)；"
+    "默认 %(default)s。仅 groups=1 可预打包，ime 还要求 OC 为 8 的倍数；"
+    "不满足 OC 条件时，PT 转换保持 legacy，--repack-vqf 回退 hwc；"
+    "分组及非 Q8 权重不预打包。写盘后读回实际权重布局计数（含 DFL/PSA，非 OP 数）。"
+)
+
+
+def report_conv_layout(path, requested_layout):
+    """读回输出中的 Q8 卷积权重布局；统计不代表完整容器或运行时验证。"""
+    v = read_vqf(path)
+    counts = {LAYOUT_LEGACY: 0, LAYOUT_CONV_HWC_TAP: 0, LAYOUT_CONV_IME_K1: 0}
+    non_q8 = 0
+    for name, tensor in v["tensors"].items():
+        if not (name.startswith("c") and name.endswith("_w") and name[1:-2].isdigit()):
+            continue
+        if tensor[0] != QT_Q8:
+            non_q8 += 1
+            continue
+        layout = v["layouts"][name]
+        counts[layout] = counts.get(layout, 0) + 1
+    actual = " ".join(f"layout{layout}={count}" for layout, count in sorted(counts.items()))
+    print(f"[vqf-layout] requested={requested_layout} actual_q8_weights: {actual} "
+          f"total={sum(counts.values())} non_q8_weights={non_q8} "
+          f"(readback; includes DFL/PSA; weight tensors, not OP count) out={path}")
+
 
 # ================================================================
 # 图展平：ultralytics 模块 → 原语算子 + 权重
@@ -676,6 +702,7 @@ def repack_existing_vqf(in_path, out_path, conv_layout):
     data_end, fsum = write_vqf(out_path, arch, out_tensors, v["family"], len(gb))
     print(f"[yolo2vqf-repack] wrote {out_path}: {len(out_tensors)} tensors, "
           f"{data_end/1048576:.2f} MB, FNV={fsum:016x}")
+    report_conv_layout(out_path, conv_layout)
 
 
 def main():
@@ -686,7 +713,7 @@ def main():
     ap.add_argument("--f16", action="store_true", help="权重存 F16")
     ap.add_argument("--q8", action="store_true", help="权重 per-channel int8")
     ap.add_argument("--conv-layout", choices=["legacy", "hwc", "ime"], default="hwc",
-                    help="Q8 卷积权重离线预打包布局：legacy(0) / hwc(4,默认) / ime(5,SpacemiT K1)")
+                    help=CONV_LAYOUT_HELP)
     ap.add_argument("--imgsz", default="640x640",
                     help="输入尺寸 HxW（默认 640x640；只改 arch 头，图按动态尺寸执行）")
     ap.add_argument("--dump-graph", action="store_true")
@@ -784,7 +811,8 @@ def main():
         sys.exit("需要 --out 或 --dump-graph")
     data_end, fsum = write_vqf(args.out, arch, tensors, fam, len(gb))
     print(f"[yolo2vqf] wrote {args.out}: {len(tensors)} tensors, "
-          f"layout={args.conv_layout}, {data_end/1048576:.2f} MB, FNV={fsum:016x}")
+          f"requested_layout={args.conv_layout}, {data_end/1048576:.2f} MB, FNV={fsum:016x}")
+    report_conv_layout(args.out, args.conv_layout)
 
     if args.check:
         check(args.pt, args.out)

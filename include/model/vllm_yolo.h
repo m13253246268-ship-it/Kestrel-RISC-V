@@ -61,6 +61,15 @@ int st_yolo_forward_raw(StYoloModel *m, const float *nchw,
 int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
                    float conf, float iou, YoloDet *out, int max_out);
 
+/** P1 诊断：nw/scratch 分配失败并降级到标量 yconv_q8 的累计次数。 */
+long st_yolo_nw_fallback_count(const StYoloModel *m);
+
+#ifdef YOLO_PRECISION_GATE_CB
+typedef void (*yolo_layer_cb_t)(int op_idx, uint32_t opcode,
+    uint32_t out_slot, const float *buf, int c, int h, int w, void *ud);
+void st_yolo_set_layer_cb(yolo_layer_cb_t cb, void *ud);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -60,6 +60,17 @@ static double ynow(void) {
 #define YGRAPH_MAGIC  0x50524759u   /* 'YGRP' */
 #define YACT_SILU     1
 
+/* ---- P1 精度门：逐层回调接口（编译期启用） ---- */
+#ifdef YOLO_PRECISION_GATE_CB
+typedef void (*yolo_layer_cb_t)(int op_idx, uint32_t opcode,
+    uint32_t out_slot, const float *buf, int c, int h, int w, void *ud);
+static yolo_layer_cb_t g_yolo_layer_cb = NULL;
+static void *g_yolo_layer_cb_ud = NULL;
+void st_yolo_set_layer_cb(yolo_layer_cb_t cb, void *ud) {
+    g_yolo_layer_cb = cb; g_yolo_layer_cb_ud = ud;
+}
+#endif
+
 /* ================================================================
  * 模型结构
  * ================================================================ */
@@ -133,6 +144,7 @@ struct StYoloModel {
     double    t_conv, t_detect, t_attn;
     double    t_i2c;             /* im2col 构建耗时（CPU dotprod 累计） */
     long      cpu_convs;
+    long      nw_fallback_count; /* P1：nw/scratch 分配失败，降级到 scalar yconv_q8 的累计次数 */
     /* Phase-0（K-YOLO-002）CPU 分解计时（env VLLM_YOLO_CPU_TIMING 门控；默认不累加） */
     double    t_elem, t_lb, t_post, t_fwd;
     long      n_conv_ops, n_elem_ops;
@@ -573,6 +585,60 @@ static void yconv_q8(const float *x, int C, int H, int W,
         }
     }
 }
+
+#if ST_HAVE_RVV
+/* Opt-in CHW Q8 depthwise: preserve the scalar tap and epilogue order. */
+static void yconv_dw_q8_rvv(const float *x, int C, int H, int W,
+                           const int8_t *wq, const float *wsc, const float *b,
+                           float *y) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(C > 16)
+#endif
+    for (int oc = 0; oc < C; oc++) {
+        const float *xc = x + (size_t)oc * H * W;
+        const int8_t *wo = wq + (size_t)oc * 9;
+        float sc = wsc ? wsc[oc] : 1.f;
+        float bias = b ? b[oc] : 0.f;
+        float *yo = y + (size_t)oc * H * W;
+        for (int oy = 0; oy < H; oy++) {
+            for (int ox = 0; ox < W; ox++) {
+                if (oy >= 1 && oy < H - 1 && ox >= 1 && ox < W - 1) {
+                    size_t vl = __riscv_vsetvl_e32m1(W - 1 - ox);
+                    vfloat32m1_t va = __riscv_vfmv_v_f_f32m1(0.f, vl);
+                    for (int ky = 0; ky < 3; ky++) {
+                        for (int kx = 0; kx < 3; kx++) {
+                            vfloat32m1_t vx = __riscv_vle32_v_f32m1(
+                                xc + (oy - 1 + ky) * W + ox - 1 + kx, vl);
+                            vfloat32m1_t vp = __riscv_vfmul_vf_f32m1(vx, (float)wo[ky * 3 + kx], vl);
+                            va = __riscv_vfadd_vv_f32m1(va, vp, vl);
+                        }
+                    }
+                    float tmp[vl];
+                    __riscv_vse32_v_f32m1(tmp, va, vl);
+                    for (size_t j = 0; j < vl; j++) {
+                        float acc = tmp[j] * sc + bias;
+                        yo[(size_t)oy * W + ox + j] = acc / (1.f + expf(-acc));
+                    }
+                    ox += (int)vl - 1;
+                    continue;
+                }
+                float acc = 0.f;
+                for (int ky = 0; ky < 3; ky++) {
+                    int iy = oy - 1 + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < 3; kx++) {
+                        int ix = ox - 1 + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        acc += (float)wo[ky * 3 + kx] * xc[iy * W + ix];
+                    }
+                }
+                acc = acc * sc + bias;
+                yo[(size_t)oy * W + ox] = acc / (1.f + expf(-acc));
+            }
+        }
+    }
+}
+#endif
 
 /* ================================================================
  * V50：im2col 输入侧 HWC 化（唯一默认路径）
@@ -1166,8 +1232,18 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
             m->nw[cid] = (int8_t *)m->cq[cid];
             m->nw_owned[cid] = 0;   /* 零拷贝直指 m->blob，禁止 free */
         } else {
+#ifdef YOLO_P1_FORCE_NW_FAIL
+            int8_t *w = NULL;   /* F1 测试：强制 nw 分配失败 */
+#else
             int8_t *w = (int8_t *)calloc((size_t)OC * Kp, 1);
-            if (!w) return 0;
+#endif
+            if (!w) {
+                fprintf(stderr, "[WARN][YOLO-P1] nw alloc failed cid=%u OC=%d Kp=%d size=%zu,"
+                        " falling back to scalar yconv_q8\n",
+                        (unsigned)cid, OC, Kp, (size_t)OC * Kp);
+                m->nw_fallback_count++;
+                return 0;
+            }
             if (lay == VQF_LAYOUT_CONV_IME_K1) {
                 /* 从 IME pack_a 逆向还原到 HWC [OC][Kp] */
                 yconv_unpack_ime_to_hwc(w, m->cq[cid], OC, Kp);
@@ -1239,7 +1315,13 @@ static int yconv_cpu_dotprod(StYoloModel *m, const float *x, int C, int H, int W
 
     int8_t *imc = use_ime ? NULL : (int8_t *)malloc((size_t)P * Kp);
     float  *rowsc = use_ime ? m->rsc : (float *)malloc((size_t)P * sizeof(float));
-    if (!rowsc || (!use_ime && !imc)) { free(imc); if (!use_ime) free(rowsc); return 0; }
+    if (!rowsc || (!use_ime && !imc)) {
+        fprintf(stderr, "[WARN][YOLO-P1] scratch alloc failed cid=%u P=%d Kp=%d,"
+                " falling back to scalar yconv_q8\n",
+                (unsigned)cid, P, Kp);
+        m->nw_fallback_count++;
+        free(imc); if (!use_ime) free(rowsc); return 0;
+    }
 
     double _t0 = ynow();
     int i2c_rc;
@@ -1845,6 +1927,21 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             } else {
                 YSlot v;
                 if (slot_view(x, 0, &v) != 0) return -1;
+#if ST_HAVE_RVV
+                const char *dw_rvv = getenv("VLLM_YOLO_DW_RVV");
+                if (dw_rvv && strcmp(dw_rvv, "1") == 0 &&
+                    !m->cw[cid] && m->cq[cid] && v.layout == 0 &&
+                    (v.c == 64 || v.c == 80 || v.c == 128 || v.c == 256) &&
+                    OC == v.c && G == v.c && G > 1 &&
+                    KH == 3 && KW == 3 && sh == 1 && sw == 1 && ph == 1 && pw == 1 &&
+                    OH == v.h && OW == v.w && v.h > 0 && v.w > 0 && act == YACT_SILU) {
+                    m->cpu_convs++;
+                    const int8_t *wq = yconv_ensure_chw_q8(m, cid, OC, v.c, KH, KW, G);
+                    if (!wq) return -1;
+                    yconv_dw_q8_rvv(v.buf, v.c, v.h, v.w, wq, m->cs[cid],
+                                    hb ? m->cb[cid] : NULL, y);
+                } else
+#endif
                 if (yconv_dispatch(m, v.buf, v.c, v.h, v.w, cid, hb, OC, KH, KW,
                                    sh, sw, ph, pw, G, act, y, OH, OW) != 0) return -1;
             }
@@ -2225,6 +2322,13 @@ static int yolo_forward(StYoloModel *m, const float *in, int iw, int ih,
             fprintf(stderr, "[YOLO] unknown op %u @op%d\n", o->op, i);
             return -1;
         }
+#ifdef YOLO_PRECISION_GATE_CB
+        if (g_yolo_layer_cb && o->out < (uint32_t)m->n_slots && S[o->out].buf) {
+            g_yolo_layer_cb(i, o->op, o->out, S[o->out].buf,
+                           S[o->out].c, S[o->out].h, S[o->out].w,
+                           g_yolo_layer_cb_ud);
+        }
+#endif
         if (cpu_tim) {
             const double dt = ynow() - _op0;
             if (o->op == YOP_CONV || o->op == YOP_MATMUL) { m->t_conv += dt; m->n_conv_ops++; }
@@ -2486,4 +2590,9 @@ int st_yolo_detect(StYoloModel *m, const uint8_t *rgb, int w, int h,
                 (m->t_fwd + m->t_lb + m->t_post) * 1e3);
     }
     return nout;
+}
+
+/* ---------- P1 诊断接口 ---------- */
+long st_yolo_nw_fallback_count(const StYoloModel *m) {
+    return m ? m->nw_fallback_count : 0;
 }
