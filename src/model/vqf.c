@@ -465,6 +465,14 @@ int vqf_load(STModelWeights *w, const char *path) {
         void *p = vqf_mount(m.data, e->offset);
         const char *name = e->name;
         if (strcmp(name, "token_embed") == 0)      w->token_embed = (float *)p;
+        else if (strcmp(name, "q_weight") == 0) w->q_weight = (float *)p;
+        else if (strcmp(name, "k_weight") == 0) w->k_weight = (float *)p;
+        else if (strcmp(name, "v_weight") == 0) w->v_weight = (float *)p;
+        else if (strcmp(name, "o_weight") == 0) w->o_weight = (float *)p;
+        else if (strcmp(name, "gate_weight") == 0) w->gate_weight = (float *)p;
+        else if (strcmp(name, "up_weight") == 0) w->up_weight = (float *)p;
+        else if (strcmp(name, "down_weight") == 0) w->down_weight = (float *)p;
+        else if (strcmp(name, "lm_head") == 0) w->lm_head = (float *)p;
         else if (strcmp(name, "final_norm") == 0)  w->final_norm  = (float *)p;
         else if (strcmp(name, "moe_router") == 0)  w->moe_router  = (float *)p;
         else if (strcmp(name, "attn_norm") == 0)   w->attn_norm   = (float *)p;
@@ -565,7 +573,10 @@ int vqf_load(STModelWeights *w, const char *path) {
     }
     (void)nl; (void)q_out; (void)k_out; (void)ff; (void)vc; (void)dim;
 
-    if (!w->token_embed || (!w->q8_q_weight && !w->q4_q_weight)) {
+    if (!w->token_embed || (!w->q8_q_weight && !w->q4_q_weight &&
+        !(w->q_weight && w->k_weight && w->v_weight && w->o_weight &&
+          w->gate_weight && w->up_weight && w->down_weight && w->lm_head &&
+          w->attn_norm && w->ffn_norm && w->final_norm))) {
         fprintf(stderr, "[VQF] missing core tensors (embed / q/k/v)\n");
         st_mmap_close(&m); return -1;
     }

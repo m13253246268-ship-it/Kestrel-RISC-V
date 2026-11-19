@@ -371,7 +371,8 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
     VBUtf8 dec;
     vb_utf8_init(&dec);
 
-    for (int step = 0; step < req->max_tokens; step++) {
+    for (int step = 0; step < req->max_tokens &&
+         st->cache_len[0] < st->max_kv_slots; step++) {
         int id = sample_token_pk(st->logits, vc, (float)req->temperature,
                                  (float)req->top_p, (float)req->min_p,
                                  req->top_k);
@@ -419,6 +420,7 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
     if (met) {
         double t_end = st_now_sec();
         met->n_tokens = gen;
+        met->finish_reason = finish;
         if (t_first > 0) met->ttft_ms = (t_first - met->start_s) * 1000.0;
         met->total_ms = (t_end - met->start_s) * 1000.0;
         if (gen > 1) met->tpot_ms = (t_end - t_first) / (double)(gen - 1) * 1000.0;

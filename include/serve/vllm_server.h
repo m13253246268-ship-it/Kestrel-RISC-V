@@ -376,6 +376,7 @@ typedef struct {
     int    prompt_tokens;   /* input token count (prefill) = total context length */
     int    last_user_tokens;/* token count of the last user message (text only) */
     int    n_tokens;        /* generated tokens */
+    const char *finish_reason; /* actual decode termination: stop or length */
     double prefill_ms;      /* start -> prefill done */
     double ttft_ms;         /* start -> first token produced */
     double tpot_ms;         /* avg per-token decode time after the first */

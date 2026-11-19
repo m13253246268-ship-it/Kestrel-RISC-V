@@ -49,6 +49,7 @@ typedef struct {
     float       norm_eps;       /* 1e-6 */
     int         bos_id;         /* 151643 */
     int         eos_id;         /* 151645 */
+    bool        tie_word_embeddings;
     bool        has_q_norm;     /* Qwen3-VL has per-layer q_norm/k_norm */
     bool        has_mrope;      /* Qwen3-VL uses MRoPE (3D RoPE) */
     int         head_dim_full;  /* 128 for Qwen3-VL */

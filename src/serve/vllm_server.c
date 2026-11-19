@@ -214,12 +214,14 @@ static int resolve_thinking(const VJson *body) {
     if (e2 && e2->type == VJ_NUMBER) return e2->u.number != 0.0;
     const char *env = getenv("VLLM_ENABLE_THINKING");
     if (env && env[0]) return env[0] != '0';
-    return 1;
+    return -1; /* unspecified: MiniCPM5 has a distinct generation suffix */
 }
 
 static char *build_chat_prompt(VLLMServerCtx *ctx, const VJson *messages,
                                int thinking) {
     StrBuf b; sb_init(&b);
+    if (ctx->tok->is_minicpm5)
+        sb_str(&b, qwen_tokenizer_decode(ctx->tok, ctx->tok->bos_id));
     size_t n = vjson_array_len(messages);
     for (size_t i = 0; i < n; i++) {
         const VJson *m = vjson_array_get(messages, i);
@@ -258,6 +260,7 @@ static char *build_chat_prompt(VLLMServerCtx *ctx, const VJson *messages,
     }
     sb_str(&b, "<|im_start|>assistant\n");
     if (!thinking) sb_str(&b, QWEN_NO_THINK_SUFFIX);
+    else if (ctx->tok->is_minicpm5 && thinking == 1) sb_str(&b, "<think>\n");
     if (!b.s) b.s = strdup("");
     return b.s;
 }
@@ -265,11 +268,13 @@ static char *build_chat_prompt(VLLMServerCtx *ctx, const VJson *messages,
 /* Legacy /v1/completions: wrap prompt in a plain user turn. */
 static char *build_completion_prompt(VLLMServerCtx *ctx, const char *prompt,
                                      int thinking) {
-    (void)ctx;
     StrBuf b; sb_init(&b);
+    if (ctx->tok->is_minicpm5)
+        sb_str(&b, qwen_tokenizer_decode(ctx->tok, ctx->tok->bos_id));
     sb_str(&b, "<|im_start|>user\n"); sb_str(&b, prompt); sb_str(&b, "<|im_end|>\n");
     sb_str(&b, "<|im_start|>assistant\n");
     if (!thinking) sb_str(&b, QWEN_NO_THINK_SUFFIX);
+    else if (ctx->tok->is_minicpm5 && thinking == 1) sb_str(&b, "<think>\n");
     if (!b.s) b.s = strdup("");
     return b.s;
 }
@@ -1254,14 +1259,15 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
     }
     int spec_tries = 0, spec_hits = 0, spec_kv_rolls = 0;
 
-    while (gen < max_tokens) {
+    while (gen < max_tokens && st->cache_len[0] < st->max_kv_slots) {
         int id = -1;
         int emit_n = 0;         /* draft tokens to emit this round */
         int emit_extra = -1;    /* rejected/bonus token after the drafts */
         int draft[SPEC_DRAFT_MAX];
         int nl = st->weights.n_layers_allocated;
 
-        if (spec_on && gn < gcap) {
+        if (spec_on && gn < gcap &&
+            st->max_kv_slots - st->cache_len[0] > spec_k) {
             int K;
             if (draft_head_on)
                 K = st_draft_head_forward(st, &draft_head, st->hidden, spec_k, draft, vlog);
@@ -1499,6 +1505,7 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
     if (met) {
         double t_end = st_now_sec();
         met->n_tokens = gen;
+        met->finish_reason = finish;
         if (t_first > 0) met->ttft_ms = (t_first - met->start_s) * 1000.0;
         met->total_ms = (t_end - met->start_s) * 1000.0;
         if (gen > 1) met->tpot_ms = (t_end - t_first) / (double)(gen - 1) * 1000.0;
@@ -3130,7 +3137,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(msg, "role", vjson_new_string("assistant"));
                         vjson_obj_set(msg, "content", vjson_new_string(out_txt ? out_txt : ""));
                         vjson_obj_set(ch, "message", msg);
-                        vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+                        vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
                         vjson_array_push(choices, ch);
                         vjson_obj_set(root, "choices", choices);
                         vjson_obj_set(root, "usage", usage_json(&met));
@@ -3147,7 +3154,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(root, "metrics", mj);
                         /* 方案 2：多模态批处理非流式出证。 */
                         attest_attach(root, user, bodyhash, out_txt ? out_txt : "",
-                                      met.prompt_tokens, met.n_tokens, "stop",
+                                      met.prompt_tokens, met.n_tokens, met.finish_reason,
                                       temperature, top_p, min_p, top_k, thinking,
                                       max_tokens);
                         size_t n = vjson_serialize(root, body, 1 << 20);
@@ -3233,7 +3240,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(msg, "role", vjson_new_string("assistant"));
                         vjson_obj_set(msg, "content", vjson_new_string(out.s ? out.s : ""));
                         vjson_obj_set(ch, "message", msg);
-                        vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+                        vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
                         vjson_array_push(choices, ch);
                         vjson_obj_set(root, "choices", choices);
                         vjson_obj_set(root, "usage", usage_json(&met));
@@ -3251,7 +3258,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                         vjson_obj_set(root, "metrics", mj);
                         /* 方案 2：多模态串行非流式出证。 */
                          attest_attach(root, user, bodyhash, out.s ? out.s : "",
-                                      met.prompt_tokens, met.n_tokens, "stop",
+                                      met.prompt_tokens, met.n_tokens, met.finish_reason,
                                       temperature, top_p, min_p, top_k, thinking,
                                       max_tokens);
                         size_t n = vjson_serialize(root, body, 1 << 20);
@@ -3394,7 +3401,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                     vjson_obj_set(msg, "role", vjson_new_string("assistant"));
                     vjson_obj_set(msg, "content", vjson_new_string(out_txt ? out_txt : ""));
                     vjson_obj_set(ch, "message", msg);
-                    vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+                    vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
                     vjson_array_push(choices, ch);
                     vjson_obj_set(root, "choices", choices);
                     vjson_obj_set(root, "usage", usage_json(&met));
@@ -3411,7 +3418,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                     vjson_obj_set(root, "metrics", mj);
                     /* 方案 2：文本批处理非流式出证。 */
                      attest_attach(root, user, bodyhash, out_txt ? out_txt : "",
-                                  met.prompt_tokens, met.n_tokens, "stop",
+                                  met.prompt_tokens, met.n_tokens, met.finish_reason,
                                   temperature, top_p, min_p, top_k, thinking,
                                   max_tokens);
                     size_t n = vjson_serialize(root, body, 1 << 20);
@@ -3532,7 +3539,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(msg, "role", vjson_new_string("assistant"));
                 vjson_obj_set(msg, "content", vjson_new_string(out.s ? out.s : ""));
                 vjson_obj_set(ch, "message", msg);
-                vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+                vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
                 vjson_array_push(choices, ch);
                 vjson_obj_set(root, "choices", choices);
                 vjson_obj_set(root, "usage", usage_json(&met));
@@ -3565,7 +3572,7 @@ static void handle_chat(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(root, "trace_id", vjson_new_string(trace_id));
                 /* 方案 2：文本串行非流式出证。 */
                  attest_attach(root, user, bodyhash, out.s ? out.s : "",
-                              met.prompt_tokens, met.n_tokens, "stop",
+                              met.prompt_tokens, met.n_tokens, met.finish_reason,
                               temperature, top_p, min_p, top_k, thinking,
                               max_tokens);
                 size_t n = vjson_serialize(root, body, 1 << 20);
@@ -3899,7 +3906,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
                 VJson *ch = vjson_new_object();
                 vjson_obj_set(ch, "index", vjson_new_number(0));
                 vjson_obj_set(ch, "text", vjson_new_string(out_txt ? out_txt : ""));
-                vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+                vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
                 vjson_array_push(choices, ch);
                 vjson_obj_set(root, "choices", choices);
                 vjson_obj_set(root, "usage", usage_json(&met));
@@ -3915,7 +3922,7 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
                 vjson_obj_set(root, "metrics", mj);
                 /* 方案 2：legacy 批处理非流式出证。 */
                 attest_attach(root, user, bodyhash, out_txt ? out_txt : "",
-                              met.prompt_tokens, met.n_tokens, "stop",
+                              met.prompt_tokens, met.n_tokens, met.finish_reason,
                               temperature, top_p, min_p, top_k, thinking,
                               max_tokens);
                 size_t n = vjson_serialize(root, body, 1 << 20);
@@ -3960,13 +3967,13 @@ static void handle_completions(VLLMServerCtx *ctx, const VHttpRequest *req,
             VJson *ch = vjson_new_object();
             vjson_obj_set(ch, "index", vjson_new_number(0));
             vjson_obj_set(ch, "text", vjson_new_string(out.s ? out.s : ""));
-            vjson_obj_set(ch, "finish_reason", vjson_new_string("stop"));
+            vjson_obj_set(ch, "finish_reason", vjson_new_string(met.finish_reason));
             vjson_array_push(choices, ch);
             vjson_obj_set(root, "choices", choices);
             vjson_obj_set(root, "usage", usage_json(&met));
             /* 方案 2：legacy 串行非流式出证。 */
             attest_attach(root, user, bodyhash, out.s ? out.s : "",
-                          met.prompt_tokens, met.n_tokens, "stop",
+                          met.prompt_tokens, met.n_tokens, met.finish_reason,
                           temperature, top_p, min_p, top_k, thinking,
                           max_tokens);
             size_t n = vjson_serialize(root, body, 1 << 20);

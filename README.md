@@ -26,6 +26,35 @@ vllm_kestrel 是一个从零自研、面向 RISC-V 边缘设备的纯 C 模型**
 
 ---
 
+## MiniCPM5-1B：Q4_0 与 K1 验证
+
+已适配 `OpenBMB/MiniCPM5-1B`，支持分词、聊天模板、结束 token，以及 Q4_0 VQF 权重。已验证配置为 **Q4_0 权重 + FP32 KV**；embedding 保留 F16，norm 保留 F32。权重需自行转换，不随仓库分发。
+
+```bash
+# 在仓库目录执行；MODEL_DIR 指向包含原始权重和 tokenizer 文件的目录
+./vqf_convert/vqf_conv --model "$MODEL_DIR" \
+  --convert-vqf "$MODEL_DIR/model-q4_0.vqf" --wmode q4
+# 同目录还需 vocab.bin、config.json 和适用的 merges.bin（见模型准备说明）
+VLLM_WMODE=q4 VLLM_KV_F32=1 VLLM_KV_NOF32=0 \
+VLLM_Q4_INT=1 VLLM_Q4_RVV=3 \
+./build-riscv/vllm_kestrel --model "$MODEL_DIR/model-q4_0.vqf" \
+  --threads 4 --serve --auto-load --port 8080
+```
+
+K1 正确性检查覆盖短文本生成、线程间一致性及 API 停止原因：达到 `max_tokens` 返回 `finish_reason="length"`，遇到正常结束 token 返回 `"stop"`。Q4_0 属于有损量化；不能据此声称与原始 F32 模型输出等价。
+
+RVV prefill 已共享 QKV、Gate/Up 激活量化，并通过在向量寄存器内直接转换 scale 减少临时数组读写，保留原量化及浮点累加顺序。scale 优化前后，50 个全词表 logits 向量哈希一致，24 个自由生成 token 一致；现有寄存器 spill 尚未消除。
+
+2026-11-19 K1 独立复测：4 线程、CPU 0–3、FP32 KV、上下文容量 512，32 个输入 token + 24 步固定 token 回放；每进程预热后清逻辑 KV，BAABABBA 交错，各四次。下表仅统计 forward，不含加载、分词、采样或 HTTP 开销。
+
+| 指标 | scale 优化前 | scale 优化后 | 平均耗时下降 |
+|---|---:|---:|---:|
+| Prefill | 1.075563 s | 0.990086 s | 7.95% |
+| Decode 24 步 | 3.597447 s | 3.587518 s | 0.28%（基本不变） |
+| 总 forward | 4.673009 s | 4.577604 s | 2.04% |
+
+**测量限制：这些是观察结果，不是严格验收通过结论。** 复测脚本误将起始温度 ≤65°C 应用于整个运行期，且一个样本首监测点达到 66°C。全部样本均保留；排除该样本所在整对后的三对敏感性分析显示 prefill 耗时下降 7.42%、总 forward 下降 1.88%，属于事后分析。频率采样均为 1.6 GHz，不能排除采样间瞬态。结论不外推至长上下文、其他模型或完整服务吞吐。
+
 ## 快速目录
 
 - [核心优势](#核心优势)

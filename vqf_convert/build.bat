@@ -16,8 +16,8 @@ echo [build] vqf_convert (x86) -O2 ...
 gcc -O2 -Wall -Wextra -I src ^
     src\conv_main.c src\model_cfgio.c src\model_layers.c ^
     src\quant_kernels.c src\qk_repack.c src\vqf_vision.c ^
-    src\vllm_crypto.c ^
-    -o vqf_conv.exe -lm -lbcrypt
+    src\vllm_crypto.c src\vqf_asr.c ^
+    -o vqf_conv.exe -lm -lbcrypt -lshell32
 if errorlevel 1 (
     echo [ERR] build failed (see errors above)
     exit /b 1

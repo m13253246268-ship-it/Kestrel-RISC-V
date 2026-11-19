@@ -417,14 +417,25 @@ int vllm_tp_init(int nthreads) {
     g->job_gen = 0;
     g->done = 0;
     g->kind = 0;
-    for (int t = 0; t < g->nworkers; t++) {
+    int created = 0;
+    for (int t = 0; t < nthreads - 1; t++) {
         vllm_tp_worker *w = &g->w[t];
         w->g = g;
         w->slot = t;
-        pthread_mutex_init(&w->mu, NULL);
-        pthread_cond_init(&w->cv, NULL);
-        if (pthread_create(&w->th, NULL, tp_worker_main, w) != 0) break;
+        if (pthread_mutex_init(&w->mu, NULL) != 0) break;
+        if (pthread_cond_init(&w->cv, NULL) != 0) {
+            pthread_mutex_destroy(&w->mu);
+            break;
+        }
+        if (pthread_create(&w->th, NULL, tp_worker_main, w) != 0) {
+            pthread_cond_destroy(&w->cv);
+            pthread_mutex_destroy(&w->mu);
+            break;
+        }
+        created++;
     }
+    g->nworkers = created;
+    g->nthreads = created + 1;
     return g->nthreads;
 }
 

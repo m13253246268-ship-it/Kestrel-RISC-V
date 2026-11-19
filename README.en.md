@@ -10,11 +10,57 @@ HTTP server, a proprietary VQF quantized model format, continuous batching,
 tiered KV residency, MoE expert parallelism, multimodal support (Qwen3-VL / YOLO),
 and embedding retrieval.
 
-This repository is currently in the **open-source preparation** stage: the edge target
-(RISC-V) is not yet available, but **x86-64 hosts can still build and run numerical
-self-tests**, and RISC-V can be cross-compiled to verify "builds + self-tests pass".
-x86 builds are used only for "compiles + regresses identically to ARM", **never as a
-performance benchmark** (see "Honest Notes" below).
+The RISC-V runtime has been tested on a SpacemiT K1 board. x86-64 hosts can build
+and run numerical regression checks; x86 builds are not used as an edge-performance
+benchmark. On-board measurements apply only to their stated model, configuration
+and workload (see "Honest Notes" below).
+
+## MiniCPM5-1B: Q4_0 and K1 validation
+
+`OpenBMB/MiniCPM5-1B` is supported, including tokenization, chat formatting and
+termination tokens. The validated configuration uses **Q4_0 weights + FP32 KV**,
+with F16 embeddings and F32 norms. Model weights are not distributed in this repository.
+
+```bash
+# Run from the repository; MODEL_DIR contains original weights and tokenizer files.
+./vqf_convert/vqf_conv --model "$MODEL_DIR" \
+  --convert-vqf "$MODEL_DIR/model-q4_0.vqf" --wmode q4
+# Also prepare vocab.bin, config.json and the applicable merges.bin in that directory.
+VLLM_WMODE=q4 VLLM_KV_F32=1 VLLM_KV_NOF32=0 \
+VLLM_Q4_INT=1 VLLM_Q4_RVV=3 \
+./build-riscv/vllm_kestrel --model "$MODEL_DIR/model-q4_0.vqf" \
+  --threads 4 --serve --auto-load --port 8080
+```
+
+K1 checks cover short generation, consistency across thread counts and API finish
+reasons: reaching `max_tokens` returns `finish_reason="length"`; a normal termination
+token returns `"stop"`. Q4_0 is lossy and these checks do not establish equivalence
+to the original F32 model.
+
+RVV prefill shares activation quantization across QKV and Gate/Up. Direct vector
+conversion of scales removes temporary array accesses while preserving quantization
+and floating-point accumulation order. Before/after scale optimization, hashes of
+50 full-vocabulary logits vectors and 24 freely generated token IDs match.
+Existing register spills have not been eliminated.
+
+Independent K1 measurements on 2026-11-19 used four threads on CPUs 0–3, FP32 KV,
+context capacity 512, 32 input tokens and 24 fixed replay steps. Each process warmed
+up fully, then cleared logical KV. BAABABBA order provided four samples per version.
+Timing covers forward calls only, excluding loading, tokenization, sampling and HTTP.
+
+| Metric | Before scale optimization | After | Mean time reduction |
+|---|---:|---:|---:|
+| Prefill | 1.075563 s | 0.990086 s | 7.95% |
+| Decode, 24 steps | 3.597447 s | 3.587518 s | 0.28% (essentially unchanged) |
+| Total forward | 4.673009 s | 4.577604 s | 2.04% |
+
+**These are observations, not a strict acceptance pass.** The measurement script
+incorrectly applied the starting-temperature limit of 65°C throughout each run;
+one sample also started monitoring at 66°C. All samples were retained. Post-hoc
+sensitivity analysis excluding that entire pair gives 7.42% lower prefill time and
+1.88% lower total forward time across three pairs. Sampled frequency was always
+1.6 GHz, which does not exclude transients between samples. Results do not establish
+long-context performance, other-model performance or end-to-end service throughput.
 
 ---
 
@@ -261,10 +307,10 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
    performance benchmark. Open items: occasional whole-request hangs on x64; the L3 Q4
    dot product has no AVX2 kernel on x86 (scalar fallback — numerically correct,
    performance meaningless).
-2. **The edge target (RISC-V) is not yet available.** RISC-V side can be cross-compiled
-   to verify "builds + self-tests pass"; the hot kernel is RVV tier 3, and `VLLM_RVV=0`
-   reverts to the scalar reference path (escape hatch) at any time. Gains are only
-   established by on-board measurement.
+2. **RISC-V has been tested on SpacemiT K1.** Cross-compilation alone proves only
+   build compatibility; numerical checks and performance measurements require execution.
+   The MiniCPM5 results above describe one short-context workload and retain their
+   measurement limitations. They are not a general performance guarantee.
 3. **The regression gate only proves "builds + self-tests pass + identical counts across
    architectures"**; it is not a performance conclusion.
 4. Model conversion, encryption/signing, and bit-level comparison all have determinism

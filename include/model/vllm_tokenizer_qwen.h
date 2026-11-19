@@ -68,6 +68,7 @@ typedef struct {
     int    pad_id;
     int    im_start_id;
     int    im_end_id;
+    int    is_minicpm5;
 
     /* Vision special token IDs (Qwen3-VL) */
     int    vision_start_id;

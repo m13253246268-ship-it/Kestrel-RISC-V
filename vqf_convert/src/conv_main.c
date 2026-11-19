@@ -18,6 +18,10 @@
 #include "vqf_st.h"
 #include "vqf_format.h"
 #include "vqf_vision.h"
+#include "vqf_asr.h"
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 #include "vllm_crypto.h"   /* VQF-Enc（SM4-CTR+HMAC-SM3）/ SM2 供应链签名 */
 #include <stdio.h>
 #include <string.h>
@@ -71,6 +75,9 @@ static void w_free(STModelWeights *w) {
     free(w->attn_norm); free(w->ffn_norm);
     free(w->q_norm); free(w->k_norm);
     free(w->q_bias); free(w->k_bias); free(w->v_bias);
+    free(w->lm_head); free(w->q_weight); free(w->k_weight);
+    free(w->v_weight); free(w->o_weight); free(w->gate_weight);
+    free(w->up_weight); free(w->down_weight);
     free(w->q8_lm_weight); free(w->q8_q_weight); free(w->q8_k_weight);
     free(w->q8_v_weight); free(w->q8_o_weight); free(w->q8_gate_weight);
     free(w->q8_up_weight); free(w->q8_down_weight);
@@ -110,7 +117,17 @@ static int w_alloc(STModelWeights *w, const STModelConfig *cfg) {
         C((size_t)nl * k_out * 4, w->k_bias);
         C((size_t)nl * k_out * 4, w->v_bias);
     }
-    if (wm != 1 && wm != 5) {   /* q8 鍖?*/
+    if (wm == 6) {
+        C((size_t)vc * dim * 4, w->lm_head);
+        C((size_t)nl * dim * q_out * 4, w->q_weight);
+        C((size_t)nl * dim * k_out * 4, w->k_weight);
+        C((size_t)nl * dim * k_out * 4, w->v_weight);
+        C((size_t)nl * q_out * dim * 4, w->o_weight);
+        C((size_t)nl * ff * dim * 4, w->gate_weight);
+        C((size_t)nl * ff * dim * 4, w->up_weight);
+        C((size_t)nl * dim * ff * 4, w->down_weight);
+    }
+    if (wm != 1 && wm != 5 && wm != 6) {   /* Q8 */
         C(Q8B((size_t)vc * dim), w->q8_lm_weight);
         C((size_t)nl * Q8B((size_t)dim * q_out), w->q8_q_weight);
         C((size_t)nl * Q8B((size_t)dim * k_out), w->q8_k_weight);
@@ -179,7 +196,15 @@ static int collect_text(const STModelWeights *w, const STModelConfig *cfg,
     int dim = cfg->dim, ff = cfg->ffn_dim, vc = cfg->vocab_size, nl = cfg->n_layers;
     int q_out = cfg->n_heads * cfg->head_dim;
     int k_out = cfg->n_kv_heads * cfg->head_dim;
-    ADDQ("token_embed", 0x05 /* F16 */, w->token_embed, vc, dim);
+    ADDQ("token_embed", g_wmode == 6 ? 0x01 : 0x05, w->token_embed, vc, dim);
+    ADDQ("q_weight", 0x01, w->q_weight, nl * q_out, dim);
+    ADDQ("k_weight", 0x01, w->k_weight, nl * k_out, dim);
+    ADDQ("v_weight", 0x01, w->v_weight, nl * k_out, dim);
+    ADDQ("o_weight", 0x01, w->o_weight, nl * dim, q_out);
+    ADDQ("gate_weight", 0x01, w->gate_weight, nl * ff, dim);
+    ADDQ("up_weight", 0x01, w->up_weight, nl * ff, dim);
+    ADDQ("down_weight", 0x01, w->down_weight, nl * dim, ff);
+    ADDQ("lm_head", 0x01, w->lm_head, vc, dim);
     ADDQ("final_norm",  0x01, w->final_norm, dim, 1);
     ADDQ("attn_norm",   0x01, w->attn_norm, nl * dim, 1);
     ADDQ("ffn_norm",    0x01, w->ffn_norm, nl * dim, 1);
@@ -614,6 +639,7 @@ static int run_convert(const char *model_dir, const char *out) {
         if (st_load_tensor(&cfg, "model.norm.weight",
                            w.final_norm, dim) != 0) {
             fprintf(stderr, "[conv] final_norm missing\n");
+            goto fail;
         }
     }
     /* lm_head（chunked；tie 时 slice 失败回退到 embed） */
@@ -626,9 +652,14 @@ static int run_convert(const char *model_dir, const char *out) {
         int wm = g_wmode;
         for (int64_t off = 0; off < lm_elems; off += chunk_elems) {
             int64_t n = lm_elems - off; if (n > chunk_elems) n = chunk_elems;
-            if (st_load_tensor_slice(&cfg, "lm_head.weight", off, tmp, n) != 0) {
-                memcpy(tmp, w.token_embed + off, (size_t)n * 4); /* tied */
+            if (cfg.tie_word_embeddings) {
+                memcpy(tmp, w.token_embed + off, (size_t)n * sizeof(float));
+            } else if (st_load_tensor_slice(&cfg, "lm_head.weight", off, tmp, n) != 0) {
+                fprintf(stderr, "[conv] untied lm_head slice failed\n");
+                free(tmp);
+                goto fail;
             }
+            if (w.lm_head) memcpy(w.lm_head + off, tmp, (size_t)n * sizeof(float));
             if (w.q8_lm_weight) {
                 uint8_t *dst = w.q8_lm_weight + (size_t)(off / 32) * 34;
                 if (wm == 3) f32_to_q4i8(dst, tmp, (int)n);
@@ -671,7 +702,7 @@ static int run_convert(const char *model_dir, const char *out) {
     }
     /* flags（与引擎转换同口径） */
     uint32_t flags = 0;
-    flags |= VQF_FLAG_EMB_F16;             /* token_embed 浠?F16 瀛?*/
+    if (g_wmode != 6) flags |= VQF_FLAG_EMB_F16;
     if (w.q8_buf_q4) flags |= VQF_FLAG_Q8BUF_Q4;
     if (w.has_x8)    flags |= VQF_FLAG_X8;
     if (g_wmode == 4) flags |= VQF_FLAG_G256;
@@ -999,8 +1030,10 @@ static int run_convert_stream(const char *model_dir, const char *out) {
             float *fn = (float *)(base + e[i].off);
             if (st_load_tensor(&cfg, "model.language_model.norm.weight", fn,
                                cfg.dim) != 0) {
-                if (st_load_tensor(&cfg, "model.norm.weight", fn, cfg.dim) != 0)
+                if (st_load_tensor(&cfg, "model.norm.weight", fn, cfg.dim) != 0) {
                     fprintf(stderr, "[conv-stream] final_norm missing\n");
+                    goto fail;
+                }
             }
             break;
         }
@@ -1010,8 +1043,11 @@ static int run_convert_stream(const char *model_dir, const char *out) {
     {
         const char *lm_src = "lm_head.weight";
         float probe[8];
-        int tie = (st_load_tensor_slice(&cfg, lm_src, 0, probe, 8) != 0);
-        if (tie) lm_src = "model.language_model.embed_tokens.weight";
+        if (cfg.tie_word_embeddings) {
+            lm_src = "model.language_model.embed_tokens.weight";
+            if (st_load_tensor_slice(&cfg, lm_src, 0, probe, 8) != 0)
+                lm_src = "model.embed_tokens.weight";
+        }
         uint8_t *lm_map8 = NULL, *lm_map4 = NULL;
         for (int i = 0; i < n; i++) {
             if (!strcmp(e[i].name, "q8_lm")) lm_map8 = base + e[i].off;
@@ -1228,22 +1264,49 @@ static int verify_vqf_header(const char *path) {
 
 int main(int argc, char **argv) {
     const char *model_dir = NULL, *out = NULL;
-    int stream = 0;
+    int stream = 0, explicit_wmode = 0, asr_w8 = 0;
+#ifdef _WIN32
+    int wide_argc = 0;
+    wchar_t **wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    char *asr_model = NULL, *asr_out = NULL;
+    if (!wide_argv || wide_argc != argc) {
+        if (wide_argv) LocalFree(wide_argv);
+        fprintf(stderr, "[conv] cannot decode Windows command line\n");
+        return 2;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--model") || !strcmp(argv[i], "--convert-vqf")) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, wide_argv[i + 1], -1, NULL, 0, NULL, NULL);
+            char *p = n > 0 ? malloc((size_t)n) : NULL;
+            if (!p) { LocalFree(wide_argv); free(asr_model); free(asr_out); return 1; }
+            WideCharToMultiByte(CP_UTF8, 0, wide_argv[i + 1], -1, p, n, NULL, NULL);
+            if (!strcmp(argv[i], "--model")) { free(asr_model); asr_model = p; }
+            else { free(asr_out); asr_out = p; }
+            i++;
+        }
+    }
+    LocalFree(wide_argv);
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!strcmp(argv[i], "--convert-vqf") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--stream")) stream = 1;
+        else if (!strcmp(argv[i], "--asr-w8")) asr_w8 = 1;
         else if (!strcmp(argv[i], "--wmode") && i + 1 < argc) {
             const char *m = argv[++i];
+            explicit_wmode = 1;
             if (!strcmp(m, "dual")) g_wmode = 0;
             else if (!strcmp(m, "q4")) g_wmode = 1;
             else if (!strcmp(m, "q8")) g_wmode = 2;
             else if (!strcmp(m, "q4i")) g_wmode = 3;
             else if (!strcmp(m, "g256")) g_wmode = 4;
+            else if (!strcmp(m, "f32")) g_wmode = 6;
             else { fprintf(stderr, "[conv] bad --wmode %s\n", m); return 2; }
         } else if (!strcmp(argv[i], "--help")) {
             printf("vqf_convert --model <dir> --convert-vqf <out.vqf> "
                    "[--stream] [--wmode dual|q4|q8|q4i|g256]\n"
+                   "  Audio8 ASR ONNX bundles: default F32/BLOB; --asr-w8 enables signed row INT8 + FP32 scales.\n"
+                   "  ASR rejects --wmode, VLLM_WMODE, encryption and signing; --stream is implicit.\n"
                    "  env: VLLM_VQF_KEY=<pass>         输出 VQF-Enc 加密文件"
                    "（SM4-CTR + HMAC-SM3）\n"
                    "       VLLM_VQF_SIGN_PRIV=<64hex>  内嵌 SM2 供应链签名"
@@ -1260,6 +1323,32 @@ int main(int argc, char **argv) {
     }
     if (!model_dir || !out) {
         fprintf(stderr, "usage: vqf_convert --model <dir> --convert-vqf <out.vqf> [--stream] [--wmode ...]\n");
+        return 2;
+    }
+#ifdef _WIN32
+    const char *asr_dir = asr_model, *asr_path = asr_out;
+#else
+    const char *asr_dir = model_dir, *asr_path = out;
+#endif
+    if (vqf_asr_is_bundle(asr_dir)) {
+        const char *key = getenv("VLLM_VQF_KEY");
+        const char *sign = getenv("VLLM_VQF_SIGN_PRIV");
+        int asr_rc;
+        if (explicit_wmode || (envw && envw[0]) || (key && key[0]) || (sign && sign[0])) {
+            fprintf(stderr, "[asr] F32/BLOB v6 does not support quantization, encryption or signing options\n");
+            asr_rc = 2;
+        } else asr_rc = vqf_asr_convert(asr_dir, asr_path, asr_w8);
+#ifdef _WIN32
+        free(asr_model); free(asr_out);
+#endif
+        return asr_rc;
+    }
+#ifdef _WIN32
+    free(asr_model); free(asr_out);
+#endif
+    if (asr_w8) { fprintf(stderr, "--asr-w8 requires an Audio8 bundle\n"); return 2; }
+    if (stream && g_wmode == 6) {
+        fprintf(stderr, "[conv] f32 requires full conversion; omit --stream\n");
         return 2;
     }
     int rc = stream ? run_convert_stream(model_dir, out) : run_convert(model_dir, out);

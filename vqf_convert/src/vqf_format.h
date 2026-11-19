@@ -44,6 +44,8 @@
 #define VQF_SM2_ID        "vllm-kestrel-vqf"
 
 /* 张量量化类型（qtype） */
+/* ASR v6 only: signed row bytes then rows FP32 scales; layout must be 1. */
+#define VQF_QT_ASR_W8  0x100
 #define VQF_QT_F32     0x01
 #define VQF_QT_Q8_0    0x02
 #define VQF_QT_Q4_0    0x03
@@ -156,6 +158,13 @@ typedef struct {
 } VQFArchDet;              /* 92B ≤ 180B ⇒ 目录偏移仍为 448 */
 
 #define VQF_QT_BLOB 0x06   /* 原始字节张量（graph / names / anchors） */
+
+/* v6：ASR（Audio8-ASR）实验格式 —— 与 tools/asr/onnx_to_vqf.py 等价。
+ * 头部 448B 内偏移 16..32 写 b"ASR-NUMPY-v1\0\0\0\0"；目录 layout 恒 0；
+ * 张量只有 F32/BLOB；尾部 FNV-1a 覆盖「目录 + 数据区」。当前 C 加载器不识别，
+ * 由 tools/asr/asr_vqf_run.py 读取。 */
+#define VQF_VERSION_ASR  6
+#define VQF_FLAG_ASR     (1u << 12)
 
 _Static_assert(sizeof(VQFArchDet) <= sizeof(VQFArch),
                "VQFArchDet must fit the arch slot (keep dir offset at 448)");

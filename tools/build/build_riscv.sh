@@ -31,7 +31,13 @@ set -e
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 
-CC="$VLLM_RISCV_CC"
+# Optional target argument: main (default), paraformer-cli, paraformer-static.
+TARGET=${1:-main}
+case "$TARGET" in
+    main|paraformer-cli|paraformer-static) ;;
+    *) echo "Invalid build target: $TARGET" >&2; exit 2 ;;
+esac
+CC="${VLLM_RISCV_CC:-${CC:-}}"
 if [ -z "$CC" ]; then
     if [ "$(uname -m)" = "riscv64" ] && command -v gcc >/dev/null 2>&1; then
         CC=gcc
@@ -49,6 +55,16 @@ MARCH="${VLLM_RISCV_MARCH:-rv64gcv}"
 OUTDIR="${VLLM_RISCV_OUTDIR:-$ROOT/build-riscv}"
 mkdir -p "$OUTDIR"
 OUT="$OUTDIR/vllm_kestrel"
+if [ "$TARGET" != main ]; then
+    KIND=${TARGET#paraformer-}
+    if [ "$KIND" = cli ]; then NAME=vllm_paraformer; else NAME=libvllm_paraformer.a; fi
+    # Extra flags precede the helper's mandatory -ffp-contract=off.
+    # shellcheck disable=SC2086
+    CC="$CC" OPENMP=1 sh "$ROOT/tools/asr/build_paraformer.sh" "$OUTDIR/$NAME" "$KIND" \
+        -march="$MARCH" -mabi=lp64d ${VLLM_RISCV_EXTRA:-}
+    if command -v file >/dev/null 2>&1; then file "$OUTDIR/$NAME"; fi
+    exit 0
+fi
 
 SRC="
 src/main.c

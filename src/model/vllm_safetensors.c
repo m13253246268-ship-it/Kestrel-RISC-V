@@ -2755,30 +2755,28 @@ static void rv_q4_colbt_worker(void *c_, int it) {
     for (int b = 0; b < c->nblk; b++) {
         const uint8_t *sc = tile + (size_t)b * 576;
         const uint8_t *dt = sc + 64;
-        float s[32];                                  /* lane k<16: 行 2k；lane 16+k: 行 2k+1 */
+        vfloat32m4_t vs;
         if (scv) {
-            /* zvfhmin vfwcvt.f.f.v（SEW=16）：全部非 NaN f16 与 f16_to_f32_bits 逐位一致（板端 65536 穷举） */
+            vuint16m1_t se = __riscv_vlse16_v_u16m1((const uint16_t *)sc, 4, vh);
+            vuint16m1_t so = __riscv_vlse16_v_u16m1((const uint16_t *)(sc + 2), 4, vh);
+            vuint16m2_t sh = __riscv_vundefined_u16m2();
+            sh = __riscv_vset_v_u16m1_u16m2(sh, 0, se);
+            sh = __riscv_vset_v_u16m1_u16m2(sh, 1, so);
             __asm__ volatile(
-                ".option push                        \n\t"
-                ".option arch, +zvfhmin              \n\t"
-                "vsetivli zero, 16, e16, m1, ta, ma \n\t"
-                "vlse16.v v8, (%[p]), %[st]          \n\t"
-                "vlse16.v v9, (%[q]), %[st]          \n\t"
-                "vfwcvt.f.f.v v10, v8                \n\t"
-                "vfwcvt.f.f.v v12, v9                \n\t"
-                "vsetivli zero, 16, e32, m2, ta, ma \n\t"
-                "vse32.v v10, (%[o0])                \n\t"
-                "vse32.v v12, (%[o1])                \n\t"
-                ".option pop                         \n\t"
-                :: [p] "r"(sc), [q] "r"(sc + 2), [st] "r"(4L), [o0] "r"(s), [o1] "r"(s + 16)
-                : "memory", "vl", "vtype", "v8", "v9", "v10", "v11", "v12", "v13");
+                ".option push\n\t"
+                ".option arch, +zvfhmin\n\t"
+                "vsetvli zero, %[n], e16, m2, ta, ma\n\t"
+                "vfwcvt.f.f.v %0, %1\n\t"
+                ".option pop\n\t"
+                : "=&vr"(vs) : "vr"(sh), [n] "r"(vl) : "vl", "vtype");
         } else {
+            float s[32];
             for (int k = 0; k < 16; k++) {
-                s[k]      = st_f16scale(sc + (size_t)(2 * k)     * 2);
+                s[k] = st_f16scale(sc + (size_t)(2 * k) * 2);
                 s[16 + k] = st_f16scale(sc + (size_t)(2 * k + 1) * 2);
             }
+            vs = __riscv_vle32_v_f32m4(s, vl);
         }
-        vfloat32m4_t vs = __riscv_vle32_v_f32m4(s, vl);
         vint16m2_t a0 = __riscv_vmv_v_x_i16m2(0, vl), a1 = a0, a2 = a0, a3 = a0,
                    a4 = a0, a5 = a0, a6 = a0, a7 = a0;
         const size_t xo = (size_t)b * 32;
@@ -3185,15 +3183,9 @@ static int rv_ime_run(rv_q4_colbt_ctx *c) {
     return 1;
 }
 
-static void rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
-                                 const float *rb, int rows, int cols,
-                                 int n_blocks, int nb) {
-    const int ntiles = rows / 32;
-    const int ngrp = (nb + RV_Q4CB_T - 1) / RV_Q4CB_T;
+static void rv_q4_colbt_quantize(const float *xb, int8_t *xq, float *xd,
+                                  int cols, int n_blocks, int nb) {
     const size_t qb = (size_t)nb * cols, db = (size_t)nb * n_blocks * sizeof(float);
-    int8_t *xq = (int8_t *)xq_alloc_canary(qb);
-    float *xd = (float *)xq_alloc_canary(db);
-    if (!xq || !xd) { xq_free_canary(xq, qb, "q4cb:xq"); xq_free_canary(xd, db, "q4cb:xd"); return; }
     if (rv_q4_qpar_on() && vllm_tp_threads() > 1) {
         rv_q4_qpar_ctx qc = { xb, xq, xd, cols, n_blocks };
         vllm_tp_parfor(0, nb, rv_q4_qpar_worker, &qc);
@@ -3216,6 +3208,13 @@ static void rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
             quantize_row_q8_0_act(xb + (size_t)t * cols, xq + (size_t)t * cols,
                                   xd + (size_t)t * n_blocks, cols);
     }
+}
+
+static void rv_q4_colbt_quantized(const uint8_t *w, const int8_t *xq, const float *xd,
+                                 float *ob, const float *rb, int rows, int cols,
+                                 int n_blocks, int nb) {
+    const int ntiles = rows / 32;
+    const int ngrp = (nb + RV_Q4CB_T - 1) / RV_Q4CB_T;
     rv_q4_colbt_ctx c = { w, xq, xd, ob, rb, rows, n_blocks, nb, ngrp, rv_q4_scv_on() };
     const int nit = ntiles * ngrp;
     if (rv_ime_run(&c)) { }
@@ -3245,8 +3244,33 @@ static void rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
                   rows, cols, nb, nbad, (double)mx);
       }
     }
+}
+
+static int rv_q4_colbt_shared(const uint8_t *const *w, float *const *ob,
+                              const float *const *rb, const int *rows, int nm,
+                              const float *xb, int cols, int n_blocks, int nb) {
+    const size_t qb = (size_t)nb * cols, db = (size_t)nb * n_blocks * sizeof(float);
+    int8_t *xq = (int8_t *)xq_alloc_canary(qb);
+    float *xd = (float *)xq_alloc_canary(db);
+    if (!xq || !xd) {
+        xq_free_canary(xq, qb, "q4cb:xq");
+        xq_free_canary(xd, db, "q4cb:xd");
+        return 0;
+    }
+    /* The activation belongs to this fused call; no pointer-based cache. */
+    rv_q4_colbt_quantize(xb, xq, xd, cols, n_blocks, nb);
+    for (int i = 0; i < nm; i++)
+        rv_q4_colbt_quantized(w[i], xq, xd, ob[i], rb ? rb[i] : NULL,
+                              rows[i], cols, n_blocks, nb);
     xq_free_canary(xq, qb, "q4cb:xq");
     xq_free_canary(xd, db, "q4cb:xd");
+    return 1;
+}
+
+static int rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
+                                const float *rb, int rows, int cols,
+                                int n_blocks, int nb) {
+    return rv_q4_colbt_shared(&w, &ob, &rb, &rows, 1, xb, cols, n_blocks, nb);
 }
 
 /* mode3 批版本：权重驻留 × 多 token。col tile 每次处理一个 token 的全部
@@ -3256,10 +3280,8 @@ static void rv_q4_colbt_rows_par(const uint8_t *w, const float *xb, float *ob,
 static void rv_q4_col_rows_par_bt(const uint8_t *w, const float *xb, float *ob,
                                   const float *rb, int rows, int cols,
                                   int n_blocks, int nb) {
-    if (rv_q4_intb_on() && nb >= 2) {
-        rv_q4_colbt_rows_par(w, xb, ob, rb, rows, cols, n_blocks, nb);
-        return;
-    }
+    if (rv_q4_intb_on() && nb >= 2 &&
+        rv_q4_colbt_rows_par(w, xb, ob, rb, rows, cols, n_blocks, nb)) return;
     for (int t = 0; t < nb; t++)
         rv_q4_col_rows_par(w, xb + (size_t)t * cols, ob + (size_t)t * rows,
                            rb ? rb + (size_t)t * rows : NULL, rows, n_blocks);
@@ -4266,6 +4288,12 @@ static void dyn_matvec_q4_q8_fused_qkv_batched_neon(
             rv_q4_dec_rows(m3, 3, x_batch, n_blocks);
             return;
         }
+        if (n_batch >= 2 && rv_q4_intb_on()) {
+            const uint8_t *w[3] = { q4_q, q4_k, q4_v };
+            float *o[3] = { q_out, k_out, v_out };
+            const int rows[3] = { q_rows, kv_rows, kv_rows };
+            if (rv_q4_colbt_shared(w, o, NULL, rows, 3, x_batch, cols, n_blocks, n_batch)) return;
+        }
         rv_q4_col_rows_par_bt(q4_q, x_batch, q_out, NULL, q_rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_k, x_batch, k_out, NULL, kv_rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_v, x_batch, v_out, NULL, kv_rows, cols, n_blocks, n_batch);
@@ -4411,6 +4439,12 @@ static void dyn_matvec_q4_q8_fused_gate_up_batched_neon(
             rv_q4_dec_mat m2[2] = { { q4_gate, gate_out, NULL, rows }, { q4_up, up_out, NULL, rows } };
             rv_q4_dec_rows(m2, 2, x_batch, n_blocks);
             return;
+        }
+        if (n_batch >= 2 && rv_q4_intb_on()) {
+            const uint8_t *w[2] = { q4_gate, q4_up };
+            float *o[2] = { gate_out, up_out };
+            const int rs[2] = { rows, rows };
+            if (rv_q4_colbt_shared(w, o, NULL, rs, 2, x_batch, cols, n_blocks, n_batch)) return;
         }
         rv_q4_col_rows_par_bt(q4_gate, x_batch, gate_out, NULL, rows, cols, n_blocks, n_batch);
         rv_q4_col_rows_par_bt(q4_up,   x_batch, up_out,   NULL, rows, cols, n_blocks, n_batch);
@@ -22873,8 +22907,10 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                                      seq_stride, st->kv_bs);
                 } else {
                     st_pack_kv_heads(st->k_cache[l], st->v_cache[l],
-                                     st->k_cache_q8[l], st->v_cache_q8[l],
-                                     st->k_scale[l], st->v_scale[l],
+                                     st->k_cache_q8 ? st->k_cache_q8[l] : NULL,
+                                     st->v_cache_q8 ? st->v_cache_q8[l] : NULL,
+                                     st->k_scale ? st->k_scale[l] : NULL,
+                                     st->v_scale ? st->v_scale[l] : NULL,
                                      k_pack, v_pack, k8_pack, ks8_pack, v8_pack, vs8_pack,
                                      seq_len, nkv, hd, kv_dim,
                                      seq_stride, st->kv_bs);

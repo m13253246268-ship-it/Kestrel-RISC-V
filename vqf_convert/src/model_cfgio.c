@@ -272,7 +272,12 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
     GET_INT("vocab_size", vocab_size);
     GET_INT("max_position_embeddings", max_seq_len);
     GET_INT("bos_token_id", bos_id);
-    GET_INT("eos_token_id", eos_id);
+    pos = json_find_key(json, "eos_token_id");
+    if (pos) {
+        while (*pos == ' ' || *pos == '\n' || *pos == '\r' || *pos == '\t') pos++;
+        if (*pos == '[') pos++;
+        json_parse_int(pos, &cfg->eos_id);
+    }
     GET_FLOAT("rope_theta", rope_theta);
     GET_FLOAT("rms_norm_eps", norm_eps);
 
@@ -290,6 +295,9 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
             cfg->head_dim = 128;
     }
 
+    const char *tie = json_find_key(json, "tie_word_embeddings");
+    if (tie) while (*tie && (*tie == ' ' || *tie == '\t' || *tie == '\r' || *tie == '\n')) tie++;
+    cfg->tie_word_embeddings = tie && strncmp(tie, "true", 4) == 0;
     cfg->has_q_norm = (strstr(json, "q_norm") != NULL);
     cfg->has_mrope = (strstr(json, "mrope") != NULL);
     cfg->head_dim_full = cfg->head_dim;

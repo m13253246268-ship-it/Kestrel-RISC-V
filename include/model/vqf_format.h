@@ -44,6 +44,8 @@
 #define VQF_SM2_ID        "vllm-kestrel-vqf"
 
 /* 张量量化类型（qtype） */
+/* ASR v6 only: signed row bytes then rows FP32 scales; layout must be 1. */
+#define VQF_QT_ASR_W8  0x100
 #define VQF_QT_F32     0x01
 #define VQF_QT_Q8_0    0x02
 #define VQF_QT_Q4_0    0x03

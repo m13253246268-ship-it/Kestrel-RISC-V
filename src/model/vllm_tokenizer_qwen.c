@@ -810,6 +810,30 @@ static int tok_bpe_encode(QwenTokenizer *tok, const char *text, int text_len,
         /* 2. 预分词切 piece；超长 piece 切分处理（避免栈内固定缓冲溢出） */
         int wlen = gpt2_span ? pretoken_span_gpt2(s + pos, text_len - pos)
                              : pretoken_span(s + pos, text_len - pos);
+        if (tok->is_minicpm5 && !gpt2_span) {
+            int q = 0, digits = 0;
+            while (q < text_len - pos && digits < 3) {
+                uint32_t cp;
+                int nb = u8_dec(s + pos + q, text_len - pos - q, &cp);
+                if (!(cp_dig(cp) || cp == 0xB2 || cp == 0xB3 || cp == 0xB9)) break;
+                q += nb;
+                digits++;
+            }
+            if (digits) wlen = q;
+            else {
+                int cap = text_len - pos;
+                for (int i = 0; i < cap;) {
+                    uint32_t cp;
+                    int nb = u8_dec(s + pos + i, cap - i, &cp);
+                    if (cp_dig(cp) || cp == 0xB2 || cp == 0xB3 || cp == 0xB9) {
+                        cap = i;
+                        break;
+                    }
+                    i += nb;
+                }
+                wlen = pretoken_span(s + pos, cap);
+            }
+        }
         if (wlen <= 0) wlen = 1;
         if (wlen > text_len - pos) wlen = text_len - pos;
         if (wlen > TK_BPE_MAXSYM) wlen = TK_BPE_MAXSYM;
@@ -1018,6 +1042,7 @@ static int json_get_int(const char *json, const char *key, int *out) {
     if (!pos) return -1;
     pos += strlen(search);
     while (*pos == ' ' || *pos == ':' || *pos == '\t') pos++;
+    if (*pos == '[') pos++; /* EOS arrays: primary EOS; im_end is also a stop. */
     if (*pos == 'n') { *out = -1; return -1; }  /* null */
     char *end;
     long v = strtol(pos, &end, 10);
@@ -1054,13 +1079,18 @@ int qwen_tokenizer_load_special(QwenTokenizer *tok, const char *model_dir) {
     json_get_int(json, "bos_token_id", &tok->bos_id);
     json_get_int(json, "eos_token_id", &tok->eos_id);
 
-    /* Find im_start / im_end from tokenizer_config or hardcode known values */
-    /* Qwen3-VL known specials: im_start=151644, im_end=151645, pad=151643 */
-    if (tok->bos_id < 0) tok->bos_id = 151643;   /* <|endoftext|> */
-    if (tok->eos_id < 0) tok->eos_id = 151645;   /* <|im_end|> */
-    tok->im_start_id = 151644;  /* <|im_start|> */
-    tok->im_end_id   = 151645;  /* <|im_end|> */
-    tok->pad_id      = 151643;  /* <|endoftext|> */
+    json_get_int(json, "pad_token_id", &tok->pad_id);
+    for (int i = 0; i < tok->vocab_size; i++) {
+        if (!tok->strings[i]) continue;
+        if (!strcmp(tok->strings[i], "<|im_start|>")) tok->im_start_id = i;
+        if (!strcmp(tok->strings[i], "<|im_end|>")) tok->im_end_id = i;
+        if (!strcmp(tok->strings[i], "<|endoftext|>")) {
+            if (tok->bos_id < 0) tok->bos_id = i;
+            if (tok->pad_id < 0) tok->pad_id = i;
+        }
+    }
+    tok->is_minicpm5 = strstr(json, "MiniCPM5") != NULL;
+    if (tok->eos_id < 0) tok->eos_id = tok->im_end_id;
 
     free(json);
 

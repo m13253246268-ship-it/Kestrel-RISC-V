@@ -878,7 +878,8 @@ static void longctx_corpus_build(QwenTokenizer *tok) {
 static int build_needle_prompt_at(QwenTokenizer *tok, int S,
                                   int *ids, int max_ids, int *needle_start_out,
                                   int pos_num, int pos_den) {
-    const int nl = 198;   /* Qwen3 newline token (Ċ) */
+    int nl = -1;
+    qwen_tokenizer_encode(tok, "\n", &nl, 1);
     const int n_names  = (int)(sizeof(G_NAMES)  / sizeof(G_NAMES[0]));
     const int n_colors = (int)(sizeof(G_COLORS) / sizeof(G_COLORS[0]));
     const int n_cities = (int)(sizeof(G_CITIES) / sizeof(G_CITIES[0]));
@@ -1765,7 +1766,8 @@ static void test_longctx_quality_ab(STModelWeights *w, const STModelConfig *cfg,
 /* Build a ~`target`-token shared prefix of filler facts (plain completion,
  * matching the known-good needle format so greedy decode stays coherent). */
 static int build_shared_prefix(QwenTokenizer *tok, int target, int *ids, int max_ids) {
-    const int nl = 198;
+    int nl = -1;
+    qwen_tokenizer_encode(tok, "\n", &nl, 1);
     const int n_names  = (int)(sizeof(G_NAMES)   / sizeof(G_NAMES[0]));
     const int n_colors = (int)(sizeof(G_COLORS)  / sizeof(G_COLORS[0]));
     const int n_cities = (int)(sizeof(G_CITIES)  / sizeof(G_CITIES[0]));
@@ -2359,7 +2361,8 @@ static void test_performance_benchmark(void) {
 
     int im_start = tok.im_start_id > 0 ? tok.im_start_id : 151644;
     int im_end   = tok.im_end_id   > 0 ? tok.im_end_id   : 151645;
-    int nl_tok   = 198;
+    int nl_tok = -1;
+    qwen_tokenizer_encode(&tok, "\n", &nl_tok, 1);
 
     /* ============================================================
      * Part A: Single-User Performance (5 different prompts)
@@ -2400,6 +2403,7 @@ static void test_performance_benchmark(void) {
         int tmp_ids[128]; int n;
 
         /* <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n */
+        if (tok.is_minicpm5) prompt_ids[pn++] = tok.bos_id;
         prompt_ids[pn++] = im_start;
         n = qwen_tokenizer_encode(&tok, "system", tmp_ids, 128);
         for (int i = 0; i < n; i++) prompt_ids[pn++] = tmp_ids[i];
@@ -2594,6 +2598,7 @@ static void test_performance_benchmark(void) {
         int pn = 0;
 
         /* system prompt */
+        if (tok.is_minicpm5) pids[pn++] = tok.bos_id;
         pids[pn++] = im_start;
         n = qwen_tokenizer_encode(&tok, "system", tmp_ids, 128);
         for (int i = 0; i < n; i++) pids[pn++] = tmp_ids[i];
@@ -3614,7 +3619,8 @@ static int run_stream_test(const char *model_dir, int n_tokens) {
     /* ---- 固定文本 prompt（不含视觉 token，保证跨档完全确定） ---- */
     int im_start = tok.im_start_id > 0 ? tok.im_start_id : 151644;
     int im_end   = tok.im_end_id   > 0 ? tok.im_end_id   : 151645;
-    int nl_tok   = 198;
+    int nl_tok = -1;
+    qwen_tokenizer_encode(&tok, "\n", &nl_tok, 1);
     const char *user_prompt =
         "请用中文一句话解释什么是\"逐层加载推理\"。";
     /* §9.28 长上下文考察：--stream-ctx N 在 assistant 头之前插入重复填充，把 prompt
@@ -3622,6 +3628,7 @@ static int run_stream_test(const char *model_dir, int n_tokens) {
     #define STREAM_MAX_PROMPT 8256
     int prompt_ids[STREAM_MAX_PROMPT]; int pn = 0;
     int tmp_ids[128]; int n;
+    if (tok.is_minicpm5) prompt_ids[pn++] = tok.bos_id;
     prompt_ids[pn++] = im_start;
     n = qwen_tokenizer_encode(&tok, "system", tmp_ids, 128);
     for (int i = 0; i < n && pn < STREAM_MAX_PROMPT; i++) prompt_ids[pn++] = tmp_ids[i];

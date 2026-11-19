@@ -23,7 +23,9 @@
 
 param(
     [string]$Gcc = $env:VLLM_GCC,
-    [string]$OutDir = $env:VLLM_X64_OUTDIR
+    [string]$OutDir = $env:VLLM_X64_OUTDIR,
+    # Optional standalone Paraformer targets; never link its CLI into the server.
+    [ValidateSet('main', 'paraformer-cli', 'paraformer-static')][string]$Target = 'main'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -40,6 +42,18 @@ if (-not $Gcc -or -not (Test-Path $Gcc)) {
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 if (-not $OutDir) { $OutDir = Join-Path $root 'build-x64' }
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+if ($Target -ne 'main') {
+    $kind = $Target.Substring('paraformer-'.Length)
+    $name = if ($kind -eq 'cli') { 'vllm_paraformer.exe' } else { 'libvllm_paraformer.a' }
+    try {
+        & (Join-Path $PSScriptRoot '../asr/build_paraformer.ps1') -Compiler $Gcc `
+            -Target $kind -Output (Join-Path $OutDir $name) -OpenMP
+    } catch {
+        Write-Error $_
+        exit 1
+    }
+    exit 0
+}
 $out = Join-Path $OutDir 'vllm_kestrel_x64.exe'
 
 Push-Location $root

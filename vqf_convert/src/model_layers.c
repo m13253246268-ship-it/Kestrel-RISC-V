@@ -158,23 +158,29 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
         g_model_load_layer = l;
         g_model_load_total = layer_end - 1;
 
-        load_layer_tensor(cfg, w, l, "input_layernorm.weight",
-                           w->attn_norm, dim, dim);
-        load_layer_tensor(cfg, w, l, "post_attention_layernorm.weight",
-                           w->ffn_norm, dim, dim);
+        if (load_layer_tensor(cfg, w, l, "input_layernorm.weight",
+                              w->attn_norm, dim, dim) != 0 ||
+            load_layer_tensor(cfg, w, l, "post_attention_layernorm.weight",
+                              w->ffn_norm, dim, dim) != 0) {
+            free(tmp_attn);
+            return -1;
+        }
         /* Attention weights: load into temp buffer, quantize to Q8_0, free temp.
          * When F32 w->q_weight is NULL, we use per-layer temp buffers to avoid
          * allocating ~5.6 GB of F32 attention at peak. */
         if (w->q_weight) {
             /* Legacy: F32 attention pre-allocated */
-            load_layer_tensor(cfg, w, l, "self_attn.q_proj.weight",
-                               w->q_weight, dim * q_out, dim * q_out);
-            load_layer_tensor(cfg, w, l, "self_attn.k_proj.weight",
-                               w->k_weight, dim * k_out, dim * k_out);
-            load_layer_tensor(cfg, w, l, "self_attn.v_proj.weight",
-                               w->v_weight, dim * k_out, dim * k_out);
-            load_layer_tensor(cfg, w, l, "self_attn.o_proj.weight",
-                               w->o_weight, q_out * dim, q_out * dim);
+            if (load_layer_tensor(cfg, w, l, "self_attn.q_proj.weight",
+                                  w->q_weight, dim * q_out, dim * q_out) != 0 ||
+                load_layer_tensor(cfg, w, l, "self_attn.k_proj.weight",
+                                  w->k_weight, dim * k_out, dim * k_out) != 0 ||
+                load_layer_tensor(cfg, w, l, "self_attn.v_proj.weight",
+                                  w->v_weight, dim * k_out, dim * k_out) != 0 ||
+                load_layer_tensor(cfg, w, l, "self_attn.o_proj.weight",
+                                  w->o_weight, q_out * dim, q_out * dim) != 0) {
+                free(tmp_attn);
+                return -1;
+            }
 
             /* Quantize attention weights to Q8_0 */
             if (w->q8_q_weight) {
@@ -196,7 +202,9 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_proj.weight", l);
             if (!find_tensor(cfg, name))
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
-            st_load_tensor(cfg, name, tmp_attn, dim * q_out);
+            if (st_load_tensor(cfg, name, tmp_attn, dim * q_out) != 0) {
+                free(tmp_attn); return -1;
+            }
             if (w->q8_q_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_q_weight + Q8_BYTES((size_t)l * dim * q_out),
@@ -216,7 +224,9 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_proj.weight", l);
             if (!find_tensor(cfg, name))
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
-            st_load_tensor(cfg, name, tmp_attn, dim * k_out);
+            if (st_load_tensor(cfg, name, tmp_attn, dim * k_out) != 0) {
+                free(tmp_attn); return -1;
+            }
             if (w->q8_k_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_k_weight + Q8_BYTES((size_t)l * dim * k_out),
@@ -236,7 +246,9 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.v_proj.weight", l);
             if (!find_tensor(cfg, name))
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
-            st_load_tensor(cfg, name, tmp_attn, dim * k_out);
+            if (st_load_tensor(cfg, name, tmp_attn, dim * k_out) != 0) {
+                free(tmp_attn); return -1;
+            }
             if (w->q8_v_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_v_weight + Q8_BYTES((size_t)l * dim * k_out),
@@ -256,7 +268,9 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
             snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", l);
             if (!find_tensor(cfg, name))
                 snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
-            st_load_tensor(cfg, name, tmp_attn, q_out * dim);
+            if (st_load_tensor(cfg, name, tmp_attn, q_out * dim) != 0) {
+                free(tmp_attn); return -1;
+            }
             if (w->q8_o_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_o_weight + Q8_BYTES((size_t)l * q_out * dim),
@@ -273,65 +287,68 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                             tmp_attn, q_out * dim);
         } else {
             /* No Q8_0: fallback to legacy scalar loading (needs F32 weights) */
-            load_layer_tensor(cfg, w, l, "self_attn.q_proj.weight",
-                               w->q_weight, dim * q_out, dim * q_out);
-            load_layer_tensor(cfg, w, l, "self_attn.k_proj.weight",
-                               w->k_weight, dim * k_out, dim * k_out);
-            load_layer_tensor(cfg, w, l, "self_attn.v_proj.weight",
-                               w->v_weight, dim * k_out, dim * k_out);
-            load_layer_tensor(cfg, w, l, "self_attn.o_proj.weight",
-                               w->o_weight, q_out * dim, q_out * dim);
+            fprintf(stderr, "[ST] missing attention buffers\n");
+            free(tmp_attn);
+            return -1;
         }
 
         if (cfg->has_q_norm) {
-            load_layer_tensor(cfg, w, l, "self_attn.q_norm.weight",
-                               w->q_norm, hd, hd);
-            load_layer_tensor(cfg, w, l, "self_attn.k_norm.weight",
-                               w->k_norm, hd, hd);
+            if (load_layer_tensor(cfg, w, l, "self_attn.q_norm.weight",
+                                  w->q_norm, hd, hd) != 0 ||
+                load_layer_tensor(cfg, w, l, "self_attn.k_norm.weight",
+                                  w->k_norm, hd, hd) != 0) {
+                free(tmp_attn); return -1;
+            }
         }
 
         /* Qwen2 系 q/k/v 投影 bias（Qwen3 无 → 指针 NULL，整段跳过）。
          * 只在分配了对应缓冲（即 safetensors 里确有该张量）时加载。 */
-        if (w->q_bias)
-            load_layer_tensor(cfg, w, l, "self_attn.q_proj.bias",
-                               w->q_bias, q_out, q_out);
-        if (w->k_bias)
-            load_layer_tensor(cfg, w, l, "self_attn.k_proj.bias",
-                               w->k_bias, k_out, k_out);
-        if (w->v_bias)
-            load_layer_tensor(cfg, w, l, "self_attn.v_proj.bias",
-                               w->v_bias, k_out, k_out);
+        if ((w->q_bias && load_layer_tensor(cfg, w, l, "self_attn.q_proj.bias",
+                                           w->q_bias, q_out, q_out) != 0) ||
+            (w->k_bias && load_layer_tensor(cfg, w, l, "self_attn.k_proj.bias",
+                                           w->k_bias, k_out, k_out) != 0) ||
+            (w->v_bias && load_layer_tensor(cfg, w, l, "self_attn.v_proj.bias",
+                                           w->v_bias, k_out, k_out) != 0)) {
+            free(tmp_attn); return -1;
+        }
 
         /* MoE router（qwen3_moe）：mlp.gate.weight [n_experts, dim] → f32 常驻
          * 堆叠 [n_layers*n_experts, dim]，top-k 选路边界精度敏感不量化。 */
         if (cfg->is_moe && w->moe_router) {
-            load_layer_tensor(cfg, w, l, "mlp.gate.weight",
-                               w->moe_router, cfg->n_experts * dim,
-                               cfg->n_experts * dim);
+            if (load_layer_tensor(cfg, w, l, "mlp.gate.weight",
+                                  w->moe_router, cfg->n_experts * dim,
+                                  cfg->n_experts * dim) != 0) {
+                free(tmp_attn); return -1;
+            }
         }
 
         /* FFN weights: load, then quantize to Q8_0 */
         if (w->gate_weight) {
             /* F32 FFN buffers exist: load normally, quantize after */
             if (cfg->is_moe) {
-                load_moe_experts_rowband(cfg, l, "gate_proj",
-                                         w->gate_weight + (size_t)l * ff * dim);
-                load_moe_experts_rowband(cfg, l, "up_proj",
-                                         w->up_weight + (size_t)l * ff * dim);
-                load_moe_experts_down(cfg, l,
-                                      w->down_weight + (size_t)l * dim * ff);
+                if (load_moe_experts_rowband(cfg, l, "gate_proj",
+                                            w->gate_weight + (size_t)l * ff * dim) != 0 ||
+                    load_moe_experts_rowband(cfg, l, "up_proj",
+                                            w->up_weight + (size_t)l * ff * dim) != 0 ||
+                    load_moe_experts_down(cfg, l,
+                                         w->down_weight + (size_t)l * dim * ff) != 0) {
+                    free(tmp_attn); return -1;
+                }
             } else {
-                load_layer_tensor(cfg, w, l, "mlp.gate_proj.weight",
-                                   w->gate_weight, ff * dim, ff * dim);
-                load_layer_tensor(cfg, w, l, "mlp.up_proj.weight",
-                                   w->up_weight, ff * dim, ff * dim);
-                load_layer_tensor(cfg, w, l, "mlp.down_proj.weight",
-                                   w->down_weight, dim * ff, dim * ff);
+                if (load_layer_tensor(cfg, w, l, "mlp.gate_proj.weight",
+                                      w->gate_weight, ff * dim, ff * dim) != 0 ||
+                    load_layer_tensor(cfg, w, l, "mlp.up_proj.weight",
+                                      w->up_weight, ff * dim, ff * dim) != 0 ||
+                    load_layer_tensor(cfg, w, l, "mlp.down_proj.weight",
+                                      w->down_weight, dim * ff, dim * ff) != 0) {
+                    free(tmp_attn);
+                    return -1;
+                }
             }
         } else if (w->q8_gate_weight || w->q4_gate_weight || w->q2_gate_weight) {
             /* Q8_0/Q4_0/Q2_1-only: load into temp F32, quantize, free temp */
             float *tmp_ffn = malloc((size_t)(ff * dim) * sizeof(float));
-            if (!tmp_ffn) { fprintf(stderr, "[ST] OOM temp FFN buf\n"); return -1; }
+            if (!tmp_ffn) { fprintf(stderr, "[ST] OOM temp FFN buf\n"); free(tmp_attn); return -1; }
 
             /* q2mix layered precision: the first (nl - tail) layers pack Q2_1
              * (offset l), the last `tail` layers pack Q4_0 into the tail-only
@@ -341,11 +358,12 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
             const int q2_ffn = (w->q2_gate_weight) && (l < w->n_layers_allocated - qm_tail);
             const int q4_ffn_off = (w->q2_gate_weight && !q2_ffn) ? (l - (w->n_layers_allocated - qm_tail)) : l;
 
-            if (cfg->is_moe)
-                load_moe_experts_rowband(cfg, l, "gate_proj", tmp_ffn);
-            else
-                load_layer_tensor(cfg, w, l, "mlp.gate_proj.weight",
-                                   tmp_ffn, 0, ff * dim);
+            if ((cfg->is_moe
+                 ? load_moe_experts_rowband(cfg, l, "gate_proj", tmp_ffn)
+                 : load_layer_tensor(cfg, w, l, "mlp.gate_proj.weight",
+                                     tmp_ffn, 0, ff * dim)) != 0) {
+                free(tmp_ffn); free(tmp_attn); return -1;
+            }
             if (w->q8_gate_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_gate_weight + (size_t)l * Q8_BYTES(ff * dim),
@@ -364,11 +382,12 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 f32_to_q2_1(w->q2_gate_weight + (size_t)l * Q2_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
 
-            if (cfg->is_moe)
-                load_moe_experts_rowband(cfg, l, "up_proj", tmp_ffn);
-            else
-                load_layer_tensor(cfg, w, l, "mlp.up_proj.weight",
-                                   tmp_ffn, 0, ff * dim);
+            if ((cfg->is_moe
+                 ? load_moe_experts_rowband(cfg, l, "up_proj", tmp_ffn)
+                 : load_layer_tensor(cfg, w, l, "mlp.up_proj.weight",
+                                     tmp_ffn, 0, ff * dim)) != 0) {
+                free(tmp_ffn); free(tmp_attn); return -1;
+            }
             if (w->q8_up_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_up_weight + (size_t)l * Q8_BYTES(ff * dim),
@@ -387,11 +406,12 @@ int st_load_layer_weights(const STModelConfig *cfg, STModelWeights *w,
                 f32_to_q2_1(w->q2_up_weight + (size_t)l * Q2_BYTES(ff * dim),
                             tmp_ffn, ff * dim);
 
-            if (cfg->is_moe)
-                load_moe_experts_down(cfg, l, tmp_ffn);
-            else
-                load_layer_tensor(cfg, w, l, "mlp.down_proj.weight",
-                                   tmp_ffn, 0, dim * ff);
+            if ((cfg->is_moe
+                 ? load_moe_experts_down(cfg, l, tmp_ffn)
+                 : load_layer_tensor(cfg, w, l, "mlp.down_proj.weight",
+                                     tmp_ffn, 0, dim * ff)) != 0) {
+                free(tmp_ffn); free(tmp_attn); return -1;
+            }
             if (w->q8_down_weight) {
                 if (w->q8_buf_q4)
                     f32_to_q4i8(w->q8_down_weight + (size_t)l * Q8_BYTES(dim * ff),

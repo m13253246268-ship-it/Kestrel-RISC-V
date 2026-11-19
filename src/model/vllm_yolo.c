@@ -29,6 +29,10 @@
 #ifdef __linux__
 #include <sched.h>          /* V56：IME 只允许跑在带 ime 扩展的 hart0-3，需要绑核 */
 #endif
+static double yacc_trans = 0.0, yacc_gather = 0.0;
+static double yacc_view = 0.0;
+static int yview_tim = 0;
+
 static double ynow(void) {
 #ifdef __linux__
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1342,13 +1346,6 @@ static int8_t *yime_pack_a(const int8_t *Wq, int OC, int Kp) {
                            Wq + (size_t)(mt * 8 + mv * 4 + q) * Kp + kb * 8, 8);
     return p;
 }
-
-/* V56 诊断：im2col 拆成「CHW→HWC 转置」和「gather+量化」两段分别累计
- * （定义前移：融合路径 yconv_ime_fused 也要在其中累计 gather 段） */
-static double yacc_trans = 0.0, yacc_gather = 0.0;
-/* Phase 2 诊断：元素算子里 `slot_view` 的隐式 layout 转换耗时（ADD/CONCAT/SLICE 共用） */
-static double yacc_view = 0.0;
-static int yview_tim = 0;
 
 /* 单个 nb 块（16 个输出像素）：GEMM 微内核 + epilogue。
  * 从 yconv_ime 抽出，供「gather+GEMM 融合」路径复用同一份实现。 */
