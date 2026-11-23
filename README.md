@@ -26,6 +26,34 @@ vllm_kestrel 是一个从零自研、面向 RISC-V 边缘设备的纯 C 模型**
 
 ---
 
+## WeVisOne-VL-2B 图像定位与 K1 性能
+
+`isLinXu/WeVisOne-VL-2B` 支持通过 `/v1/chat/completions` 输入图片，返回 `<ref>` 目标名称与 `<box>` 边界框。Windows x64 和 SpacemiT K1-X 已验证 224 × 224 猫图定位。框坐标范围为 0–1000。分割与抠图使用独立的 [PyTorch 像素解码器](tools/wevisone_pixel.py)。K1 图文请求可能在框后继续生成，调用方可设置 `max_tokens` 并解析首个完整框。
+
+请用本版转换器从原始权重生成 Q4 VQF，并将 `vocab.bin`、`merges.bin` 放在模型同目录。旧转换器可能为输出层写入不一致的布局，导致重复文本。以下命令从仓库根目录运行，`MODEL_DIR` 指向模型目录。
+
+```bash
+./vqf_convert/vqf_conv --model "$MODEL_DIR" --convert-vqf "$MODEL_DIR/model-q4-fixed.vqf" --wmode q4
+VLLM_RISCV_EXTRA=-DVLLM_K1_Q8B_ASM=1 bash tools/build/build_riscv.sh
+VLLM_WEVIS_LM_LANE=1 VLLM_Q4_RVV=3 VLLM_Q4CHK=0 \
+VLLM_TP=4 VLLM_THREADS=4 OMP_NUM_THREADS=4 \
+taskset -c 0-3 ./build-riscv/vllm_kestrel --serve --auto-load --threads 4 \
+  --model "$MODEL_DIR/model-q4-fixed.vqf" --port 8080
+```
+
+**K1-X 四核实测。** 文本行比较词表输出层重排开关，按 A–B–B–A 顺序交错测试，每种配置各取 4 次热态请求的均值，每次生成 12 个 token。图像行保持词表优化开启，比较视觉 Q8 汇编内核的编译开关。每个版本在同一进程中依次提交原图、相同图片、水平翻转图，各一次。首响应从客户端发起请求计至首个可见输出，服务已就绪。
+
+| 负载与指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| 热态文本解码，每个 token | 462.54 ms | 313.55 ms |
+| 首张猫图，首响应 | 390.18 s | 185.79 s |
+| 重复猫图，命中视觉缓存，首响应 | 6.00 s | 5.14 s |
+| 翻转猫图，重新编码，首响应 | 398.56 s | 186.71 s |
+
+词表重排默认关闭，开启后额外占用 167.73 MiB。13 次真实输入的全部 152,680 个 logits 与基线逐位一致。视觉优化前后三组请求的 token ID 和定位框均一致。新图的主要耗时在视觉前馈网络，翻转图的 24 层前馈计算从 253.22 s 降至 112.37 s。[图文测试脚本](tools/bench/wevis_hot_cat.py) · [Q8 微基准](tools/bench/wevis_q8b_micro.c)
+
+另一次同板测试使用 34 个相同文本输入 token，双方均复用 33 个前缀 token 并生成 10 个 token。三次重复请求的解码速度中位数为 Kestrel **3.47 token/s**、官方 llama.cpp **1.98 token/s**。该轮首次猫图首响应分别为 **391.31 s**（Kestrel 未启用视觉汇编）和 **141.95 s**。两端使用同源权重，格式分别为 Q4 VQF 和 GGUF Q4_0 + mmproj。[llama.cpp 测试版本](https://github.com/ggml-org/llama.cpp/commit/08c252e221759e0f69e80f0450b295c92d2344e1)
+
 ## MiniCPM5-1B：Q4_0 与 K1 验证
 
 已适配 `OpenBMB/MiniCPM5-1B`，支持分词、聊天模板、结束 token，以及 Q4_0 VQF 权重。已验证配置为 **Q4_0 权重 + FP32 KV**；embedding 保留 F16，norm 保留 F32。权重需自行转换，不随仓库分发。
@@ -57,6 +85,7 @@ RVV prefill 已共享 QKV、Gate/Up 激活量化，并通过在向量寄存器�
 
 ## 快速目录
 
+- [WeVisOne-VL-2B 图像定位与 K1 性能](#wevisone-vl-2b-图像定位与-k1-性能)
 - [核心优势](#核心优势)
 - [协同推理](#协同推理)
 - [性能](#性能)

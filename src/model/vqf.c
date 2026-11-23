@@ -453,6 +453,7 @@ int vqf_load(STModelWeights *w, const char *path) {
     int k_out = c->n_kv_heads * c->head_dim;
     int ff = c->ffn_dim, vc = c->vocab_size, dim = c->dim;
 
+    const VQFTensor *lm_entry = NULL;
     size_t dir_off = (sizeof(VQFHeader) + 63) & ~(size_t)63;
     uint64_t data_end = h->file_len;   /* file_len = 数据区绝对结束位置（含 data_offset） */
     for (uint32_t i = 0; i < h->n_tensors; i++) {
@@ -521,6 +522,7 @@ int vqf_load(STModelWeights *w, const char *path) {
             w->q4_down_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
         }
         else if (strcmp(name, "q4_lm") == 0) {
+            lm_entry = e;
             w->q4_lm_weight = (uint8_t *)p;
             w->q4_lm_layout = (h->version == VQF_VERSION_LANE) ? (int)e->layout : 1;
         }
@@ -608,6 +610,14 @@ int vqf_load(STModelWeights *w, const char *path) {
                         "prefill/decode 会显著变慢\n");
 #endif
     }
+    /* Only after all load checks: the mapped layout1 tensor stays authoritative. */
+    const char *lane = getenv("VLLM_WEVIS_LM_LANE");
+    if (lane && strcmp(lane, "1") == 0 && lm_entry && vc == 152680 && dim == 2048 &&
+        w->q4_lm_layout == 1 && lm_entry->qtype == VQF_QT_Q4_0 &&
+        lm_entry->rows == (unsigned)vc && lm_entry->cols == (unsigned)dim &&
+        lm_entry->bytes == (size_t)vc * (dim / 32) * 18 &&
+        lm_entry->offset <= data_end - lm_entry->bytes)
+        st_prepare_lm_lane(w, vc, dim);
     g_vqf_loaded_flags = h->flags;      /* /admin 只读展示"文件内固化布局" */
     g_vqf_loaded_version = h->version;
     w->n_layers_allocated = c->n_layers;

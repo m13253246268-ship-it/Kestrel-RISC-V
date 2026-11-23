@@ -3378,9 +3378,10 @@ static const uint8_t rv_vm_xidx[128] = {
    24,25,26,27,28,29,30,31, 24,25,26,27,28,29,30,31,
    24,25,26,27,28,29,30,31, 24,25,26,27,28,29,30,31,
 };
-__attribute__((noinline))
-static void rv_vm_tile16(const uint8_t *w, const int8_t *xq, const float *xd, const int32_t *corr,
-                         int nblk, float *out) {
+/* One 64-bit lane holds one complete K=8 operand of the 4x4x8 dot. */
+static inline __attribute__((always_inline)) void rv_vm_tile16_impl(
+        const uint8_t *w, const int8_t *xq, const float *xd, const int32_t *corr,
+        int nblk, float *out, int wide) {
     long k = nblk;
     __asm__ volatile(
         ".option push                          \n\t"
@@ -3388,7 +3389,9 @@ static void rv_vm_tile16(const uint8_t *w, const int8_t *xq, const float *xd, co
         "vsetivli    zero, 16, e32, m2, ta, ma \n\t"
         "vmv.v.i     v24, 0                    \n\t"
         "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
-        "vle8.v      v0, (%[ix])               \n\t"   /* 128B 展开索引 */
+        ".if !%c[wide]                          \n\t"
+        "vle8.v      v0, (%[ix])               \n\t"
+        ".endif                                 \n\t"
         "1:                                    \n\t"
         "vsetvli     t0, zero, e32, m8, ta, ma \n\t"
         "vmv.v.i     v16, 0                    \n\t"
@@ -3396,7 +3399,16 @@ static void rv_vm_tile16(const uint8_t *w, const int8_t *xq, const float *xd, co
         "vsetvli     t0, t0, e8, m1, ta, ma    \n\t"
         "vle8.v      v28, (%[x])               \n\t"   /* 32B 紧凑激活 */
         "vsetvli     t0, zero, e8, m4, ta, ma  \n\t"
-        "vrgather.vv v4, v28, v0               \n\t"   /* → v4..v7（与 xr 布局同） */
+        ".if %c[wide]                           \n\t"
+        "vsetivli zero,4,e64,m1,ta,ma           \n\t"
+        "vrgather.vi v4,v28,0                   \n\t"
+        "vrgather.vi v5,v28,1                   \n\t"
+        "vrgather.vi v6,v28,2                   \n\t"
+        "vrgather.vi v7,v28,3                   \n\t"
+        "vsetvli t0,zero,e8,m4,ta,ma            \n\t"
+        ".else                                  \n\t"
+        "vrgather.vv v4,v28,v0                  \n\t"
+        ".endif                                 \n\t"
         "addi        t1, %[w], 32              \n\t"
         "vle8.v      v12, (t1)                 \n\t"
         "vsrl.vi     v8, v12, 4                \n\t"
@@ -3438,12 +3450,25 @@ static void rv_vm_tile16(const uint8_t *w, const int8_t *xq, const float *xd, co
         "bnez        %[k], 1b                  \n\t"
         "vse32.v     v24, (%[o])               \n\t"
         ".option pop                           \n\t"
-        : [w] "+r"(w), [x] "+r"(xq), [d] "+r"(xd), [c] "+r"(corr), [k] "+r"(k)
-        : [o] "r"(out), [ix] "r"(rv_vm_xidx)
+        : [w] "+&r"(w), [x] "+&r"(xq), [d] "+&r"(xd), [c] "+&r"(corr), [k] "+&r"(k)
+        : [o] "r"(out), [ix] "r"(rv_vm_xidx), [wide] "i"(wide)
         : "t0", "t1", "t2", "ft0", "memory", "vl", "vtype",
           "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
           "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
           "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+static __attribute__((noinline)) void rv_vm_tile16(const uint8_t *w, const int8_t *xq,
+        const float *xd, const int32_t *corr, int nblk, float *out) {
+    static __thread int wide = -1;
+    if (wide < 0) {
+        const char *e = getenv("VLLM_Q4_VM_K8");
+        wide = e && strcmp(e, "1") == 0;
+        if (wide && getenv("VLLM_Q4VM_DIAG"))
+            fprintf(stderr, "[Q4VM-K8] executing on cpu=%d nblk=%d\n", sched_getcpu(), nblk);
+    }
+    if (wide) rv_vm_tile16_impl(w, xq, xd, corr, nblk, out, 1);
+    else rv_vm_tile16_impl(w, xq, xd, corr, nblk, out, 0);
 }
 
 /* 32 行 tile ti 的 vmadot 单元：两个 16 行半 tile 先写栈上 tmp（out 可能与 resid 同址），
@@ -6016,6 +6041,7 @@ void st_weights_free(STModelWeights *w) {
     if (!w->is_allocated) return;
     /* VQF mmap-backed weights: all pointers alias one read-only mapping. */
     if (w->vqf_map) {
+        free(w->q4_lm_lane);
         vqf_sa_async_drain();  /* f1：映射释放前清空异步 madvise 队列 */
         gu_lane_close();       /* GU_LANE：注销 alt 并 munmap sidecar（未开启时无操作） */
         dn_lane_close();       /* DN_LANE：同上（down sidecar，未开启时无操作） */
@@ -10822,6 +10848,31 @@ static void vllm_q8b_worker(void *ctx_, int r) {
         float d = q8_block_scale(pr);
         float32x4_t f[8];
         i8x32_to_f32x8((const int8_t *)(pr + 2), f);
+#if defined(VLLM_K1_Q8B_ASM) && VLLM_K1_Q8B_ASM && defined(__riscv_vector)
+        /* One signed Q8 block, 32 independent FP32 accumulation lanes.
+         * Keep scaled weights live across all patches; preserve baseline fmaf. */
+        const float *xp = c->x + (size_t)b * 32;
+        void *ap = acc;
+        long patches = c->B;
+        if (patches > 0) __asm__ volatile(
+            "vsetvli zero,%[lanes],e32,m8,ta,ma\n\t"
+            "vle32.v v8,(%[weights])\n\t"
+            "vfmul.vf v8,v8,%[scale]\n\t"
+            "1: vle32.v v16,(%[x])\n\t"
+            "vle32.v v24,(%[a])\n\t"
+            "vfmacc.vv v24,v8,v16\n\t"
+            "vse32.v v24,(%[a])\n\t"
+            "add %[x],%[x],%[stride]\n\t"
+            "addi %[a],%[a],128\n\t"
+            "addi %[count],%[count],-1\n\t"
+            "bnez %[count],1b"
+            : [x] "+&r"(xp), [a] "+&r"(ap), [count] "+&r"(patches)
+            : [lanes] "r"(32L), [weights] "r"(f), [scale] "f"(d),
+              [stride] "r"((size_t)c->cols * sizeof(float))
+            : "memory", "v8","v9","v10","v11","v12","v13","v14","v15",
+              "v16","v17","v18","v19","v20","v21","v22","v23",
+              "v24","v25","v26","v27","v28","v29","v30","v31");
+#else
         float32x4_t dq = vdupq_n_f32(d);
         for (int p = 0; p < c->B; p++) {
             const float *xs = c->x + (size_t)p * c->cols + (size_t)b * 32;
@@ -10829,6 +10880,7 @@ static void vllm_q8b_worker(void *ctx_, int r) {
                 acc[p][i] = vfmaq_f32(acc[p][i], vmulq_f32(f[i], dq),
                                       vld1q_f32(xs + (size_t)i * 4));
         }
+#endif
         pr += 34;
     }
     if (c->nh > 0) {
@@ -11341,6 +11393,47 @@ static void dyn_matvec_q4_q8(float *__restrict out, const uint8_t *__restrict q4
     dyn_matvec_q4_q8_neon(out, q4_w, x, rows, cols, mode);
 }
 
+
+void st_prepare_lm_lane(STModelWeights *w, int rows, int cols) {
+#if ST_HAVE_RVV
+    if (!rv_q4_m2_on()) return;
+    const int blocks = cols / 32, tiles = rows / 32;
+    size_t bytes = (size_t)tiles * blocks * 576;
+    uint8_t *lane = malloc(bytes);
+    if (!lane) {
+        fprintf(stderr, "[LM-LANE] allocation failed (%zu bytes), using layout1\n", bytes);
+        return;
+    }
+    for (int t = 0; t < tiles; ++t) for (int b = 0; b < blocks; ++b) {
+        uint8_t *dst = lane + ((size_t)t * blocks + b) * 576;
+        for (int g = 0; g < 8; ++g) {
+            const uint8_t *src = w->q4_lm_weight + (((size_t)t * 8 + g) * blocks + b) * 72;
+            for (int m = 0; m < 4; ++m) {
+                memcpy(dst + m * 16 + g * 2, src + m * 2, 2);
+                for (int k = 0; k < 4; ++k)
+                    memcpy(dst + 64 + k * 128 + m * 32 + g * 4, src + 8 + k * 16 + m * 4, 4);
+            }
+        }
+    }
+    w->q4_lm_lane = lane;
+    fprintf(stderr, "[LM-LANE] packed %d rows, %zu bytes, %d layout1 tail rows\n", tiles * 32, bytes, rows % 32);
+#else
+    (void)w; (void)rows; (void)cols;
+#endif
+}
+
+static void st_q4_lm(float *out, const STModelWeights *w, const float *x, int rows, int cols) {
+#if ST_HAVE_RVV
+    if (w->q4_lm_lane) {
+        int body = rows / 32 * 32, blocks = cols / 32;
+        rv_q4_lane_rows_par(w->q4_lm_lane, x, out, NULL, body, blocks);
+        rv_q4_rows_par(w->q4_lm_weight + (size_t)body * blocks * 18, x, out + body,
+                       NULL, rows - body, blocks);
+        return;
+    }
+#endif
+    dyn_matvec_q4_q8(out, w->q4_lm_weight, x, rows, cols, w->q4_lm_layout);
+}
 
 static void dyn_matvec_q4_q8_fused_gate_up(
     float *__restrict gate_out, float *__restrict up_out,
@@ -11875,7 +11968,7 @@ int st_draft_head_forward(STQwenInferenceState *st, STDraftHead *dh,
 
         /* 10) lm_head（复用主模型 lm_head 权重） */
         if (w->q4_lm_weight && (st_dense_q4_first() || !w->has_q8 || !w->q8_lm_weight)) {
-            dyn_matvec_q4_q8(logits_buf, w->q4_lm_weight, normed, vc, d, w->q4_lm_layout);
+            st_q4_lm(logits_buf, w, normed, vc, d);
         } else if (w->has_q8 && w->q8_lm_weight) {
             dyn_matvec_q8(logits_buf, w->q8_lm_weight, normed, vc, d);
         } else {
@@ -21327,7 +21420,7 @@ static void st_qwen_model_forward_impl(STQwenInferenceState *st, int token_id) {
     if (w->q4_lm_weight &&
         (st_dense_q4_first() || !w->has_q8 || !w->q8_lm_weight)) {
         /* Q4_0 LM head: 331 MB weights vs 661 MB Q8_0 / 2.49 GB F32 */
-        dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed, vc, d, w->q4_lm_layout);
+        st_q4_lm(st->logits, w, normed, vc, d);
     } else if (w->has_q8 && w->q8_lm_weight) {
         /* AVX2 Q8_0 dequantizing matvec: 660 MB weights vs 2.49 GB F32 */
         dyn_matvec_q8(st->logits, w->q8_lm_weight, normed, vc, d);
@@ -21756,7 +21849,7 @@ void st_qwen_model_forward_batch(STQwenInferenceState *const *sts,
         dyn_rms_norm(normed, st->hidden, w->final_norm, d, eps);
         if (w->q4_lm_weight &&
             (st_dense_q4_first() || !w->has_q8 || !w->q8_lm_weight)) {
-            dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed, vc, d, w->q4_lm_layout);
+            st_q4_lm(st->logits, w, normed, vc, d);
         } else if (w->has_q8 && w->q8_lm_weight) {
             dyn_matvec_q8(st->logits, w->q8_lm_weight, normed, vc, d);
         } else {
@@ -23252,7 +23345,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                     float *scratch = normed_b;   /* 层循环已结束，可复用 */
                     dyn_rms_norm(scratch, xh, w->final_norm, d, eps);
                     if (use_q4 && w->q4_lm_weight)
-                        dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, scratch, vc, d, w->q4_lm_layout);
+                        st_q4_lm(st->logits, w, scratch, vc, d);
                     else
                         dyn_matvec_q8(st->logits, w->q8_lm_weight, scratch, vc, d);
                     int topn = 8, ti[8]; float tv[8];
@@ -23345,7 +23438,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
             float *last_hidden = hidden_b + (size_t)(last_nb - 1) * d;
             dyn_rms_norm(normed_b, last_hidden, w->final_norm, d, eps);
             if (use_q4 && w->q4_lm_weight)
-                dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed_b, vc, d, w->q4_lm_layout);
+                st_q4_lm(st->logits, w, normed_b, vc, d);
             else
                 dyn_matvec_q8(st->logits, w->q8_lm_weight, normed_b, vc, d);
         } else {
@@ -23354,7 +23447,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
                 float *vh = hidden_b + (size_t)i * d;
                 dyn_rms_norm(normed_b, vh, w->final_norm, d, eps);
                 if (use_q4 && w->q4_lm_weight)
-                    dyn_matvec_q4_q8(vlog, w->q4_lm_weight, normed_b, vc, d, w->q4_lm_layout);
+                    st_q4_lm(vlog, w, normed_b, vc, d);
                 else
                     dyn_matvec_q8(vlog, w->q8_lm_weight, normed_b, vc, d);
                 int best = 0, second = 0;
@@ -23373,7 +23466,7 @@ int st_qwen_model_prefill_batch(STQwenInferenceState *st,
         dyn_rms_norm(normed_b, last_hidden, w->final_norm, d, eps);
         if (!emb_skip) {   /* K-EMB-002：embedding 不产 token ⇒ LM head logits 无用 */
             if (use_q4 && w->q4_lm_weight)
-                dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed_b, vc, d, w->q4_lm_layout);
+                st_q4_lm(st->logits, w, normed_b, vc, d);
             else
                 dyn_matvec_q8(st->logits, w->q8_lm_weight, normed_b, vc, d);
         }
@@ -24118,7 +24211,7 @@ int st_qwen_model_multimodal_prefill_ex(
     float *last_hidden = hidden_b + (size_t)(last_nb - 1) * d;
     dyn_rms_norm(normed_b, last_hidden, w->final_norm, d, eps);
     if (use_q4 && w->q4_lm_weight)
-        dyn_matvec_q4_q8(st->logits, w->q4_lm_weight, normed_b, vc, d, w->q4_lm_layout);
+        st_q4_lm(st->logits, w, normed_b, vc, d);
     else
         dyn_matvec_q8(st->logits, w->q8_lm_weight, normed_b, vc, d);
 

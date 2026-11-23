@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define QWEN_TOKENIZER_MAX_TOKENS  151936
+#define QWEN_TOKENIZER_MAX_TOKENS  (1 << 20) /* allocation guard; actual size comes from vocab.bin */
 #define QWEN_TOKENIZER_MAX_STR      256
 
 typedef struct {
@@ -61,6 +61,7 @@ typedef struct {
     uint32_t *at_off;
     uint16_t *at_len;
     int       n_added;
+    uint8_t   added_first[256]; /* possible first bytes of added tokens */
 
     /* Special token IDs */
     int    bos_id;

@@ -1117,7 +1117,7 @@ static int emit_token(VLLMServerCtx *ctx, QwenTokenizer *tok, Utf8Incr *dec,
     if (id == tok->eos_id || id == tok->im_end_id) return 1;
     if (gids && *gn < gcap) gids[(*gn)++] = id;
     const char *raw = qwen_tokenizer_decode(tok, id);
-    int rawlen = tok->str_lens[id];
+    int rawlen = (int)strlen(raw);
     char piece[2048];
     int plen = utf8_incr_feed(dec, (const unsigned char *)raw, rawlen,
                               piece, (int)sizeof(piece));
@@ -1449,7 +1449,7 @@ static int decode_loop(VLLMServerCtx *ctx, double temperature, double top_p,
             if (id == tok->eos_id || id == tok->im_end_id) { finish = "stop"; done = 1; break; }
             if (gids && gn < gcap) gids[gn++] = id;
             const char *raw = qwen_tokenizer_decode(tok, id);
-            int rawlen = tok->str_lens[id];
+            int rawlen = (int)strlen(raw);
             char piece[2048];
             int plen = utf8_incr_feed(&dec, (const unsigned char *)raw, rawlen,
                                        piece, (int)sizeof(piece));

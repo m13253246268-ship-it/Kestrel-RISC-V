@@ -762,6 +762,8 @@ static int tok_bpe_load_bin(QwenTokenizer *tok, const char *model_dir) {
     tok->bm_off = off; tok->bm_llen = ll; tok->bm_rlen = lr;
     tok->bm_tab = tab; tok->bm_mask = tcap - 1; tok->n_merges = nm;
     tok->at_id = aid; tok->at_off = aoff; tok->at_len = alen; tok->n_added = na;
+    for (int i = 0; i < na; i++)
+        if (alen[i]) tok->added_first[(uint8_t)str[aoff[i]]] = 1;
     tok->bpe_ready = 1;
     printf("[TOK] BPE merges loaded: %d merges, %d added tokens (%zu KB)\n",
            nm, na, len / 1024);
@@ -775,6 +777,7 @@ static int tok_bpe_load_bin(QwenTokenizer *tok, const char *model_dir) {
 static int next_added_start(const QwenTokenizer *tok, const char *s, int len,
                             int from) {
     for (int k = from; k < len; k++) {
+        if (!tok->added_first[(uint8_t)s[k]]) continue;
         /* K-LAYA-001：added token 首字节不一定 '<'（ModernBERT 有 '|'/'['/空格），
          * 故在所有位置试匹配；对 Qwen（全 '<' 前缀）结果不变。 */
         for (int i = 0; i < tok->n_added; i++) {
@@ -792,10 +795,11 @@ static int tok_bpe_encode(QwenTokenizer *tok, const char *text, int text_len,
     b2u_init();
     const unsigned char *s = (const unsigned char *)text;
     int pos = 0, num = 0;
+    int boundary = next_added_start(tok, text, text_len, 0);
     while (pos < text_len && num < max_tokens) {
         /* 1. added/special 整串最长匹配 */
         int best = -1, best_len = 0;
-        for (int i = 0; i < tok->n_added; i++) {
+        for (int i = 0; pos == boundary && i < tok->n_added; i++) {
             int l = tok->at_len[i];
             if (l <= best_len || l > text_len - pos) continue;
             if (memcmp(text + pos, tok->bpe_str + tok->at_off[i], (size_t)l) == 0) {
@@ -805,11 +809,13 @@ static int tok_bpe_encode(QwenTokenizer *tok, const char *text, int text_len,
         if (best >= 0) {
             token_ids[num++] = (int)tok->at_id[best];
             pos += best_len;
+            boundary = next_added_start(tok, text, text_len, pos);
             continue;
         }
         /* 2. 预分词切 piece；超长 piece 切分处理（避免栈内固定缓冲溢出） */
-        int wlen = gpt2_span ? pretoken_span_gpt2(s + pos, text_len - pos)
-                             : pretoken_span(s + pos, text_len - pos);
+        int remaining = boundary - pos;
+        int wlen = gpt2_span ? pretoken_span_gpt2(s + pos, remaining)
+                             : pretoken_span(s + pos, remaining);
         if (tok->is_minicpm5 && !gpt2_span) {
             int q = 0, digits = 0;
             while (q < text_len - pos && digits < 3) {
@@ -838,8 +844,7 @@ static int tok_bpe_encode(QwenTokenizer *tok, const char *text, int text_len,
         if (wlen > text_len - pos) wlen = text_len - pos;
         if (wlen > TK_BPE_MAXSYM) wlen = TK_BPE_MAXSYM;
         /* added-token 硬边界：piece 不得跨过后面出现的特殊 token 起始位置。 */
-        int cap = next_added_start(tok, text + pos, text_len - pos, 1);
-        if (wlen > cap) wlen = cap;
+        if (wlen > remaining) wlen = remaining;
 
         /* 3. raw → repr */
         char rb[TK_BPE_RBUF];

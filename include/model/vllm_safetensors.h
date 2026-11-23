@@ -179,6 +179,7 @@ typedef struct {
      * 旧文件（v2/v3/v4）加载后统一置 1（4x4），与 g_st_q4_repack=1 行为一致。 */
     int      q4_q_layout, q4_k_layout, q4_v_layout, q4_o_layout;
     int      q4_gate_layout, q4_up_layout, q4_down_layout, q4_lm_layout;
+    uint8_t *q4_lm_lane;  /* Model-owned full tiles; tail aliases q4_lm_weight. */
 
     /* --- Q4_0 8x8 GEMM 预打包副本（prefill 专用, 仅 wmode=q4 分配）---
      * 每个矩阵与 legacy 同大小（144B/block = 8 行 legacy 18B/block），布局为
@@ -308,6 +309,7 @@ typedef struct {
 /**
  * Free all weight buffers.
  */
+void st_prepare_lm_lane(STModelWeights *w, int rows, int cols);
 void st_weights_free(STModelWeights *w);
 
 /* Batched Q8_0 matvec with row-tiled shared-input fusion (axiom:

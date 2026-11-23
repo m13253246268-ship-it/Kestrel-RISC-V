@@ -42,6 +42,7 @@ if (-not $Gcc -or -not (Test-Path $Gcc)) {
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 if (-not $OutDir) { $OutDir = Join-Path $root 'build-x64' }
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+$OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 if ($Target -ne 'main') {
     $kind = $Target.Substring('paraformer-'.Length)
     $name = if ($kind -eq 'cli') { 'vllm_paraformer.exe' } else { 'libvllm_paraformer.a' }
@@ -57,6 +58,8 @@ if ($Target -ne 'main') {
 $out = Join-Path $OutDir 'vllm_kestrel_x64.exe'
 
 Push-Location $root
+$linkOut = Resolve-Path -LiteralPath $OutDir -Relative
+$linkOut = Join-Path $linkOut 'vllm_kestrel_x64.exe'
 $src = @(
   'src/main.c',
   'src/core/vllm_superpos.c','src/core/vllm_attention.c','src/core/vllm_scheduler.c',
@@ -83,7 +86,7 @@ Remove-Item $out -Force -ErrorAction SilentlyContinue
 & $Gcc -std=gnu11 -O2 -D_GNU_SOURCE -mavx2 -mfma -mf16c -fopenmp -ffp-contract=off `
   -Wno-error=incompatible-pointer-types -Wno-error=int-conversion `
   -Wno-error=implicit-function-declaration `
-  @incs @src -o $out -lm -lws2_32 -lbcrypt 2>&1 | Tee-Object -Variable errs
+  @incs @src -o $linkOut -lm -lws2_32 -lbcrypt 2>&1 | Tee-Object -Variable errs
 $rc = $LASTEXITCODE
 Write-Host "rc=$rc"
 Pop-Location

@@ -62,6 +62,16 @@ int g_q2mix_tail = 0;
 int g_model_load_layer = -1;
 int g_model_load_total = 0;
 
+/* One TOC layout covers every chunk of the LM head, including the tail. */
+static int pack_lm_chunk(uint8_t *dst, int rows, int cols, int total_rows) {
+    if (g_st_q4_col && total_rows % 32 == 0 && cols % 32 == 0) {
+        extern int repack_q4_0_lane_col_inplace(uint8_t *, int, int);
+        return repack_q4_0_lane_col_inplace(dst, rows, cols) == 0 ? 3 : -1;
+    }
+    if (total_rows % 4 != 0) return 0;
+    return repack_q4_0_4x4_inplace(dst, rows, cols) == 0 ? 1 : -1;
+}
+
 /* wmode（dual=0/q4=1/q8=2/q4i=3/g256=4；q2mix=5 v1 拒） */
 static int g_wmode = 0;
 int st_wmode_effective(void) { return g_wmode; }
@@ -671,10 +681,11 @@ static int run_convert(const char *model_dir, const char *out) {
             if (w.q4_lm_weight) {
                 uint8_t *dst = w.q4_lm_weight + (size_t)(off / 32) * 18;
                 f32_to_q4_0(dst, tmp, (int)n);
-                if (g_st_q4_repack)
-                    w.q4_lm_layout = q4_repack_choose(
-                        w.q4_lm_weight + (size_t)(off / dim) * (((dim + 31) / 32) * 18),
-                        (int)(n / dim), dim);
+                if (g_st_q4_repack && (w.q4_lm_layout = pack_lm_chunk(
+                        dst, (int)(n / dim), dim, cfg.vocab_size)) < 0) {
+                    free(tmp);
+                    goto fail;
+                }
             }
         }
         free(tmp);
@@ -1077,11 +1088,11 @@ static int run_convert_stream(const char *model_dir, const char *out) {
                 if (lm_map4) {
                     uint8_t *dst = lm_map4 + (size_t)(off / 32) * 18;
                     f32_to_q4_0(dst, tmp_lm, (int)nlm);
-                    if (g_st_q4_repack)
-                        w.q4_lm_layout = q4_repack_choose(
-                            lm_map4 + (size_t)(off / cfg.dim) *
-                                (((cfg.dim + 31) / 32) * 18),
-                            (int)(nlm / cfg.dim), cfg.dim);
+                    if (g_st_q4_repack && (w.q4_lm_layout = pack_lm_chunk(
+                            dst, (int)(nlm / cfg.dim), cfg.dim, cfg.vocab_size)) < 0) {
+                        free(tmp_lm);
+                        goto fail;
+                    }
                 }
             }
             free(tmp_lm);

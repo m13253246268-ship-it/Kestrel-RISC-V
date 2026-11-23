@@ -378,7 +378,7 @@ int vllm_batch_run(VBatchSched *b, VBatchReq *req) {
                                  req->top_k);
         if (id == b->tok->eos_id || id == b->tok->im_end_id) { finish = "stop"; done = 1; break; }
         const char *raw = qwen_tokenizer_decode(b->tok, id);
-        int rawlen = b->tok->str_lens[id];
+        int rawlen = (int)strlen(raw);
         char piece[2048];
         int plen = vb_utf8_feed(&dec, (const unsigned char *)raw, rawlen, piece, (int)sizeof(piece));
         char pbuf[2048];

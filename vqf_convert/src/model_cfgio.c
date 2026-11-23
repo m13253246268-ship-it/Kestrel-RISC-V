@@ -272,6 +272,11 @@ int st_parse_config(const char *model_dir, STModelConfig *cfg) {
     GET_INT("vocab_size", vocab_size);
     GET_INT("max_position_embeddings", max_seq_len);
     GET_INT("bos_token_id", bos_id);
+    if (pos && *pos == 'n') {
+        const char *text = json_find_key(json, "text_config");
+        const char *bos = text ? json_find_key(text, "bos_token_id") : NULL;
+        if (bos) json_parse_int(bos, &cfg->bos_id);
+    }
     pos = json_find_key(json, "eos_token_id");
     if (pos) {
         while (*pos == ' ' || *pos == '\n' || *pos == '\r' || *pos == '\t') pos++;
